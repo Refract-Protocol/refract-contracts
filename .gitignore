@@ -1,0 +1,16 @@
+# Rust / Cargo
+/target
+**/target
+Cargo.lock.orig
+
+# Soroban build artifacts
+*.wasm
+.soroban/
+deployments.local.json
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
