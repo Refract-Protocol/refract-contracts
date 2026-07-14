@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 5,
+    "address": 3,
     "nonce": 0
   },
   "auth": [
@@ -206,36 +206,11 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000003"
               },
               {
-                "symbol": "register_policy"
+                "symbol": "get_policy"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                },
-                {
-                  "u32": 0
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 100000000
-                  }
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 1000000
-                  }
-                },
-                {
-                  "u64": 9999999999
-                }
-              ]
+              "u64": 404
             }
           }
         }
@@ -254,12 +229,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "register_policy"
+                "symbol": "get_policy"
               }
             ],
             "data": {
               "error": {
-                "contract": 3
+                "contract": 4
               }
             }
           }
@@ -280,7 +255,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 4
                 }
               }
             ],
@@ -305,7 +280,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 4
                 }
               }
             ],
@@ -315,33 +290,12 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "register_policy"
+                  "symbol": "get_policy"
                 },
                 {
                   "vec": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                    },
-                    {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                    },
-                    {
-                      "u32": 0
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 100000000
-                      }
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 1000000
-                      }
-                    },
-                    {
-                      "u64": 9999999999
+                      "u64": 404
                     }
                   ]
                 }

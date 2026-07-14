@@ -5,7 +5,9 @@
 //! contract provides a queryable index of policies per holder.
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Map, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
+};
 
 /// Coverage types (must match RefractPool enum).
 #[contracttype]
@@ -19,9 +21,24 @@ pub enum CoverageType {
     FlightDelay = 4,
 }
 
+/// Errors returned by the registry. State-changing entrypoints still call
+/// `require_auth()` directly (which panics on a missing/invalid signature —
+/// that failure mode is not recoverable), but every *recoverable* misuse
+/// (wrong principal, unknown policy, double init) now returns a typed error
+/// instead of panicking, matching the convention used by `RefractPool`.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RegistryError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    PolicyNotFound = 4,
+}
+
 /// On-chain policy record.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PolicyRecord {
     pub policy_id: u64,
     pub holder: Address,
@@ -51,9 +68,13 @@ pub struct RefractPolicyRegistry;
 impl RefractPolicyRegistry {
     // ─── Initialization ───────────────────────────────────────────────────
 
-    pub fn initialize(env: Env, admin: Address, pool_contract: Address) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        pool_contract: Address,
+    ) -> Result<(), RegistryError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+            return Err(RegistryError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -62,6 +83,7 @@ impl RefractPolicyRegistry {
         env.storage().instance().set(&DataKey::NextPolicyId, &1u64);
         env.storage().instance().set(&DataKey::TotalPolicies, &0u64);
         env.storage().instance().set(&DataKey::TotalPremium, &0i128);
+        Ok(())
     }
 
     // ─── Policy registration (called by Pool contract) ───────────────────
@@ -74,8 +96,8 @@ impl RefractPolicyRegistry {
         coverage_amount: i128,
         premium: i128,
         expires_at: u64,
-    ) -> u64 {
-        Self::require_pool_or_admin(&env, &caller);
+    ) -> Result<u64, RegistryError> {
+        Self::require_pool_or_admin(&env, &caller)?;
 
         let policy_id: u64 = env
             .storage()
@@ -136,16 +158,20 @@ impl RefractPolicyRegistry {
             (coverage_type as u32, coverage_amount),
         );
 
-        policy_id
+        Ok(policy_id)
     }
 
-    pub fn deactivate_policy(env: Env, caller: Address, policy_id: u64) {
-        Self::require_pool_or_admin(&env, &caller);
+    pub fn deactivate_policy(
+        env: Env,
+        caller: Address,
+        policy_id: u64,
+    ) -> Result<(), RegistryError> {
+        Self::require_pool_or_admin(&env, &caller)?;
         let mut record: PolicyRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Policy(policy_id))
-            .expect("policy not found");
+            .ok_or(RegistryError::PolicyNotFound)?;
         record.is_active = false;
         env.storage()
             .persistent()
@@ -153,15 +179,16 @@ impl RefractPolicyRegistry {
 
         env.events()
             .publish((Symbol::new(&env, "policy_deactivated"), policy_id), ());
+        Ok(())
     }
 
     // ─── Queries ──────────────────────────────────────────────────────────
 
-    pub fn get_policy(env: Env, policy_id: u64) -> PolicyRecord {
+    pub fn get_policy(env: Env, policy_id: u64) -> Result<PolicyRecord, RegistryError> {
         env.storage()
             .persistent()
             .get(&DataKey::Policy(policy_id))
-            .expect("policy not found")
+            .ok_or(RegistryError::PolicyNotFound)
     }
 
     pub fn get_holder_policy_ids(env: Env, holder: Address) -> Vec<u64> {
@@ -191,19 +218,26 @@ impl RefractPolicyRegistry {
     // ─── Internal ─────────────────────────────────────────────────────────
 
     /// Only the registered Pool contract or the admin may mutate the registry.
-    /// The caller must authorize the invocation; we then verify the authorized
-    /// address is one of the two privileged principals.
-    fn require_pool_or_admin(env: &Env, caller: &Address) {
+    /// The caller must authorize the invocation (this panics on a missing or
+    /// invalid signature — not recoverable); we then verify the authorized
+    /// address is one of the two privileged principals, which *is* recoverable
+    /// and reported as a typed error.
+    fn require_pool_or_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
         caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RegistryError::NotInitialized)?;
         let pool: Address = env
             .storage()
             .instance()
             .get(&DataKey::PoolContract)
-            .unwrap();
+            .ok_or(RegistryError::NotInitialized)?;
         if caller != &admin && caller != &pool {
-            panic!("unauthorized: caller is neither pool nor admin");
+            return Err(RegistryError::Unauthorized);
         }
+        Ok(())
     }
 }
 
