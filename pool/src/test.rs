@@ -3,7 +3,7 @@
 use super::*;
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env,
 };
@@ -316,6 +316,85 @@ fn double_claim_is_rejected() {
 
     f.pool.process_claim(&id);
     let res = f.pool.try_process_claim(&id);
+    assert_eq!(res, Err(Ok(PoolError::AlreadyClaimed)));
+}
+
+#[test]
+fn expire_policy_frees_coverage_and_deactivates_registry_record() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+    assert_eq!(f.pool.pool_stats().total_coverage, 500 * ONE_USDC);
+    assert!(f.registry.get_policy(&id).is_active);
+
+    // Fast-forward well past the 30-day coverage window.
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 31 * 86_400;
+    });
+
+    f.pool.expire_policy(&id);
+
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Expired
+    );
+    assert_eq!(f.pool.pool_stats().total_coverage, 0);
+    assert!(!f.registry.get_policy(&id).is_active);
+}
+
+#[test]
+fn expire_policy_rejects_before_end_time() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    let res = f.pool.try_expire_policy(&id);
+    assert_eq!(res, Err(Ok(PoolError::PolicyNotYetExpired)));
+}
+
+#[test]
+fn expire_policy_rejects_an_already_claimed_policy() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&id);
+
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 31 * 86_400;
+    });
+    let res = f.pool.try_expire_policy(&id);
     assert_eq!(res, Err(Ok(PoolError::AlreadyClaimed)));
 }
 
