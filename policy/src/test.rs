@@ -70,13 +70,12 @@ fn admin_may_register() {
 }
 
 #[test]
-#[should_panic(expected = "unauthorized")]
 fn stranger_cannot_register() {
     let f = setup();
     let stranger = Address::generate(&f.env);
     let holder = Address::generate(&f.env);
     // mock_all_auths satisfies require_auth, but the principal check still rejects.
-    f.registry.register_policy(
+    let res = f.registry.try_register_policy(
         &stranger,
         &holder,
         &CoverageType::StablecoinDepeg,
@@ -84,6 +83,7 @@ fn stranger_cannot_register() {
         &(TEN_USDC / 100),
         &9_999_999_999,
     );
+    assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
 }
 
 #[test]
@@ -101,4 +101,25 @@ fn deactivate_flips_active_flag() {
 
     f.registry.deactivate_policy(&f.pool, &id);
     assert!(!f.registry.get_policy(&id).is_active);
+}
+
+#[test]
+fn double_initialize_is_rejected() {
+    let f = setup();
+    let res = f.registry.try_initialize(&f.admin, &f.pool);
+    assert_eq!(res, Err(Ok(RegistryError::AlreadyInitialized)));
+}
+
+#[test]
+fn get_policy_rejects_unknown_id() {
+    let f = setup();
+    let res = f.registry.try_get_policy(&404u64);
+    assert_eq!(res, Err(Ok(RegistryError::PolicyNotFound)));
+}
+
+#[test]
+fn deactivate_rejects_unknown_id() {
+    let f = setup();
+    let res = f.registry.try_deactivate_policy(&f.pool, &404u64);
+    assert_eq!(res, Err(Ok(RegistryError::PolicyNotFound)));
 }
