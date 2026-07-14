@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    IntoVal, Symbol, Vec,
 };
 
 const PRECISION: i128 = 10_000_000i128;
@@ -18,12 +19,50 @@ pub enum CoverageType {
     FlightDelay,       // Future: airline ticket delay oracle
 }
 
+// ── RefractPolicyRegistry ABI mirror ────────────────────────────────────────
+//
+// The pool calls into RefractPolicyRegistry purely through
+// `env.invoke_contract`, deliberately *not* via a source-level dependency on
+// the `refract-policy` crate. `#[contractimpl]` emits `export_name` for any
+// wasm32 compile regardless of crate-type, so pulling policy's contract impl
+// in as a normal dependency causes its entry points (e.g. `get_policy`,
+// which also exists on the pool) to leak into — and collide with — the
+// pool's own wasm exports at link time. Mirroring the registry's argument
+// and return types locally (exactly as this file already does for
+// `CoverageType`, which purposefully has independent, near-identical
+// definitions in both contracts) keeps each contract's wasm binary
+// self-contained while staying ABI-compatible: `#[contracttype]` structs and
+// enums serialize by field/variant name, not by which crate declared them.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RegistryCoverageType {
+    StablecoinDepeg = 0,
+    MarketCrash = 1,
+    LiquidationShield = 2,
+    SmartContractRisk = 3,
+    FlightDelay = 4,
+}
+
+/// Mirrors `RefractPolicyRegistry::PolicyRegistration` field-for-field.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PolicyRegistration {
+    pub policy_id: u64,
+    pub holder: Address,
+    pub coverage_type: RegistryCoverageType,
+    pub coverage_amount: i128,
+    pub premium: i128,
+    pub expires_at: u64,
+}
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
     UsdcToken,
+    PolicyRegistry, // RefractPolicyRegistry contract address
     TotalCapital,
     TotalCoverage, // sum of all active policy coverage amounts
     TotalPremiums, // accumulated premiums (protocol revenue)
@@ -125,7 +164,12 @@ pub struct RefractPool;
 
 #[contractimpl]
 impl RefractPool {
-    pub fn initialize(env: Env, admin: Address, usdc_token: Address) -> Result<(), PoolError> {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        usdc_token: Address,
+        policy_registry: Address,
+    ) -> Result<(), PoolError> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(PoolError::AlreadyInitialized);
         }
@@ -135,6 +179,9 @@ impl RefractPool {
         env.storage()
             .instance()
             .set(&DataKey::UsdcToken, &usdc_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::PolicyRegistry, &policy_registry);
         env.storage().instance().set(&DataKey::TotalCapital, &0i128);
         env.storage()
             .instance()
@@ -325,6 +372,7 @@ impl RefractPool {
         let premium = Self::_calc_premium(&config, &params);
         let now = env.ledger().timestamp();
         let end_time = now + (params.duration_days as u64) * 86_400;
+        let registry_coverage_type = Self::_to_registry_coverage_type(&params.coverage_type);
 
         // Transfer premium from holder
         let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
@@ -393,6 +441,42 @@ impl RefractPool {
         env.storage()
             .persistent()
             .set(&DataKey::UserPolicies(holder.clone()), &user_policies);
+
+        // Mirror the policy into RefractPolicyRegistry so it's indexed for
+        // per-holder lookups. The pool is the source of truth for the id;
+        // this call authorizes as the pool contract itself (a direct
+        // contract-to-contract invocation satisfies `require_auth()` on the
+        // invoker's own address without an external signature). See the
+        // "RefractPolicyRegistry ABI mirror" note above for why this is a
+        // raw `invoke_contract` rather than a generated Client call.
+        let registry_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyRegistry)
+            .ok_or(PoolError::NotInitialized)?;
+        let registration = PolicyRegistration {
+            policy_id: id,
+            holder: holder.clone(),
+            coverage_type: registry_coverage_type,
+            coverage_amount: params.coverage_amount,
+            premium,
+            expires_at: end_time,
+        };
+        let _registered_id: u64 = env.invoke_contract(
+            &registry_addr,
+            &Symbol::new(&env, "register_policy"),
+            Vec::from_array(
+                &env,
+                [
+                    env.current_contract_address().into_val(&env),
+                    registration.into_val(&env),
+                ],
+            ),
+        );
+        debug_assert_eq!(
+            _registered_id, id,
+            "registry must echo back the id the pool assigned"
+        );
 
         env.events().publish(
             (symbol_short!("BUY"), holder),
@@ -496,6 +580,31 @@ impl RefractPool {
         Ok(payout)
     }
 
+    // ── Admin ─────────────────────────────────────────────────────────────────
+
+    /// Repoint the RefractPolicyRegistry this pool indexes policies into.
+    /// Only needed for redeploys/migrations — `initialize` already wires the
+    /// registry address set at deploy time.
+    pub fn set_policy_registry(
+        env: Env,
+        caller: Address,
+        policy_registry: Address,
+    ) -> Result<(), PoolError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PoolError::NotInitialized)?;
+        if caller != admin {
+            return Err(PoolError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PolicyRegistry, &policy_registry);
+        Ok(())
+    }
+
     // ── Oracle (Admin-controlled, upgradeable to decentralized oracle) ─────────
 
     pub fn update_oracle(
@@ -594,7 +703,27 @@ impl RefractPool {
             .unwrap_or(0)
     }
 
+    /// The RefractPolicyRegistry address this pool currently indexes
+    /// policies into.
+    pub fn policy_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PolicyRegistry)
+    }
+
     // ── Internals ─────────────────────────────────────────────────────────────
+
+    /// Translate the pool's own `CoverageType` into the wire-compatible
+    /// mirror used for the registry's ABI (see the "RefractPolicyRegistry
+    /// ABI mirror" note near the top of this file for why they're separate
+    /// types instead of a shared crate).
+    fn _to_registry_coverage_type(t: &CoverageType) -> RegistryCoverageType {
+        match t {
+            CoverageType::StablecoinDepeg => RegistryCoverageType::StablecoinDepeg,
+            CoverageType::MarketCrash => RegistryCoverageType::MarketCrash,
+            CoverageType::LiquidationShield => RegistryCoverageType::LiquidationShield,
+            CoverageType::SmartContractRisk => RegistryCoverageType::SmartContractRisk,
+            CoverageType::FlightDelay => RegistryCoverageType::FlightDelay,
+        }
+    }
 
     fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
         // Premium = coverage × base_rate × risk_multiplier × (days/365)
