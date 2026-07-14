@@ -34,6 +34,22 @@ pub enum RegistryError {
     NotInitialized = 2,
     Unauthorized = 3,
     PolicyNotFound = 4,
+    PolicyAlreadyExists = 5,
+}
+
+/// Parameters for indexing a policy that the Pool contract already created.
+/// Grouped into a struct (rather than passed as loose arguments) to stay
+/// under clippy's argument-count lint and to give the pool↔registry wiring a
+/// single, easy-to-extend payload type.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PolicyRegistration {
+    pub policy_id: u64,
+    pub holder: Address,
+    pub coverage_type: CoverageType,
+    pub coverage_amount: i128, // 1e7 USDC
+    pub premium: i128,         // 1e7 USDC
+    pub expires_at: u64,       // unix timestamp
 }
 
 /// On-chain policy record.
@@ -54,7 +70,6 @@ pub struct PolicyRecord {
 pub enum DataKey {
     Admin,
     PoolContract,
-    NextPolicyId,
     Policy(u64),             // policy_id → PolicyRecord
     HolderPolicies(Address), // address → Vec<u64>
     TotalPolicies,
@@ -80,7 +95,6 @@ impl RefractPolicyRegistry {
         env.storage()
             .instance()
             .set(&DataKey::PoolContract, &pool_contract);
-        env.storage().instance().set(&DataKey::NextPolicyId, &1u64);
         env.storage().instance().set(&DataKey::TotalPolicies, &0u64);
         env.storage().instance().set(&DataKey::TotalPremium, &0i128);
         Ok(())
@@ -88,22 +102,30 @@ impl RefractPolicyRegistry {
 
     // ─── Policy registration (called by Pool contract) ───────────────────
 
+    /// Index a policy that was already created (and id-assigned) by the Pool
+    /// contract. The Pool is the source of truth for policy ids — the
+    /// registry does not mint its own, it just mirrors the id the pool
+    /// picked so the two stay in lockstep and a policy can be looked up by
+    /// the same id in either contract.
     pub fn register_policy(
         env: Env,
         caller: Address,
-        holder: Address,
-        coverage_type: CoverageType,
-        coverage_amount: i128,
-        premium: i128,
-        expires_at: u64,
+        reg: PolicyRegistration,
     ) -> Result<u64, RegistryError> {
         Self::require_pool_or_admin(&env, &caller)?;
 
-        let policy_id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextPolicyId)
-            .unwrap_or(1);
+        let PolicyRegistration {
+            policy_id,
+            holder,
+            coverage_type,
+            coverage_amount,
+            premium,
+            expires_at,
+        } = reg;
+
+        if env.storage().persistent().has(&DataKey::Policy(policy_id)) {
+            return Err(RegistryError::PolicyAlreadyExists);
+        }
 
         let record = PolicyRecord {
             policy_id,
@@ -148,10 +170,6 @@ impl RefractPolicyRegistry {
         env.storage()
             .instance()
             .set(&DataKey::TotalPremium, &(total_premium + premium));
-
-        env.storage()
-            .instance()
-            .set(&DataKey::NextPolicyId, &(policy_id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "policy_registered"), policy_id),

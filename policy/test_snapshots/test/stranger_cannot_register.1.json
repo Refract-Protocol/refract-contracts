@@ -56,18 +56,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "NextPolicyId"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": 1
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "PoolContract"
                             }
                           ]
@@ -215,25 +203,62 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                },
-                {
-                  "u32": 0
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 100000000
-                  }
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 1000000
-                  }
-                },
-                {
-                  "u64": 9999999999
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "coverage_amount"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 100000000
+                        }
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "coverage_type"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "expires_at"
+                      },
+                      "val": {
+                        "u64": 9999999999
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "holder"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "policy_id"
+                      },
+                      "val": {
+                        "u64": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "premium"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 1000000
+                        }
+                      }
+                    }
+                  ]
                 }
               ]
             }
@@ -323,25 +348,62 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                     },
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                    },
-                    {
-                      "u32": 0
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 100000000
-                      }
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 1000000
-                      }
-                    },
-                    {
-                      "u64": 9999999999
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "coverage_amount"
+                          },
+                          "val": {
+                            "i128": {
+                              "hi": 0,
+                              "lo": 100000000
+                            }
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "coverage_type"
+                          },
+                          "val": {
+                            "u32": 0
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "expires_at"
+                          },
+                          "val": {
+                            "u64": 9999999999
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "holder"
+                          },
+                          "val": {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "policy_id"
+                          },
+                          "val": {
+                            "u64": 1
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "premium"
+                          },
+                          "val": {
+                            "i128": {
+                              "hi": 0,
+                              "lo": 1000000
+                            }
+                          }
+                        }
+                      ]
                     }
                   ]
                 }
