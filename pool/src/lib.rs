@@ -572,6 +572,11 @@ impl RefractPool {
             &payout,
         );
 
+        // Keep the registry's mirrored record in sync now that the policy
+        // is settled. See _deactivate_in_registry for why this is
+        // best-effort and cannot roll back the payout above.
+        Self::_deactivate_in_registry(&env, policy_id);
+
         env.events().publish(
             (symbol_short!("CLAIM"), policy.holder),
             (policy_id, payout, now),
@@ -723,6 +728,33 @@ impl RefractPool {
             CoverageType::SmartContractRisk => RegistryCoverageType::SmartContractRisk,
             CoverageType::FlightDelay => RegistryCoverageType::FlightDelay,
         }
+    }
+
+    /// Deactivate a policy's mirrored record in RefractPolicyRegistry (claim
+    /// paid out, or the policy lapsed). Best-effort and non-blocking: the
+    /// pool's own `Policy.status` is always the authoritative record, so a
+    /// missing registry or a failed/reverted registry call must not stop a
+    /// payout that's already been transferred — money owed to the
+    /// policyholder outranks keeping a secondary index in sync. Uses
+    /// `try_invoke_contract` (rather than `invoke_contract`, which panics on
+    /// any callee failure) specifically so registry issues can't roll back
+    /// funds that already moved.
+    fn _deactivate_in_registry(env: &Env, policy_id: u64) {
+        let registry_addr: Option<Address> = env.storage().instance().get(&DataKey::PolicyRegistry);
+        let Some(registry_addr) = registry_addr else {
+            return;
+        };
+        let _ = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+            &registry_addr,
+            &Symbol::new(env, "deactivate_policy"),
+            Vec::from_array(
+                env,
+                [
+                    env.current_contract_address().into_val(env),
+                    policy_id.into_val(env),
+                ],
+            ),
+        );
     }
 
     fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {

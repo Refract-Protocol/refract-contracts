@@ -237,6 +237,38 @@ fn process_claim_pays_out_when_oracle_triggered() {
 }
 
 #[test]
+fn process_claim_deactivates_the_registry_record() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+    assert!(f.registry.get_policy(&id).is_active);
+
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&id);
+
+    // The pool's own record and the registry's mirrored record must both
+    // reflect the settled claim.
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Claimed
+    );
+    assert!(!f.registry.get_policy(&id).is_active);
+}
+
+#[test]
 fn process_claim_rejected_when_not_triggered() {
     let f = setup();
     let lp = funded(&f, 100_000 * ONE_USDC);
