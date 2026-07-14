@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
     testutils::Address as _,
     token::{Client as TokenClient, StellarAssetClient},
@@ -12,6 +13,7 @@ const ONE_USDC: i128 = 10_000_000; // 1e7 fixed-point
 struct Fixture<'a> {
     env: Env,
     pool: RefractPoolClient<'a>,
+    registry: RefractPolicyRegistryClient<'a>,
     usdc: TokenClient<'a>,
     usdc_admin: StellarAssetClient<'a>,
     admin: Address,
@@ -26,13 +28,22 @@ fn setup<'a>() -> Fixture<'a> {
     let usdc = TokenClient::new(&env, &sac.address());
     let usdc_admin = StellarAssetClient::new(&env, &sac.address());
 
+    // Contract addresses are known as soon as they're registered, so both
+    // the pool and the registry can be wired to each other before either is
+    // initialized — mirrors how they'd be deployed and wired on testnet.
     let pool_id = env.register_contract(None, RefractPool);
     let pool = RefractPoolClient::new(&env, &pool_id);
-    pool.initialize(&admin, &sac.address());
+
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+    let registry = RefractPolicyRegistryClient::new(&env, &registry_id);
+
+    registry.initialize(&admin, &pool_id);
+    pool.initialize(&admin, &sac.address(), &registry_id);
 
     Fixture {
         env,
         pool,
+        registry,
         usdc,
         usdc_admin,
         admin,
@@ -95,6 +106,82 @@ fn buy_policy_charges_quoted_premium() {
     let policy = f.pool.get_policy(&id).unwrap();
     assert_eq!(policy.status, PolicyStatus::Active);
     assert_eq!(policy.coverage_amount, 1_000 * ONE_USDC);
+}
+
+#[test]
+fn buy_policy_registers_in_the_policy_registry() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::MarketCrash,
+        duration_days: 30,
+        trigger_threshold: 3_000,
+    };
+    let quote = f.pool.quote_premium(&params);
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // The pool's own record and the registry's mirrored record must agree —
+    // same id, same holder, same terms — proving buy_policy actually
+    // performed the cross-contract call rather than just writing local
+    // state.
+    let record = f.registry.get_policy(&id);
+    assert_eq!(record.policy_id, id);
+    assert_eq!(record.holder, holder);
+    assert_eq!(
+        record.coverage_type,
+        refract_policy::CoverageType::MarketCrash
+    );
+    assert_eq!(record.coverage_amount, 1_000 * ONE_USDC);
+    assert_eq!(record.premium, quote);
+    assert!(record.is_active);
+
+    let holder_ids = f.registry.get_holder_policy_ids(&holder);
+    assert_eq!(holder_ids.len(), 1);
+    assert_eq!(holder_ids.get(0).unwrap(), id);
+}
+
+#[test]
+fn a_stranger_cannot_register_directly_bypassing_the_pool() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let holder = Address::generate(&f.env);
+    let res = f.registry.try_register_policy(
+        &stranger,
+        &refract_policy::PolicyRegistration {
+            policy_id: 999,
+            holder,
+            coverage_type: refract_policy::CoverageType::StablecoinDepeg,
+            coverage_amount: 1_000 * ONE_USDC,
+            premium: 10 * ONE_USDC,
+            expires_at: 9_999_999_999,
+        },
+    );
+    assert_eq!(res, Err(Ok(refract_policy::RegistryError::Unauthorized)));
+}
+
+#[test]
+fn set_policy_registry_repoints_the_wired_registry() {
+    let f = setup();
+    assert_eq!(f.pool.policy_registry(), Some(f.registry.address.clone()));
+
+    let new_registry_id = f.env.register_contract(None, RefractPolicyRegistry);
+    f.pool.set_policy_registry(&f.admin, &new_registry_id);
+    assert_eq!(f.pool.policy_registry(), Some(new_registry_id));
+}
+
+#[test]
+fn set_policy_registry_rejects_non_admin() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let other_registry_id = f.env.register_contract(None, RefractPolicyRegistry);
+    let res = f
+        .pool
+        .try_set_policy_registry(&stranger, &other_registry_id);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
 }
 
 #[test]

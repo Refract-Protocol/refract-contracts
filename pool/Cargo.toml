@@ -11,3 +11,9 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
+# Dev-only: the pool calls the registry purely through env.invoke_contract()
+# with a locally-mirrored ABI (see the cross-contract wiring note in
+# src/lib.rs) so the actual refract-policy contract code never gets compiled
+# into the pool's wasm. Tests still want the real registry contract deployed
+# in-process to exercise the call end-to-end, hence dev-dependencies only.
+refract-policy = { path = "../policy" }
