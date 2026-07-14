@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    Address, Env, Symbol,
+};
 
 const SCALE: i128 = 10_000_000;
 
@@ -74,18 +77,18 @@ fn crash_trigger_uses_negative_return() {
 }
 
 #[test]
-#[should_panic(expected = "not a relayer")]
 fn unregistered_relayer_cannot_submit() {
     let f = setup();
     let imposter = Address::generate(&f.env);
     let now = f.env.ledger().timestamp();
-    f.oracle.submit(
+    let res = f.oracle.try_submit(
         &imposter,
         &Symbol::new(&f.env, "USDC_PRICE"),
         &9_000_000,
         &now,
         &Symbol::new(&f.env, "test_source"),
     );
+    assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
 }
 
 #[test]
@@ -101,4 +104,69 @@ fn remove_relayer_revokes_access() {
         &Symbol::new(&f.env, "test_source"),
     );
     assert!(res.is_err());
+}
+
+#[test]
+fn double_initialize_is_rejected() {
+    let f = setup();
+    let admin = Address::generate(&f.env);
+    let res = f.oracle.try_initialize(&admin);
+    assert_eq!(res, Err(Ok(OracleError::AlreadyInitialized)));
+}
+
+#[test]
+fn stale_submission_is_rejected() {
+    let f = setup();
+    // Advance the ledger clock well past MAX_STALENESS_SECS relative to the
+    // timestamp being submitted.
+    let stale_ts = f.env.ledger().timestamp();
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = stale_ts + 3_600);
+
+    let res = f.oracle.try_submit(
+        &f.relayer,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &9_000_000,
+        &stale_ts,
+        &Symbol::new(&f.env, "test_source"),
+    );
+    assert_eq!(res, Err(Ok(OracleError::StaleReading)));
+}
+
+#[test]
+fn get_reading_rejects_unknown_feed() {
+    let f = setup();
+    let res = f.oracle.try_get_reading(&Symbol::new(&f.env, "NOPE"));
+    assert_eq!(res, Err(Ok(OracleError::FeedNotFound)));
+}
+
+#[test]
+fn is_triggered_rejects_unknown_coverage_type() {
+    let f = setup();
+    let feed = Symbol::new(&f.env, "USDC_PRICE");
+    submit(&f, "USDC_PRICE", 9_900_000);
+    let res = f.oracle.try_is_triggered(&99, &feed);
+    assert_eq!(res, Err(Ok(OracleError::UnknownCoverageType)));
+}
+
+#[test]
+fn adding_the_same_relayer_twice_is_a_no_op() {
+    let f = setup();
+    // Adding an already-registered relayer must not create a duplicate entry
+    // (previously `add_relayer` pushed unconditionally).
+    f.oracle.add_relayer(&f.relayer);
+    submit(&f, "USDC_PRICE", 9_900_000);
+    f.oracle.remove_relayer(&f.relayer);
+    // A single remove should fully revoke access even though add was called
+    // twice, proving no duplicate entry survived.
+    let now = f.env.ledger().timestamp();
+    let res = f.oracle.try_submit(
+        &f.relayer,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &9_000_000,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
+    assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
 }

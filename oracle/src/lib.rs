@@ -5,7 +5,9 @@
 //! connected to Band Protocol, Pyth, or a Refract-operated relay.
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Map, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
+};
 
 /// Maximum oracle staleness in seconds (30 minutes).
 const MAX_STALENESS_SECS: u64 = 1_800;
@@ -21,9 +23,26 @@ const LIQUIDATION_RATIO_THRESHOLD: i128 = 85 * SCALE / 100; // ratio < 85%
 const TVL_THRESHOLD: i128 = 500_000 * SCALE; // protocol TVL < $500k
 const FLIGHT_DELAY_THRESHOLD: i128 = 120; // delay in minutes (not scaled)
 
+/// Errors returned by the oracle. `require_auth()` still panics on a
+/// missing/invalid signature (unrecoverable); every other recoverable
+/// misuse — wrong principal, unknown feed, stale data, double init —
+/// returns a typed error instead of panicking, matching the convention
+/// used by `RefractPool` and `RefractPolicyRegistry`.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum OracleError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    FeedNotFound = 4,
+    StaleReading = 5,
+    UnknownCoverageType = 6,
+}
+
 /// Oracle reading stored on-chain.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OracleReading {
     /// Signed integer value in 1e7 precision.
     /// For prices: USD price * 1e7.
@@ -48,31 +67,35 @@ pub struct RefractOracle;
 impl RefractOracle {
     // ─── Initialization ──────────────────────────────────────────────────
 
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), OracleError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+            return Err(OracleError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
             .set(&DataKey::Relayers, &Vec::<Address>::new(&env));
+        Ok(())
     }
 
     // ─── Admin ───────────────────────────────────────────────────────────
 
-    pub fn add_relayer(env: Env, relayer: Address) {
-        Self::require_admin(&env);
+    pub fn add_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
         let mut relayers: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::Relayers)
             .unwrap_or_else(|| Vec::new(&env));
-        relayers.push_back(relayer);
-        env.storage().instance().set(&DataKey::Relayers, &relayers);
+        if !relayers.iter().any(|r| r == relayer) {
+            relayers.push_back(relayer);
+            env.storage().instance().set(&DataKey::Relayers, &relayers);
+        }
+        Ok(())
     }
 
-    pub fn remove_relayer(env: Env, relayer: Address) {
-        Self::require_admin(&env);
+    pub fn remove_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
         let relayers: Vec<Address> = env
             .storage()
             .instance()
@@ -86,6 +109,7 @@ impl RefractOracle {
             }
         }
         env.storage().instance().set(&DataKey::Relayers, &filtered);
+        Ok(())
     }
 
     // ─── Data submission ─────────────────────────────────────────────────
@@ -99,15 +123,15 @@ impl RefractOracle {
         value: i128,
         timestamp: u64,
         source: Symbol,
-    ) {
+    ) -> Result<(), OracleError> {
         relayer.require_auth();
-        Self::require_relayer(&env, &relayer);
+        Self::require_relayer(&env, &relayer)?;
 
         // Reject readings older than MAX_STALENESS_SECS
         let ledger_time = env.ledger().timestamp();
         let age = ledger_time.saturating_sub(timestamp);
         if age > MAX_STALENESS_SECS {
-            panic!("reading too stale");
+            return Err(OracleError::StaleReading);
         }
 
         let reading = OracleReading {
@@ -123,39 +147,44 @@ impl RefractOracle {
             (Symbol::new(&env, "oracle_updated"), feed_id),
             (value, timestamp),
         );
+        Ok(())
     }
 
     // ─── Queries ─────────────────────────────────────────────────────────
 
-    /// Get the latest reading for a feed.  Panics if not found or stale.
-    pub fn get_reading(env: Env, feed_id: Symbol) -> OracleReading {
+    /// Get the latest reading for a feed. Errors if not found or stale.
+    pub fn get_reading(env: Env, feed_id: Symbol) -> Result<OracleReading, OracleError> {
         let reading: OracleReading = env
             .storage()
             .persistent()
             .get(&DataKey::Reading(feed_id))
-            .expect("feed not found");
+            .ok_or(OracleError::FeedNotFound)?;
 
         let ledger_time = env.ledger().timestamp();
         let age = ledger_time.saturating_sub(reading.timestamp);
         if age > MAX_STALENESS_SECS {
-            panic!("oracle stale");
+            return Err(OracleError::StaleReading);
         }
 
-        reading
+        Ok(reading)
     }
 
     /// Returns true if the trigger condition for a given coverage type is met.
     /// coverage_type: 0=Depeg, 1=Crash, 2=Liquidation, 3=SmartContract, 4=Flight
-    pub fn is_triggered(env: Env, coverage_type: u32, feed_id: Symbol) -> bool {
-        let reading = Self::get_reading(env, feed_id);
+    pub fn is_triggered(
+        env: Env,
+        coverage_type: u32,
+        feed_id: Symbol,
+    ) -> Result<bool, OracleError> {
+        let reading = Self::get_reading(env, feed_id)?;
 
         match coverage_type {
-            0 => reading.value < DEPEG_PRICE_THRESHOLD,
-            1 => reading.value < CRASH_RETURN_THRESHOLD,
-            2 => reading.value < LIQUIDATION_RATIO_THRESHOLD,
-            3 => reading.value < TVL_THRESHOLD,
-            4 => reading.value > FLIGHT_DELAY_THRESHOLD,
-            _ => panic!("unknown coverage type"),
+            0 => Ok(reading.value < DEPEG_PRICE_THRESHOLD),
+            1 => Ok(reading.value < CRASH_RETURN_THRESHOLD),
+            2 => Ok(reading.value < LIQUIDATION_RATIO_THRESHOLD),
+            3 => Ok(reading.value < TVL_THRESHOLD),
+            4 => Ok(reading.value > FLIGHT_DELAY_THRESHOLD),
+            _ => Err(OracleError::UnknownCoverageType),
         }
     }
 
@@ -176,12 +205,17 @@ impl RefractOracle {
 
     // ─── Internal helpers ─────────────────────────────────────────────────
 
-    fn require_admin(env: &Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    fn require_admin(env: &Env) -> Result<(), OracleError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(OracleError::NotInitialized)?;
         admin.require_auth();
+        Ok(())
     }
 
-    fn require_relayer(env: &Env, caller: &Address) {
+    fn require_relayer(env: &Env, caller: &Address) -> Result<(), OracleError> {
         let relayers: Vec<Address> = env
             .storage()
             .instance()
@@ -189,10 +223,15 @@ impl RefractOracle {
             .unwrap_or_else(|| Vec::new(env));
         let is_relayer = relayers.iter().any(|r| &r == caller);
         // Admin can also submit
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(OracleError::NotInitialized)?;
         if !is_relayer && caller != &admin {
-            panic!("not a relayer");
+            return Err(OracleError::Unauthorized);
         }
+        Ok(())
     }
 }
 
