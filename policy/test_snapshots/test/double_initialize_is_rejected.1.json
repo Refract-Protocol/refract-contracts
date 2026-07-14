@@ -56,18 +56,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "NextPolicyId"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": 1
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "PoolContract"
                             }
                           ]

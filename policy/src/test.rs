@@ -30,6 +30,17 @@ fn setup<'a>() -> Fixture<'a> {
     }
 }
 
+fn registration(policy_id: u64, holder: &Address, ct: CoverageType) -> PolicyRegistration {
+    PolicyRegistration {
+        policy_id,
+        holder: holder.clone(),
+        coverage_type: ct,
+        coverage_amount: TEN_USDC,
+        premium: TEN_USDC / 100,
+        expires_at: 9_999_999_999,
+    }
+}
+
 #[test]
 fn register_indexes_policy_per_holder() {
     let f = setup();
@@ -37,13 +48,9 @@ fn register_indexes_policy_per_holder() {
 
     let id = f.registry.register_policy(
         &f.pool,
-        &holder,
-        &CoverageType::StablecoinDepeg,
-        &TEN_USDC,
-        &(TEN_USDC / 100),
-        &9_999_999_999,
+        &registration(42, &holder, CoverageType::StablecoinDepeg),
     );
-    assert_eq!(id, 1);
+    assert_eq!(id, 42);
 
     let rec = f.registry.get_policy(&id);
     assert_eq!(rec.holder, holder);
@@ -51,7 +58,7 @@ fn register_indexes_policy_per_holder() {
 
     let ids = f.registry.get_holder_policy_ids(&holder);
     assert_eq!(ids.len(), 1);
-    assert_eq!(ids.get(0).unwrap(), 1);
+    assert_eq!(ids.get(0).unwrap(), 42);
 }
 
 #[test]
@@ -60,13 +67,9 @@ fn admin_may_register() {
     let holder = Address::generate(&f.env);
     let id = f.registry.register_policy(
         &f.admin,
-        &holder,
-        &CoverageType::MarketCrash,
-        &TEN_USDC,
-        &(TEN_USDC / 100),
-        &9_999_999_999,
+        &registration(7, &holder, CoverageType::MarketCrash),
     );
-    assert_eq!(id, 1);
+    assert_eq!(id, 7);
 }
 
 #[test]
@@ -77,13 +80,26 @@ fn stranger_cannot_register() {
     // mock_all_auths satisfies require_auth, but the principal check still rejects.
     let res = f.registry.try_register_policy(
         &stranger,
-        &holder,
-        &CoverageType::StablecoinDepeg,
-        &TEN_USDC,
-        &(TEN_USDC / 100),
-        &9_999_999_999,
+        &registration(1, &holder, CoverageType::StablecoinDepeg),
     );
     assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
+}
+
+#[test]
+fn registering_a_duplicate_policy_id_is_rejected() {
+    let f = setup();
+    let holder = Address::generate(&f.env);
+    f.registry.register_policy(
+        &f.pool,
+        &registration(1, &holder, CoverageType::StablecoinDepeg),
+    );
+
+    let other_holder = Address::generate(&f.env);
+    let res = f.registry.try_register_policy(
+        &f.pool,
+        &registration(1, &other_holder, CoverageType::MarketCrash),
+    );
+    assert_eq!(res, Err(Ok(RegistryError::PolicyAlreadyExists)));
 }
 
 #[test]
@@ -92,11 +108,7 @@ fn deactivate_flips_active_flag() {
     let holder = Address::generate(&f.env);
     let id = f.registry.register_policy(
         &f.pool,
-        &holder,
-        &CoverageType::StablecoinDepeg,
-        &TEN_USDC,
-        &(TEN_USDC / 100),
-        &9_999_999_999,
+        &registration(1, &holder, CoverageType::StablecoinDepeg),
     );
 
     f.registry.deactivate_policy(&f.pool, &id);
