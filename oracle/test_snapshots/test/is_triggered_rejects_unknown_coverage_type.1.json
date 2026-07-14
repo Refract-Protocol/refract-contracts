@@ -26,15 +26,30 @@
     ],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
         {
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "function_name": "remove_relayer",
+              "function_name": "submit",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "symbol": "USDC_PRICE"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 9900000
+                  }
+                },
+                {
+                  "u64": 0
+                },
+                {
+                  "symbol": "test_source"
                 }
               ]
             }
@@ -91,13 +106,18 @@
       [
         {
           "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
             "key": {
-              "ledger_key_nonce": {
-                "nonce": 5541220902715666415
-              }
+              "vec": [
+                {
+                  "symbol": "Reading"
+                },
+                {
+                  "symbol": "USDC_PRICE"
+                }
+              ]
             },
-            "durability": "temporary"
+            "durability": "persistent"
           }
         },
         [
@@ -106,19 +126,54 @@
             "data": {
               "contract_data": {
                 "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
                 "key": {
-                  "ledger_key_nonce": {
-                    "nonce": 5541220902715666415
-                  }
+                  "vec": [
+                    {
+                      "symbol": "Reading"
+                    },
+                    {
+                      "symbol": "USDC_PRICE"
+                    }
+                  ]
                 },
-                "durability": "temporary",
-                "val": "void"
+                "durability": "persistent",
+                "val": {
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "source"
+                      },
+                      "val": {
+                        "symbol": "test_source"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "timestamp"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "value"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 9900000
+                        }
+                      }
+                    }
+                  ]
+                }
               }
             },
             "ext": "v0"
           },
-          6311999
+          4095
         ]
       ],
       [
@@ -165,7 +220,11 @@
                           ]
                         },
                         "val": {
-                          "vec": []
+                          "vec": [
+                            {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                            }
+                          ]
                         }
                       }
                     ]
@@ -176,6 +235,39 @@
             "ext": "v0"
           },
           4095
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+            "key": {
+              "ledger_key_nonce": {
+                "nonce": 5541220902715666415
+              }
+            },
+            "durability": "temporary"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+                "key": {
+                  "ledger_key_nonce": {
+                    "nonce": 5541220902715666415
+                  }
+                },
+                "durability": "temporary",
+                "val": "void"
+              }
+            },
+            "ext": "v0"
+          },
+          6311999
         ]
       ],
       [
@@ -311,53 +403,6 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
               },
               {
-                "symbol": "remove_relayer"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "remove_relayer"
-              }
-            ],
-            "data": "void"
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
-              },
-              {
                 "symbol": "submit"
               }
             ],
@@ -372,7 +417,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 9000000
+                    "lo": 9900000
                   }
                 },
                 {
@@ -380,6 +425,39 @@
                 },
                 {
                   "symbol": "test_source"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "oracle_updated"
+              },
+              {
+                "symbol": "USDC_PRICE"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 9900000
+                  }
+                },
+                {
+                  "u64": 0
                 }
               ]
             }
@@ -403,9 +481,63 @@
                 "symbol": "submit"
               }
             ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
+              },
+              {
+                "symbol": "is_triggered"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "u32": 99
+                },
+                {
+                  "symbol": "USDC_PRICE"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "is_triggered"
+              }
+            ],
             "data": {
               "error": {
-                "contract": 3
+                "contract": 6
               }
             }
           }
@@ -426,7 +558,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 6
                 }
               }
             ],
@@ -451,7 +583,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 6
                 }
               }
             ],
@@ -461,27 +593,15 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "submit"
+                  "symbol": "is_triggered"
                 },
                 {
                   "vec": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                      "u32": 99
                     },
                     {
                       "symbol": "USDC_PRICE"
-                    },
-                    {
-                      "i128": {
-                        "hi": 0,
-                        "lo": 9000000
-                      }
-                    },
-                    {
-                      "u64": 0
-                    },
-                    {
-                      "symbol": "test_source"
                     }
                   ]
                 }
