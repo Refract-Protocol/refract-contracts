@@ -855,3 +855,6 @@ impl RefractPool {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod pricing_proptest;
