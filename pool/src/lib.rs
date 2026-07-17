@@ -607,6 +607,9 @@ impl RefractPool {
         env.storage()
             .instance()
             .set(&DataKey::PolicyRegistry, &policy_registry);
+
+        env.events()
+            .publish((symbol_short!("REG_SET"), caller), (policy_registry,));
         Ok(())
     }
 
@@ -629,12 +632,15 @@ impl RefractPool {
         }
 
         env.storage().instance().set(
-            &DataKey::OracleData(coverage_type),
+            &DataKey::OracleData(coverage_type.clone()),
             &OracleData {
                 value,
                 updated_at: env.ledger().timestamp(),
             },
         );
+
+        env.events()
+            .publish((symbol_short!("ORACLE"), coverage_type), (value,));
         Ok(())
     }
 

@@ -3,7 +3,7 @@
 use super::*;
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Events as _},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env,
 };
@@ -174,6 +174,18 @@ fn set_policy_registry_repoints_the_wired_registry() {
 }
 
 #[test]
+fn set_policy_registry_emits_an_event() {
+    let f = setup();
+    let new_registry_id = f.env.register_contract(None, RefractPolicyRegistry);
+
+    let before = f.env.events().all().len();
+    f.pool.set_policy_registry(&f.admin, &new_registry_id);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
+}
+
+#[test]
 fn set_policy_registry_rejects_non_admin() {
     let f = setup();
     let stranger = Address::generate(&f.env);
@@ -200,6 +212,21 @@ fn buy_policy_rejected_when_over_utilization() {
     };
     let res = f.pool.try_buy_policy(&holder, &params);
     assert_eq!(res, Err(Ok(PoolError::InsufficientCapacity)));
+}
+
+#[test]
+fn update_oracle_emits_an_event() {
+    let f = setup();
+
+    let before = f.env.events().all().len();
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
 }
 
 #[test]
