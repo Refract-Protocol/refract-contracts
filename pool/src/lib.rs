@@ -94,6 +94,7 @@ pub enum PoolError {
     ZeroAmount = 11,
     InsufficientShares = 12,
     CapitalLocked = 13, // can't withdraw during a claim event
+    PolicyNotYetExpired = 14,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -583,6 +584,52 @@ impl RefractPool {
         );
 
         Ok(payout)
+    }
+
+    /// Sweep a lapsed policy: frees the coverage capacity it was holding
+    /// against and deactivates its mirrored registry record. Anyone may call
+    /// this once the policy's `end_time` has passed and it was never
+    /// claimed — permissionless, mirroring `process_claim`. Capital itself
+    /// isn't touched: the premium was already earned by LPs when the policy
+    /// was bought; only the *coverage* obligation (and the utilization it
+    /// consumes) ends, freeing room for new policies.
+    pub fn expire_policy(env: Env, policy_id: u64) -> Result<(), PoolError> {
+        let mut policy: Policy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Policy(policy_id))
+            .ok_or(PoolError::PolicyNotFound)?;
+
+        if policy.status != PolicyStatus::Active {
+            return Err(PoolError::AlreadyClaimed);
+        }
+
+        let now = env.ledger().timestamp();
+        if now <= policy.end_time {
+            return Err(PoolError::PolicyNotYetExpired);
+        }
+
+        policy.status = PolicyStatus::Expired;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Policy(policy_id), &policy);
+
+        let mut total_cov: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCoverage)
+            .unwrap_or(0);
+        total_cov = (total_cov - policy.coverage_amount).max(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalCoverage, &total_cov);
+
+        Self::_deactivate_in_registry(&env, policy_id);
+
+        env.events()
+            .publish((symbol_short!("EXPIRE"), policy.holder), (policy_id, now));
+
+        Ok(())
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
