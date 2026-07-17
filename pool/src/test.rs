@@ -330,3 +330,35 @@ fn withdraw_returns_capital_to_provider() {
     assert_eq!(f.pool.shares_of(&lp), 0);
     assert_eq!(f.usdc.balance(&lp), 10_000 * ONE_USDC);
 }
+
+#[test]
+fn withdraw_capital_rejects_zero_shares() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    let res = f.pool.try_withdraw_capital(&lp, &0);
+    assert_eq!(res, Err(Ok(PoolError::ZeroAmount)));
+}
+
+#[test]
+fn withdraw_capital_rejects_negative_shares() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    // A negative share count must never be able to mint capital out of the
+    // pool via the `total_capital - usdc_out` accounting below this guard.
+    let res = f.pool.try_withdraw_capital(&lp, &-1);
+    assert_eq!(res, Err(Ok(PoolError::ZeroAmount)));
+}
+
+#[test]
+fn withdraw_capital_rejects_more_shares_than_owned() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    let res = f.pool.try_withdraw_capital(&lp, &(shares + 1));
+    assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}
