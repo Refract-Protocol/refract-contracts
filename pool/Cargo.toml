@@ -17,3 +17,4 @@ soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
 # into the pool's wasm. Tests still want the real registry contract deployed
 # in-process to exercise the call end-to-end, hence dev-dependencies only.
 refract-policy = { path = "../policy" }
+proptest = "1.5.0"
