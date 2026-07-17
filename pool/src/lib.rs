@@ -265,6 +265,9 @@ impl RefractPool {
     pub fn withdraw_capital(env: Env, provider: Address, shares: i128) -> Result<i128, PoolError> {
         provider.require_auth();
         Self::assert_initialized(&env)?;
+        if shares <= 0 {
+            return Err(PoolError::ZeroAmount);
+        }
 
         let user_shares: i128 = env
             .storage()
