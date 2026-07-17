@@ -88,8 +88,10 @@ impl RefractOracle {
             .get(&DataKey::Relayers)
             .unwrap_or_else(|| Vec::new(&env));
         if !relayers.iter().any(|r| r == relayer) {
-            relayers.push_back(relayer);
+            relayers.push_back(relayer.clone());
             env.storage().instance().set(&DataKey::Relayers, &relayers);
+            env.events()
+                .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         }
         Ok(())
     }
@@ -108,7 +110,12 @@ impl RefractOracle {
                 filtered.push_back(r);
             }
         }
+        let removed = filtered.len() != relayers.len();
         env.storage().instance().set(&DataKey::Relayers, &filtered);
+        if removed {
+            env.events()
+                .publish((Symbol::new(&env, "relayer_removed"),), (relayer,));
+        }
         Ok(())
     }
 

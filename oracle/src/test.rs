@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, Symbol,
 };
 
@@ -148,6 +148,52 @@ fn is_triggered_rejects_unknown_coverage_type() {
     submit(&f, "USDC_PRICE", 9_900_000);
     let res = f.oracle.try_is_triggered(&99, &feed);
     assert_eq!(res, Err(Ok(OracleError::UnknownCoverageType)));
+}
+
+#[test]
+fn add_relayer_emits_an_event() {
+    let f = setup();
+    let new_relayer = Address::generate(&f.env);
+
+    let before = f.env.events().all().len();
+    f.oracle.add_relayer(&new_relayer);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
+}
+
+#[test]
+fn adding_a_duplicate_relayer_does_not_emit_an_event() {
+    let f = setup();
+
+    let before = f.env.events().all().len();
+    f.oracle.add_relayer(&f.relayer); // already added in setup()
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before);
+}
+
+#[test]
+fn remove_relayer_emits_an_event() {
+    let f = setup();
+
+    let before = f.env.events().all().len();
+    f.oracle.remove_relayer(&f.relayer);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
+}
+
+#[test]
+fn removing_an_unknown_relayer_does_not_emit_an_event() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+
+    let before = f.env.events().all().len();
+    f.oracle.remove_relayer(&stranger);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before);
 }
 
 #[test]
