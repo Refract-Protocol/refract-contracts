@@ -58,6 +58,27 @@ fn funded(f: &Fixture, amount: i128) -> Address {
 }
 
 #[test]
+fn double_initialize_is_rejected() {
+    let f = setup();
+    let res = f
+        .pool
+        .try_initialize(&f.admin, &f.usdc.address, &f.registry.address);
+    assert_eq!(res, Err(Ok(PoolError::AlreadyInitialized)));
+}
+
+#[test]
+fn provide_capital_rejects_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+
+    let lp = Address::generate(&env);
+    let res = pool.try_provide_capital(&lp, &(10 * ONE_USDC));
+    assert_eq!(res, Err(Ok(PoolError::NotInitialized)));
+}
+
+#[test]
 fn initialize_sets_defaults() {
     let f = setup();
     let stats = f.pool.pool_stats();
