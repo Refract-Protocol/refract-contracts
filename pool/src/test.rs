@@ -4,6 +4,7 @@ use super::*;
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
+    testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env,
 };
@@ -55,6 +56,27 @@ fn funded(f: &Fixture, amount: i128) -> Address {
     let a = Address::generate(&f.env);
     f.usdc_admin.mint(&a, &amount);
     a
+}
+
+#[test]
+fn double_initialize_is_rejected() {
+    let f = setup();
+    let res = f
+        .pool
+        .try_initialize(&f.admin, &f.usdc.address, &f.registry.address);
+    assert_eq!(res, Err(Ok(PoolError::AlreadyInitialized)));
+}
+
+#[test]
+fn provide_capital_rejects_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+
+    let lp = Address::generate(&env);
+    let res = pool.try_provide_capital(&lp, &(10 * ONE_USDC));
+    assert_eq!(res, Err(Ok(PoolError::NotInitialized)));
 }
 
 #[test]
@@ -197,6 +219,42 @@ fn set_policy_registry_rejects_non_admin() {
 }
 
 #[test]
+fn buy_policy_rejected_below_min_coverage() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    // Default config's min_coverage is 10 USDC; ask for 1 USDC.
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let res = f.pool.try_buy_policy(&holder, &params);
+    assert_eq!(res, Err(Ok(PoolError::InsufficientCapacity)));
+}
+
+#[test]
+fn buy_policy_rejected_above_max_coverage() {
+    let f = setup();
+    let lp = funded(&f, 1_000_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000_000 * ONE_USDC));
+
+    // Default config's max_coverage is 5,000 USDC; ask for 5,001.
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 5_001 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let res = f.pool.try_buy_policy(&holder, &params);
+    assert_eq!(res, Err(Ok(PoolError::InsufficientCapacity)));
+}
+
+#[test]
 fn buy_policy_rejected_when_over_utilization() {
     let f = setup();
     let lp = funded(&f, 1_000 * ONE_USDC);
@@ -322,6 +380,42 @@ fn process_claim_rejected_when_not_triggered() {
 }
 
 #[test]
+fn process_claim_rejects_unknown_policy() {
+    let f = setup();
+    let res = f.pool.try_process_claim(&404u64);
+    assert_eq!(res, Err(Ok(PoolError::PolicyNotFound)));
+}
+
+#[test]
+fn process_claim_rejects_after_end_time() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // USDC depegged, but the coverage window has already lapsed.
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 31 * 86_400;
+    });
+
+    let res = f.pool.try_process_claim(&id);
+    assert_eq!(res, Err(Ok(PoolError::PolicyExpired)));
+}
+
+#[test]
 fn double_claim_is_rejected() {
     let f = setup();
     let lp = funded(&f, 100_000 * ONE_USDC);
@@ -347,6 +441,85 @@ fn double_claim_is_rejected() {
 }
 
 #[test]
+fn expire_policy_frees_coverage_and_deactivates_registry_record() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+    assert_eq!(f.pool.pool_stats().total_coverage, 500 * ONE_USDC);
+    assert!(f.registry.get_policy(&id).is_active);
+
+    // Fast-forward well past the 30-day coverage window.
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 31 * 86_400;
+    });
+
+    f.pool.expire_policy(&id);
+
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Expired
+    );
+    assert_eq!(f.pool.pool_stats().total_coverage, 0);
+    assert!(!f.registry.get_policy(&id).is_active);
+}
+
+#[test]
+fn expire_policy_rejects_before_end_time() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    let res = f.pool.try_expire_policy(&id);
+    assert_eq!(res, Err(Ok(PoolError::PolicyNotYetExpired)));
+}
+
+#[test]
+fn expire_policy_rejects_an_already_claimed_policy() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&id);
+
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 31 * 86_400;
+    });
+    let res = f.pool.try_expire_policy(&id);
+    assert_eq!(res, Err(Ok(PoolError::AlreadyClaimed)));
+}
+
+#[test]
 fn withdraw_returns_capital_to_provider() {
     let f = setup();
     let lp = funded(&f, 10_000 * ONE_USDC);
@@ -356,4 +529,36 @@ fn withdraw_returns_capital_to_provider() {
     assert_eq!(out, 10_000 * ONE_USDC);
     assert_eq!(f.pool.shares_of(&lp), 0);
     assert_eq!(f.usdc.balance(&lp), 10_000 * ONE_USDC);
+}
+
+#[test]
+fn withdraw_capital_rejects_zero_shares() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    let res = f.pool.try_withdraw_capital(&lp, &0);
+    assert_eq!(res, Err(Ok(PoolError::ZeroAmount)));
+}
+
+#[test]
+fn withdraw_capital_rejects_negative_shares() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    // A negative share count must never be able to mint capital out of the
+    // pool via the `total_capital - usdc_out` accounting below this guard.
+    let res = f.pool.try_withdraw_capital(&lp, &-1);
+    assert_eq!(res, Err(Ok(PoolError::ZeroAmount)));
+}
+
+#[test]
+fn withdraw_capital_rejects_more_shares_than_owned() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    let res = f.pool.try_withdraw_capital(&lp, &(shares + 1));
+    assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
