@@ -3,7 +3,7 @@
 use super::*;
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env,
 };
@@ -292,6 +292,42 @@ fn process_claim_rejected_when_not_triggered() {
 
     let res = f.pool.try_process_claim(&id);
     assert_eq!(res, Err(Ok(PoolError::PolicyNotTriggered)));
+}
+
+#[test]
+fn process_claim_rejects_unknown_policy() {
+    let f = setup();
+    let res = f.pool.try_process_claim(&404u64);
+    assert_eq!(res, Err(Ok(PoolError::PolicyNotFound)));
+}
+
+#[test]
+fn process_claim_rejects_after_end_time() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // USDC depegged, but the coverage window has already lapsed.
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 31 * 86_400;
+    });
+
+    let res = f.pool.try_process_claim(&id);
+    assert_eq!(res, Err(Ok(PoolError::PolicyExpired)));
 }
 
 #[test]
