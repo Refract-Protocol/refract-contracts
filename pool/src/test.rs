@@ -185,6 +185,42 @@ fn set_policy_registry_rejects_non_admin() {
 }
 
 #[test]
+fn buy_policy_rejected_below_min_coverage() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    // Default config's min_coverage is 10 USDC; ask for 1 USDC.
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let res = f.pool.try_buy_policy(&holder, &params);
+    assert_eq!(res, Err(Ok(PoolError::InsufficientCapacity)));
+}
+
+#[test]
+fn buy_policy_rejected_above_max_coverage() {
+    let f = setup();
+    let lp = funded(&f, 1_000_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000_000 * ONE_USDC));
+
+    // Default config's max_coverage is 5,000 USDC; ask for 5,001.
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 5_001 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let res = f.pool.try_buy_policy(&holder, &params);
+    assert_eq!(res, Err(Ok(PoolError::InsufficientCapacity)));
+}
+
+#[test]
 fn buy_policy_rejected_when_over_utilization() {
     let f = setup();
     let lp = funded(&f, 1_000 * ONE_USDC);
