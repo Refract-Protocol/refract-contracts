@@ -3,8 +3,7 @@
 use super::*;
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env,
 };
@@ -227,7 +226,7 @@ fn buy_policy_rejected_below_min_coverage() {
     // Default config's min_coverage is 10 USDC; ask for 1 USDC.
     let holder = funded(&f, 1_000 * ONE_USDC);
     let params = PolicyParams {
-        coverage_amount: 1 * ONE_USDC,
+        coverage_amount: ONE_USDC,
         coverage_type: CoverageType::StablecoinDepeg,
         duration_days: 30,
         trigger_threshold: 500,
