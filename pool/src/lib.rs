@@ -149,6 +149,10 @@ pub struct PoolStats {
     pub utilization_bps: u32,
     pub share_price: i128,
     pub apy_estimate_bps: u32,
+    /// Coverage the pool can still underwrite before buy_policy() starts
+    /// rejecting on InsufficientCapacity, i.e. max(0, max_utilization_bps
+    /// of total_capital, minus total_coverage already committed).
+    pub available_capacity: i128,
 }
 
 // ── Oracle Reading ────────────────────────────────────────────────────────────
@@ -735,6 +739,9 @@ impl RefractPool {
             total_capital * PRECISION / total_shares
         };
         let apy_estimate_bps = config.base_premium_rate_bps * utilization_bps / 10_000;
+        // Mirrors the InsufficientCapacity check in buy_policy().
+        let max_coverage_capacity = total_capital * (config.max_utilization_bps as i128) / BPS;
+        let available_capacity = (max_coverage_capacity - total_coverage).max(0);
 
         PoolStats {
             total_capital,
@@ -742,6 +749,7 @@ impl RefractPool {
             total_shares,
             utilization_bps,
             share_price,
+            available_capacity,
             apy_estimate_bps,
         }
     }

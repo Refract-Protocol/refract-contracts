@@ -104,6 +104,39 @@ fn provide_capital_mints_shares_one_to_one_initially() {
 }
 
 #[test]
+fn pool_stats_available_capacity_is_zero_before_any_capital_is_provided() {
+    let f = setup();
+    assert_eq!(f.pool.pool_stats().available_capacity, 0);
+}
+
+#[test]
+fn pool_stats_available_capacity_tracks_max_utilization_and_shrinks_as_policies_are_bought() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    // Default max_utilization_bps is 8000 (80%) of total_capital.
+    assert_eq!(f.pool.pool_stats().available_capacity, 80_000 * ONE_USDC);
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let premium = f.pool.quote_premium(&params);
+    f.pool.buy_policy(&holder, &params);
+
+    // The premium accrues into total_capital (LPs earn it), which nudges
+    // max_coverage_capacity up slightly even as total_coverage grows by
+    // the full coverage_amount — so capacity doesn't drop by exactly
+    // coverage_amount, only by coverage_amount minus 80% of the premium.
+    let expected = 80_000 * ONE_USDC - 1_000 * ONE_USDC + (premium * 8_000 / 10_000);
+    assert_eq!(f.pool.pool_stats().available_capacity, expected);
+}
+
+#[test]
 fn buy_policy_charges_quoted_premium() {
     let f = setup();
     let lp = funded(&f, 100_000 * ONE_USDC);
