@@ -151,6 +151,23 @@ fn is_triggered_rejects_unknown_coverage_type() {
 }
 
 #[test]
+fn list_relayers_reflects_adds_and_removes() {
+    let f = setup();
+    // setup() already added f.relayer.
+    assert_eq!(f.oracle.list_relayers(), Vec::from_array(&f.env, [f.relayer.clone()]));
+
+    let second = Address::generate(&f.env);
+    f.oracle.add_relayer(&second);
+    assert_eq!(
+        f.oracle.list_relayers(),
+        Vec::from_array(&f.env, [f.relayer.clone(), second.clone()])
+    );
+
+    f.oracle.remove_relayer(&f.relayer);
+    assert_eq!(f.oracle.list_relayers(), Vec::from_array(&f.env, [second]));
+}
+
+#[test]
 fn add_relayer_emits_an_event() {
     let f = setup();
     let new_relayer = Address::generate(&f.env);

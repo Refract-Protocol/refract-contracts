@@ -119,6 +119,16 @@ impl RefractOracle {
         Ok(())
     }
 
+    /// Addresses currently authorized to submit oracle readings. Before
+    /// this, the only way to answer "who can relay right now" was to
+    /// replay add_relayer/remove_relayer events from history.
+    pub fn list_relayers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Relayers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     // ─── Data submission ─────────────────────────────────────────────────
 
     /// Submit a reading for a given feed.
