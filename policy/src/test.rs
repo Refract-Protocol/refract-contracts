@@ -62,6 +62,40 @@ fn register_indexes_policy_per_holder() {
 }
 
 #[test]
+fn get_holder_active_policy_ids_excludes_deactivated_policies() {
+    let f = setup();
+    let holder = Address::generate(&f.env);
+
+    f.registry.register_policy(
+        &f.pool,
+        &registration(1, &holder, CoverageType::StablecoinDepeg),
+    );
+    f.registry.register_policy(
+        &f.pool,
+        &registration(2, &holder, CoverageType::MarketCrash),
+    );
+
+    // Both start active.
+    let active = f.registry.get_holder_active_policy_ids(&holder);
+    assert_eq!(active.len(), 2);
+
+    f.registry.deactivate_policy(&f.pool, &1);
+
+    let active = f.registry.get_holder_active_policy_ids(&holder);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active.get(0).unwrap(), 2);
+    // get_holder_policy_ids is unaffected — it's the full history, not just active.
+    assert_eq!(f.registry.get_holder_policy_ids(&holder).len(), 2);
+}
+
+#[test]
+fn get_holder_active_policy_ids_is_empty_for_an_unknown_holder() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    assert_eq!(f.registry.get_holder_active_policy_ids(&stranger).len(), 0);
+}
+
+#[test]
 fn admin_may_register() {
     let f = setup();
     let holder = Address::generate(&f.env);

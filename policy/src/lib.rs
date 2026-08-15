@@ -216,6 +216,32 @@ impl RefractPolicyRegistry {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Same as get_holder_policy_ids, filtered to currently-active policies.
+    /// Without this, a caller wanting "what does this holder have active
+    /// right now" had to fetch every id the holder has ever had and call
+    /// get_policy on each one just to check is_active.
+    pub fn get_holder_active_policy_ids(env: Env, holder: Address) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderPolicies(holder))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut active = Vec::new(&env);
+        for id in ids.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PolicyRecord>(&DataKey::Policy(id))
+            {
+                if record.is_active {
+                    active.push_back(id);
+                }
+            }
+        }
+        active
+    }
+
     pub fn get_stats(env: Env) -> Map<Symbol, i128> {
         let mut stats: Map<Symbol, i128> = Map::new(&env);
         let total: u64 = env
