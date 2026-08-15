@@ -104,6 +104,43 @@ fn provide_capital_mints_shares_one_to_one_initially() {
 }
 
 #[test]
+fn quote_shares_matches_what_provide_capital_actually_mints() {
+    let f = setup();
+    let lp = funded(&f, 20_000 * ONE_USDC);
+
+    // Quoting must not require auth or move funds — it's a pure preview.
+    let quoted_first = f.pool.quote_shares(&(10_000 * ONE_USDC));
+    assert_eq!(quoted_first, 10_000 * ONE_USDC); // 1:1 on an empty pool
+    assert_eq!(f.usdc.balance(&lp), 20_000 * ONE_USDC); // untouched
+
+    let minted_first = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    assert_eq!(quoted_first, minted_first);
+
+    // Once the pool isn't empty / 1:1, the quote must still match reality.
+    let quoted_second = f.pool.quote_shares(&(5_000 * ONE_USDC));
+    let minted_second = f.pool.provide_capital(&lp, &(5_000 * ONE_USDC));
+    assert_eq!(quoted_second, minted_second);
+}
+
+#[test]
+fn quote_shares_rejects_a_non_positive_amount() {
+    let f = setup();
+    let res = f.pool.try_quote_shares(&0);
+    assert_eq!(res, Err(Ok(PoolError::ZeroAmount)));
+}
+
+#[test]
+fn quote_shares_rejects_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+
+    let res = pool.try_quote_shares(&(10 * ONE_USDC));
+    assert_eq!(res, Err(Ok(PoolError::NotInitialized)));
+}
+
+#[test]
 fn pool_stats_available_capacity_is_zero_before_any_capital_is_provided() {
     let f = setup();
     assert_eq!(f.pool.pool_stats().available_capacity, 0);

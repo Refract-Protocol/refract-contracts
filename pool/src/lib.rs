@@ -213,6 +213,18 @@ impl RefractPool {
 
     // ── Capital Provision ─────────────────────────────────────────────────────
 
+    /// Preview the shares a deposit of `amount` would mint, without
+    /// depositing. Mirrors quote_premium()'s role on the policy side —
+    /// provide_capital() requires the caller's auth and moves real funds,
+    /// so this is the only way to check the exchange rate first.
+    pub fn quote_shares(env: Env, amount: i128) -> Result<i128, PoolError> {
+        Self::assert_initialized(&env)?;
+        if amount <= 0 {
+            return Err(PoolError::ZeroAmount);
+        }
+        Ok(Self::_calc_shares(&env, amount))
+    }
+
     /// Deposit USDC as risk capital, receive pool shares.
     pub fn provide_capital(env: Env, provider: Address, amount: i128) -> Result<i128, PoolError> {
         provider.require_auth();
