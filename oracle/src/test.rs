@@ -250,6 +250,36 @@ fn removing_an_unknown_relayer_does_not_emit_an_event() {
 }
 
 #[test]
+fn set_admin_updates_the_stored_admin() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+
+    f.oracle.set_admin(&new_admin);
+
+    // require_admin() authorizes via `admin.require_auth()` on whatever
+    // address is currently stored (see require_admin), not by comparing
+    // against an explicit caller argument — so under mock_all_auths() a
+    // call succeeding doesn't by itself prove the admin actually moved.
+    // Read storage directly to confirm it did.
+    let stored_admin: Address = f.env.as_contract(&f.oracle.address, || {
+        f.env.storage().instance().get(&DataKey::Admin).unwrap()
+    });
+    assert_eq!(stored_admin, new_admin);
+}
+
+#[test]
+fn set_admin_emits_an_event() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+
+    let before = f.env.events().all().len();
+    f.oracle.set_admin(&new_admin);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
+}
+
+#[test]
 fn adding_the_same_relayer_twice_is_a_no_op() {
     let f = setup();
     // Adding an already-registered relayer must not create a duplicate entry

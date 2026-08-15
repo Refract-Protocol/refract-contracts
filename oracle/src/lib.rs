@@ -130,6 +130,18 @@ impl RefractOracle {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Rotate the admin key. The only recovery path if the current admin
+    /// key is lost or compromised — without it, add_relayer/remove_relayer
+    /// and this function itself would be permanently stuck on whatever key
+    /// was set at initialize().
+    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events()
+            .publish((Symbol::new(&env, "admin_set"),), (new_admin,));
+        Ok(())
+    }
+
     // ─── Data submission ─────────────────────────────────────────────────
 
     /// Submit a reading for a given feed.

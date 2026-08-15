@@ -230,6 +230,43 @@ impl RefractPolicyRegistry {
         Ok(())
     }
 
+    // ─── Admin ────────────────────────────────────────────────────────────
+
+    /// Repoint the RefractPool this registry trusts to call
+    /// register_policy()/deactivate_policy(). Only needed after a pool
+    /// redeploy/migration — `initialize` already wires the pool address
+    /// set at deploy time. Deliberately admin-only rather than
+    /// admin-or-pool (unlike register_policy/deactivate_policy): the pool
+    /// itself must never be able to redirect which pool address the
+    /// registry trusts.
+    pub fn set_pool_contract(
+        env: Env,
+        caller: Address,
+        pool_contract: Address,
+    ) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolContract, &pool_contract);
+
+        env.events()
+            .publish((Symbol::new(&env, "pool_contract_set"),), (pool_contract,));
+        Ok(())
+    }
+
+    /// Rotate the admin key. The only recovery path if the current admin
+    /// key is lost or compromised — without it, set_pool_contract and this
+    /// function itself would be permanently stuck on whatever key was set
+    /// at initialize().
+    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_set"),), (new_admin,));
+        Ok(())
+    }
+
     // ─── Queries ──────────────────────────────────────────────────────────
 
     pub fn get_policy(env: Env, policy_id: u64) -> Result<PolicyRecord, RegistryError> {
@@ -315,6 +352,21 @@ impl RefractPolicyRegistry {
             .get(&DataKey::PoolContract)
             .ok_or(RegistryError::NotInitialized)?;
         if caller != &admin && caller != &pool {
+            return Err(RegistryError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Stricter than require_pool_or_admin: used by set_pool_contract and
+    /// set_admin, which must never be callable by the pool contract itself.
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RegistryError::NotInitialized)?;
+        if caller != &admin {
             return Err(RegistryError::Unauthorized);
         }
         Ok(())

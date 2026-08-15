@@ -360,6 +360,105 @@ fn set_policy_registry_rejects_non_admin() {
 }
 
 #[test]
+fn set_admin_rotates_who_can_call_admin_gated_functions() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+
+    f.pool.set_admin(&f.admin, &new_admin);
+
+    // The old admin has lost access...
+    let new_registry_id = f.env.register_contract(None, RefractPolicyRegistry);
+    let res = f.pool.try_set_policy_registry(&f.admin, &new_registry_id);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
+
+    // ...and the new admin has it.
+    f.pool.set_policy_registry(&new_admin, &new_registry_id);
+    assert_eq!(f.pool.policy_registry(), Some(new_registry_id));
+}
+
+#[test]
+fn set_admin_rejects_non_admin() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let new_admin = Address::generate(&f.env);
+    let res = f.pool.try_set_admin(&stranger, &new_admin);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
+}
+
+#[test]
+fn set_admin_emits_an_event() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+
+    let before = f.env.events().all().len();
+    f.pool.set_admin(&f.admin, &new_admin);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
+}
+
+#[test]
+fn set_pool_config_replaces_the_operational_parameters() {
+    let f = setup();
+    let new_config = PoolConfig {
+        base_premium_rate_bps: 500,
+        max_utilization_bps: 9_000,
+        min_coverage: 50 * ONE_USDC,
+        max_coverage: 10_000 * ONE_USDC,
+        lockup_days: 14,
+    };
+
+    f.pool.set_pool_config(&f.admin, &new_config);
+
+    // Exercise the new bounds end to end: a coverage amount that would
+    // have been rejected under the old 5,000 USDC max_coverage (from
+    // initialize_sets_defaults) now succeeds under the new 10,000 cap.
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 8_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    assert!(f.pool.try_buy_policy(&holder, &params).is_ok());
+}
+
+#[test]
+fn set_pool_config_rejects_non_admin() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let new_config = PoolConfig {
+        base_premium_rate_bps: 500,
+        max_utilization_bps: 9_000,
+        min_coverage: 50 * ONE_USDC,
+        max_coverage: 10_000 * ONE_USDC,
+        lockup_days: 14,
+    };
+    let res = f.pool.try_set_pool_config(&stranger, &new_config);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
+}
+
+#[test]
+fn set_pool_config_emits_an_event() {
+    let f = setup();
+    let new_config = PoolConfig {
+        base_premium_rate_bps: 500,
+        max_utilization_bps: 9_000,
+        min_coverage: 50 * ONE_USDC,
+        max_coverage: 10_000 * ONE_USDC,
+        lockup_days: 14,
+    };
+
+    let before = f.env.events().all().len();
+    f.pool.set_pool_config(&f.admin, &new_config);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
+}
+
+#[test]
 fn buy_policy_rejected_below_min_coverage() {
     let f = setup();
     let lp = funded(&f, 100_000 * ONE_USDC);

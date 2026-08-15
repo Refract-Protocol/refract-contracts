@@ -235,3 +235,86 @@ fn deactivate_rejects_unknown_id() {
     let res = f.registry.try_deactivate_policy(&f.pool, &404u64);
     assert_eq!(res, Err(Ok(RegistryError::PolicyNotFound)));
 }
+
+#[test]
+fn set_pool_contract_repoints_who_may_register_and_deactivate() {
+    let f = setup();
+    let new_pool = Address::generate(&f.env);
+
+    f.registry.set_pool_contract(&f.admin, &new_pool);
+
+    // The old pool address has lost access...
+    let holder = Address::generate(&f.env);
+    let res = f.registry.try_register_policy(
+        &f.pool,
+        &registration(1, &holder, CoverageType::StablecoinDepeg),
+    );
+    assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
+
+    // ...and the new pool address has it.
+    let id = f.registry.register_policy(
+        &new_pool,
+        &registration(1, &holder, CoverageType::StablecoinDepeg),
+    );
+    assert_eq!(id, 1);
+}
+
+#[test]
+fn set_pool_contract_rejects_non_admin() {
+    let f = setup();
+    let new_pool = Address::generate(&f.env);
+    // mock_all_auths satisfies require_auth, but the principal check still
+    // rejects — and unlike register_policy/deactivate_policy, the current
+    // pool address itself isn't privileged here either.
+    let res = f.registry.try_set_pool_contract(&f.pool, &new_pool);
+    assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
+}
+
+#[test]
+fn set_pool_contract_emits_an_event() {
+    let f = setup();
+    let new_pool = Address::generate(&f.env);
+
+    let before = f.env.events().all().len();
+    f.registry.set_pool_contract(&f.admin, &new_pool);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
+}
+
+#[test]
+fn set_admin_rotates_who_can_call_admin_gated_functions() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+
+    f.registry.set_admin(&f.admin, &new_admin);
+
+    // The old admin has lost access...
+    let new_pool = Address::generate(&f.env);
+    let res = f.registry.try_set_pool_contract(&f.admin, &new_pool);
+    assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
+
+    // ...and the new admin has it.
+    f.registry.set_pool_contract(&new_admin, &new_pool);
+}
+
+#[test]
+fn set_admin_rejects_non_admin() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+    // The pool contract isn't privileged for admin rotation either.
+    let res = f.registry.try_set_admin(&f.pool, &new_admin);
+    assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
+}
+
+#[test]
+fn set_admin_emits_an_event() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+
+    let before = f.env.events().all().len();
+    f.registry.set_admin(&f.admin, &new_admin);
+    let after = f.env.events().all().len();
+
+    assert_eq!(after, before + 1);
+}

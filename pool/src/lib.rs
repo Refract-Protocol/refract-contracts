@@ -663,21 +663,40 @@ impl RefractPool {
         caller: Address,
         policy_registry: Address,
     ) -> Result<(), PoolError> {
-        caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(PoolError::NotInitialized)?;
-        if caller != admin {
-            return Err(PoolError::Unauthorized);
-        }
+        Self::require_admin(&env, &caller)?;
         env.storage()
             .instance()
             .set(&DataKey::PolicyRegistry, &policy_registry);
 
         env.events()
             .publish((symbol_short!("REG_SET"), caller), (policy_registry,));
+        Ok(())
+    }
+
+    /// Rotate the admin key. The only recovery path if the current admin
+    /// key is lost or compromised — without it, every admin-gated call
+    /// (set_policy_registry, update_oracle, set_pool_config, this function
+    /// itself) would be permanently stuck on whatever key was set at
+    /// initialize().
+    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events()
+            .publish((symbol_short!("ADMIN_SET"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Replace the pool's operational parameters (rates, utilization cap,
+    /// coverage bounds, lockup period) wholesale. Full-replace rather than
+    /// per-field setters — PoolConfig is already read and written as a
+    /// single unit everywhere else in this contract, so a partial-update
+    /// API would be new surface area this contract doesn't otherwise have.
+    pub fn set_pool_config(env: Env, caller: Address, config: PoolConfig) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::PoolConfig, &config);
+
+        env.events().publish((symbol_short!("CFG_SET"),), ());
         Ok(())
     }
 
@@ -689,15 +708,7 @@ impl RefractPool {
         coverage_type: CoverageType,
         value: i128,
     ) -> Result<(), PoolError> {
-        caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(PoolError::NotInitialized)?;
-        if caller != admin {
-            return Err(PoolError::Unauthorized);
-        }
+        Self::require_admin(&env, &caller)?;
 
         env.storage().instance().set(
             &DataKey::OracleData(coverage_type.clone()),
@@ -993,6 +1004,22 @@ impl RefractPool {
     fn assert_initialized(env: &Env) -> Result<(), PoolError> {
         if !env.storage().instance().has(&DataKey::Initialized) {
             return Err(PoolError::NotInitialized);
+        }
+        Ok(())
+    }
+
+    /// Shared by every admin-gated entrypoint (set_policy_registry,
+    /// set_admin, set_pool_config, update_oracle) so the auth + principal
+    /// check can't drift between them.
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), PoolError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PoolError::NotInitialized)?;
+        if caller != &admin {
+            return Err(PoolError::Unauthorized);
         }
         Ok(())
     }
