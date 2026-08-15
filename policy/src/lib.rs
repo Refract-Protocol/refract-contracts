@@ -332,6 +332,21 @@ impl RefractPolicyRegistry {
         stats
     }
 
+    /// The address currently authorized to call set_admin()/
+    /// set_pool_contract(). Without this, verifying who holds admin
+    /// control meant replaying event history instead of just reading
+    /// current state.
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// The RefractPool address this registry currently trusts to call
+    /// register_policy()/deactivate_policy(). Without this,
+    /// set_pool_contract() would be a write with no matching read.
+    pub fn pool_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PoolContract)
+    }
+
     // ─── Internal ─────────────────────────────────────────────────────────
 
     /// Only the registered Pool contract or the admin may mutate the registry.

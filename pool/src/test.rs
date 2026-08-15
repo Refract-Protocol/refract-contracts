@@ -459,6 +459,53 @@ fn set_pool_config_emits_an_event() {
 }
 
 #[test]
+fn admin_reflects_the_initialized_admin_and_tracks_rotation() {
+    let f = setup();
+    assert_eq!(f.pool.admin(), Some(f.admin.clone()));
+
+    let new_admin = Address::generate(&f.env);
+    f.pool.set_admin(&f.admin, &new_admin);
+    assert_eq!(f.pool.admin(), Some(new_admin));
+}
+
+#[test]
+fn admin_is_none_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    assert_eq!(pool.admin(), None);
+}
+
+#[test]
+fn pool_config_reflects_defaults_and_tracks_updates() {
+    let f = setup();
+    let defaults = f.pool.pool_config().unwrap();
+    assert_eq!(defaults.base_premium_rate_bps, 300);
+    assert_eq!(defaults.max_utilization_bps, 8_000);
+    assert_eq!(defaults.lockup_days, 7);
+
+    let new_config = PoolConfig {
+        base_premium_rate_bps: 500,
+        max_utilization_bps: 9_000,
+        min_coverage: 50 * ONE_USDC,
+        max_coverage: 10_000 * ONE_USDC,
+        lockup_days: 14,
+    };
+    f.pool.set_pool_config(&f.admin, &new_config);
+    assert_eq!(f.pool.pool_config(), Some(new_config));
+}
+
+#[test]
+fn pool_config_is_none_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    assert_eq!(pool.pool_config(), None);
+}
+
+#[test]
 fn buy_policy_rejected_below_min_coverage() {
     let f = setup();
     let lp = funded(&f, 100_000 * ONE_USDC);

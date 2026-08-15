@@ -133,7 +133,7 @@ pub struct Policy {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PoolConfig {
     pub base_premium_rate_bps: u32, // annual base rate, e.g. 300 = 3% APY
     pub max_utilization_bps: u32,   // max coverage/capital ratio, e.g. 8000 = 80%
@@ -835,6 +835,24 @@ impl RefractPool {
     /// policies into.
     pub fn policy_registry(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PolicyRegistry)
+    }
+
+    /// The address currently authorized to call every admin-gated function
+    /// (set_admin, set_policy_registry, set_pool_config, update_oracle).
+    /// Without this, verifying who holds admin control — e.g. confirming a
+    /// set_admin() rotation actually landed — meant replaying event history
+    /// instead of just reading current state.
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// The pool's current operational parameters (rates, utilization cap,
+    /// coverage bounds, lockup period). Without this, set_pool_config()
+    /// would be a write with no matching read — callers had no way to
+    /// check the live values before deciding what to change, or to notice
+    /// if they'd drifted from whatever a client cached at deploy time.
+    pub fn pool_config(env: Env) -> Option<PoolConfig> {
+        env.storage().instance().get(&DataKey::PoolConfig)
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────

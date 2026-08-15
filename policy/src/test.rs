@@ -318,3 +318,32 @@ fn set_admin_emits_an_event() {
 
     assert_eq!(after, before + 1);
 }
+
+#[test]
+fn admin_reflects_the_initialized_admin_and_tracks_rotation() {
+    let f = setup();
+    assert_eq!(f.registry.admin(), Some(f.admin.clone()));
+
+    let new_admin = Address::generate(&f.env);
+    f.registry.set_admin(&f.admin, &new_admin);
+    assert_eq!(f.registry.admin(), Some(new_admin));
+}
+
+#[test]
+fn admin_is_none_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, RefractPolicyRegistry);
+    let registry = RefractPolicyRegistryClient::new(&env, &id);
+    assert_eq!(registry.admin(), None);
+}
+
+#[test]
+fn pool_contract_reflects_initialize_and_tracks_repointing() {
+    let f = setup();
+    assert_eq!(f.registry.pool_contract(), Some(f.pool.clone()));
+
+    let new_pool = Address::generate(&f.env);
+    f.registry.set_pool_contract(&f.admin, &new_pool);
+    assert_eq!(f.registry.pool_contract(), Some(new_pool));
+}

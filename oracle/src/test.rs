@@ -367,6 +367,24 @@ fn set_admin_emits_an_event() {
 }
 
 #[test]
+fn admin_reflects_set_admin() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+
+    f.oracle.set_admin(&new_admin);
+    assert_eq!(f.oracle.admin(), Some(new_admin));
+}
+
+#[test]
+fn admin_is_none_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register_contract(None, RefractOracle);
+    let oracle = RefractOracleClient::new(&env, &id);
+    assert_eq!(oracle.admin(), None);
+}
+
+#[test]
 fn adding_the_same_relayer_twice_is_a_no_op() {
     let f = setup();
     // Adding an already-registered relayer must not create a duplicate entry

@@ -131,6 +131,14 @@ impl RefractOracle {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// The address currently authorized to call
+    /// add_relayer()/remove_relayer()/set_admin(). Without this, verifying
+    /// who holds admin control meant replaying event history instead of
+    /// just reading current state.
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
     /// Rotate the admin key. The only recovery path if the current admin
     /// key is lost or compromised — without it, add_relayer/remove_relayer
     /// and this function itself would be permanently stuck on whatever key
