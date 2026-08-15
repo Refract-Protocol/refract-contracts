@@ -39,6 +39,7 @@ pub enum OracleError {
     StaleReading = 5,
     UnknownCoverageType = 6,
     FutureTimestamp = 7,
+    StaleSubmission = 8, // older than the reading already stored for this feed
 }
 
 /// Oracle reading stored on-chain.
@@ -173,6 +174,24 @@ impl RefractOracle {
         let age = ledger_time - timestamp;
         if age > MAX_STALENESS_SECS {
             return Err(OracleError::StaleReading);
+        }
+
+        // Multiple relayers can be registered at once (add_relayer supports
+        // a list), and nothing orders their submissions relative to each
+        // other. Without this check, a submission that's individually
+        // "fresh enough" (within MAX_STALENESS_SECS of now) could still be
+        // older than the reading already on file — e.g. two relayers racing,
+        // or one submitting out of order — silently regressing the feed
+        // backward in time and potentially un-triggering (or reviving) a
+        // claim based on stale data replacing a more current reading.
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
+        {
+            if timestamp < existing.timestamp {
+                return Err(OracleError::StaleSubmission);
+            }
         }
 
         let reading = OracleReading {

@@ -168,6 +168,93 @@ fn a_timestamp_equal_to_the_current_ledger_time_is_accepted() {
 }
 
 #[test]
+fn submitting_an_older_timestamp_than_the_stored_reading_is_rejected() {
+    let f = setup();
+    let feed = Symbol::new(&f.env, "USDC_PRICE");
+    // Advance first so the "100s older" submission below can't underflow
+    // regardless of Env::default()'s starting timestamp.
+    let t1 = f.env.ledger().timestamp() + 1_000;
+    f.env.ledger().with_mut(|li| li.timestamp = t1);
+
+    // Freshest reading on file: submitted at t1.
+    f.oracle.submit(
+        &f.relayer,
+        &feed,
+        &9_990_000,
+        &t1,
+        &Symbol::new(&f.env, "test_source"),
+    );
+
+    // A second relayer (or a delayed retry) submits a reading 100s older —
+    // individually still well within MAX_STALENESS_SECS of the current
+    // ledger time, so this isn't caught by the StaleReading check, only by
+    // the ordering check.
+    let res = f.oracle.try_submit(
+        &f.relayer,
+        &feed,
+        &9_000_000, // would look like a depeg if this silently won
+        &(t1 - 100),
+        &Symbol::new(&f.env, "test_source"),
+    );
+    assert_eq!(res, Err(Ok(OracleError::StaleSubmission)));
+
+    // The fresher reading must still be what's on file.
+    assert_eq!(f.oracle.get_reading(&feed).value, 9_990_000);
+}
+
+#[test]
+fn submitting_a_newer_timestamp_replaces_the_stored_reading() {
+    let f = setup();
+    let feed = Symbol::new(&f.env, "USDC_PRICE");
+    let now = f.env.ledger().timestamp();
+
+    f.oracle.submit(
+        &f.relayer,
+        &feed,
+        &9_990_000,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
+
+    f.env.ledger().with_mut(|li| li.timestamp = now + 60);
+    f.oracle.submit(
+        &f.relayer,
+        &feed,
+        &9_000_000,
+        &(now + 60),
+        &Symbol::new(&f.env, "test_source"),
+    );
+
+    assert_eq!(f.oracle.get_reading(&feed).value, 9_000_000);
+}
+
+#[test]
+fn resubmitting_the_same_timestamp_is_allowed() {
+    let f = setup();
+    let feed = Symbol::new(&f.env, "USDC_PRICE");
+    let now = f.env.ledger().timestamp();
+
+    f.oracle.submit(
+        &f.relayer,
+        &feed,
+        &9_990_000,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
+
+    // Equal timestamps aren't a regression — must not be rejected as stale.
+    let res = f.oracle.try_submit(
+        &f.relayer,
+        &feed,
+        &9_980_000,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
+    assert!(res.is_ok());
+    assert_eq!(f.oracle.get_reading(&feed).value, 9_980_000);
+}
+
+#[test]
 fn get_reading_rejects_unknown_feed() {
     let f = setup();
     let res = f.oracle.try_get_reading(&Symbol::new(&f.env, "NOPE"));
