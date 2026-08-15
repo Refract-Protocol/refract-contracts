@@ -188,3 +188,52 @@ fn calc_shares_is_1to1_when_pool_is_empty() {
         })
         .unwrap();
 }
+
+/// `_quote_withdrawal` must never let a caller preview more USDC than the
+/// pool actually holds. Regression coverage for the bug where a `shares`
+/// argument above `total_shares` made `usdc_out` exceed `total_capital`,
+/// which drove `new_capital` negative and skipped the utilization guard
+/// (gated on `new_capital > 0`) — returning a fabricated payout instead of
+/// erroring. `shares` is deliberately generated up to 2x `total_shares` so
+/// the property exercises both sides of that boundary.
+#[test]
+fn quote_withdrawal_never_returns_more_than_total_capital() {
+    let env = Env::default();
+    let pool_id = env.register_contract(None, RefractPool);
+
+    let cases = (
+        1i128..1_000_000_000 * PRECISION, // total_capital
+        1i128..1_000_000_000 * PRECISION, // total_shares
+        0i128..1_000_000_000 * PRECISION, // total_coverage
+        1i128..2_000_000_000 * PRECISION, // shares requested (may exceed total_shares)
+    );
+    TestRunner::default()
+        .run(
+            &cases,
+            |(total_capital, total_shares, total_coverage, shares)| {
+                let result = env.as_contract(&pool_id, || {
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::TotalCapital, &total_capital);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::TotalShares, &total_shares);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::TotalCoverage, &total_coverage);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::PoolConfig, &config());
+                    RefractPool::_quote_withdrawal(&env, shares)
+                });
+
+                if shares > total_shares {
+                    prop_assert_eq!(result, Err(PoolError::InsufficientShares));
+                } else if let Ok(usdc_out) = result {
+                    prop_assert!(usdc_out <= total_capital);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+}
