@@ -821,3 +821,16 @@ fn quote_withdrawal_and_withdraw_capital_agree_when_utilization_would_be_exceede
     let withdrawn = f.pool.try_withdraw_capital(&lp, &six_thousand_shares);
     assert_eq!(withdrawn, Err(Ok(PoolError::CapitalLocked)));
 }
+
+#[test]
+fn quote_withdrawal_rejects_more_shares_than_exist() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    // No caller can ever hold more shares than total_shares, so quoting
+    // more than that must error rather than silently returning a payout
+    // larger than the entire pool holds (see _quote_withdrawal).
+    let res = f.pool.try_quote_withdrawal(&(shares + 1));
+    assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}

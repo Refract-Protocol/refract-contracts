@@ -920,6 +920,20 @@ impl RefractPool {
             .unwrap_or(0);
         let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
 
+        // No caller can ever hold more than total_shares (provide_capital/
+        // withdraw_capital maintain that invariant), so a quote for more
+        // than that is impossible to honor. Without this check, shares far
+        // above total_shares makes usdc_out exceed total_capital, which
+        // drives new_capital negative below and skips the utilization
+        // check entirely (its guard is `new_capital > 0`) — returning a
+        // fabricated payout instead of an error. withdraw_capital() itself
+        // can never trigger this: it already rejects shares above the
+        // caller's own balance, which is always <= total_shares, before
+        // reaching this shared helper.
+        if shares > total_shares {
+            return Err(PoolError::InsufficientShares);
+        }
+
         let usdc_out = if total_shares == 0 {
             0
         } else {
