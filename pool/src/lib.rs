@@ -748,6 +748,26 @@ impl RefractPool {
         env.storage().persistent().get(&DataKey::Policy(id))
     }
 
+    /// Batch-fetch multiple policies by id in one call — e.g. every id from
+    /// user_policies(), which otherwise requires one get_policy() round trip
+    /// per id to render a holder's full policy list. Skips any id that
+    /// doesn't resolve rather than failing the whole batch (shouldn't
+    /// happen for ids sourced from user_policies(), but this stays
+    /// defensive instead of letting one bad id block the rest).
+    pub fn get_policies(env: Env, ids: Vec<u64>) -> Vec<Policy> {
+        let mut out = Vec::new(&env);
+        for id in ids.iter() {
+            if let Some(policy) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Policy>(&DataKey::Policy(id))
+            {
+                out.push_back(policy);
+            }
+        }
+        out
+    }
+
     pub fn user_policies(env: Env, user: Address) -> Vec<u64> {
         env.storage()
             .persistent()

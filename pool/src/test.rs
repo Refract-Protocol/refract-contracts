@@ -200,6 +200,69 @@ fn buy_policy_charges_quoted_premium() {
 }
 
 #[test]
+fn get_policies_batch_fetches_every_id_a_holder_owns() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let params_a = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let params_b = PolicyParams {
+        coverage_amount: 2_000 * ONE_USDC,
+        coverage_type: CoverageType::MarketCrash,
+        duration_days: 30,
+        trigger_threshold: 3000,
+    };
+    let id_a = f.pool.buy_policy(&holder, &params_a);
+    let id_b = f.pool.buy_policy(&holder, &params_b);
+
+    let ids = f.pool.user_policies(&holder);
+    let policies = f.pool.get_policies(&ids);
+
+    assert_eq!(policies.len(), 2);
+    assert!(policies
+        .iter()
+        .any(|p| p.id == id_a && p.coverage_amount == 1_000 * ONE_USDC));
+    assert!(policies
+        .iter()
+        .any(|p| p.id == id_b && p.coverage_amount == 2_000 * ONE_USDC));
+}
+
+#[test]
+fn get_policies_skips_unknown_ids_instead_of_failing_the_whole_batch() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    let ids = Vec::from_array(&f.env, [id, 999u64]);
+    let policies = f.pool.get_policies(&ids);
+
+    assert_eq!(policies.len(), 1);
+    assert_eq!(policies.get(0).unwrap().id, id);
+}
+
+#[test]
+fn get_policies_returns_empty_for_an_empty_id_list() {
+    let f = setup();
+    let policies = f.pool.get_policies(&Vec::new(&f.env));
+    assert_eq!(policies.len(), 0);
+}
+
+#[test]
 fn buy_policy_registers_in_the_policy_registry() {
     let f = setup();
     let lp = funded(&f, 100_000 * ONE_USDC);
