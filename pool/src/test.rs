@@ -342,6 +342,71 @@ fn buy_policy_rejected_when_over_utilization() {
 }
 
 #[test]
+fn quote_premium_rejects_the_same_cases_buy_policy_would_reject() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+
+    // Below min_coverage (10 USDC).
+    let below_min = PolicyParams {
+        coverage_amount: ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    assert_eq!(
+        f.pool.try_quote_premium(&below_min),
+        Err(Ok(PoolError::InsufficientCapacity))
+    );
+
+    // Above max_coverage (5,000 USDC).
+    let above_max = PolicyParams {
+        coverage_amount: 5_001 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    assert_eq!(
+        f.pool.try_quote_premium(&above_max),
+        Err(Ok(PoolError::InsufficientCapacity))
+    );
+
+    // Within per-policy bounds but over the pool's 80%-of-1,000 utilization cap.
+    let over_utilization = PolicyParams {
+        coverage_amount: 900 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    assert_eq!(
+        f.pool.try_quote_premium(&over_utilization),
+        Err(Ok(PoolError::InsufficientCapacity))
+    );
+}
+
+#[test]
+fn quote_premium_matches_what_buy_policy_actually_charges() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+
+    let quoted = f.pool.quote_premium(&params);
+    let before = f.usdc.balance(&holder);
+    f.pool.buy_policy(&holder, &params);
+    let after = f.usdc.balance(&holder);
+
+    assert_eq!(quoted, before - after);
+}
+
+#[test]
 fn update_oracle_emits_an_event() {
     let f = setup();
 

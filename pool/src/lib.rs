@@ -347,9 +347,15 @@ impl RefractPool {
     // ── Policy Purchase ───────────────────────────────────────────────────────
 
     /// Calculate the premium for a proposed policy.
+    /// Preview the premium for a proposed policy. Before this, quote_premium
+    /// happily returned a number for a coverage_amount buy_policy() would
+    /// actually reject (below min_coverage, above max_coverage, or more than
+    /// the pool's remaining underwriting capacity) — a caller had no way to
+    /// tell a quote was for a purchase that could never succeed.
     pub fn quote_premium(env: Env, params: PolicyParams) -> Result<i128, PoolError> {
         Self::assert_initialized(&env)?;
         let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+        Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
         Ok(Self::_calc_premium(&config, &params))
     }
 
@@ -359,31 +365,7 @@ impl RefractPool {
         Self::assert_initialized(&env)?;
 
         let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
-
-        if params.coverage_amount < config.min_coverage {
-            return Err(PoolError::InsufficientCapacity);
-        }
-        if params.coverage_amount > config.max_coverage {
-            return Err(PoolError::InsufficientCapacity);
-        }
-
-        // Check pool can absorb this coverage
-        let total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let total_coverage: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCoverage)
-            .unwrap_or(0);
-        let new_coverage = total_coverage + params.coverage_amount;
-        let max_coverage = total_capital * (config.max_utilization_bps as i128) / BPS;
-
-        if new_coverage > max_coverage {
-            return Err(PoolError::InsufficientCapacity);
-        }
+        let new_coverage = Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
 
         let premium = Self::_calc_premium(&config, &params);
         let now = env.ledger().timestamp();
@@ -859,6 +841,43 @@ impl RefractPool {
         } else {
             amount * total_shares / total_capital
         }
+    }
+
+    /// Shared by quote_premium() and buy_policy() so the preview and the
+    /// real purchase path can never silently diverge. Checks coverage_amount
+    /// against config.min_coverage/max_coverage and the pool's remaining
+    /// underwriting capacity, returning the resulting total_coverage (which
+    /// buy_policy() needs afterward to update storage) on success.
+    fn _check_coverage_capacity(
+        env: &Env,
+        config: &PoolConfig,
+        coverage_amount: i128,
+    ) -> Result<i128, PoolError> {
+        if coverage_amount < config.min_coverage {
+            return Err(PoolError::InsufficientCapacity);
+        }
+        if coverage_amount > config.max_coverage {
+            return Err(PoolError::InsufficientCapacity);
+        }
+
+        let total_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCapital)
+            .unwrap_or(0);
+        let total_coverage: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCoverage)
+            .unwrap_or(0);
+        let new_coverage = total_coverage + coverage_amount;
+        let max_coverage_capacity = total_capital * (config.max_utilization_bps as i128) / BPS;
+
+        if new_coverage > max_coverage_capacity {
+            return Err(PoolError::InsufficientCapacity);
+        }
+
+        Ok(new_coverage)
     }
 
     /// Shared by quote_withdrawal() and withdraw_capital() so the preview
