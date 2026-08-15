@@ -57,6 +57,15 @@ fn funded(f: &Fixture, amount: i128) -> Address {
     a
 }
 
+/// Helper: advance the ledger past the default 7-day LP lockup (see
+/// initialize_sets_defaults) so a test can withdraw_capital() without the
+/// lockup itself being what's under test.
+fn past_lockup(f: &Fixture) {
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 7 * 86_400;
+    });
+}
+
 #[test]
 fn double_initialize_is_rejected() {
     let f = setup();
@@ -721,11 +730,88 @@ fn withdraw_returns_capital_to_provider() {
     let f = setup();
     let lp = funded(&f, 10_000 * ONE_USDC);
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    past_lockup(&f);
 
     let out = f.pool.withdraw_capital(&lp, &shares);
     assert_eq!(out, 10_000 * ONE_USDC);
     assert_eq!(f.pool.shares_of(&lp), 0);
     assert_eq!(f.usdc.balance(&lp), 10_000 * ONE_USDC);
+}
+
+#[test]
+fn withdraw_capital_rejects_before_the_lockup_expires() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    // Still within the default 7-day lockup (initialize_sets_defaults).
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 6 * 86_400;
+    });
+
+    let res = f.pool.try_withdraw_capital(&lp, &shares);
+    assert_eq!(res, Err(Ok(PoolError::LockupActive)));
+}
+
+#[test]
+fn withdraw_capital_succeeds_exactly_at_the_lockup_boundary() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    past_lockup(&f); // lands exactly at last_deposit + lockup_days, not past it
+
+    let res = f.pool.try_withdraw_capital(&lp, &shares);
+    assert!(res.is_ok());
+}
+
+#[test]
+fn provide_capital_resets_the_lockup_clock_on_a_top_up() {
+    let f = setup();
+    let lp = funded(&f, 20_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    past_lockup(&f);
+
+    // Topping up re-locks the provider's entire position, not just the
+    // newly-added shares — see the comment in provide_capital().
+    let more_shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    let total_shares = f.pool.shares_of(&lp);
+
+    let res = f.pool.try_withdraw_capital(&lp, &more_shares);
+    assert_eq!(res, Err(Ok(PoolError::LockupActive)));
+
+    past_lockup(&f);
+    let out = f.pool.withdraw_capital(&lp, &total_shares);
+    assert_eq!(out, 20_000 * ONE_USDC);
+}
+
+#[test]
+fn lockup_expires_at_is_none_for_a_provider_who_never_deposited() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    assert_eq!(f.pool.lockup_expires_at(&stranger), None);
+}
+
+#[test]
+fn lockup_expires_at_matches_the_enforced_boundary() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    let expires_at = f.pool.lockup_expires_at(&lp).unwrap();
+    assert_eq!(expires_at, f.env.ledger().timestamp() + 7 * 86_400);
+
+    f.env.ledger().with_mut(|li| {
+        li.timestamp = expires_at - 1;
+    });
+    assert_eq!(
+        f.pool.try_withdraw_capital(&lp, &ONE_USDC),
+        Err(Ok(PoolError::LockupActive))
+    );
+
+    f.env.ledger().with_mut(|li| {
+        li.timestamp = expires_at;
+    });
+    assert!(f.pool.try_withdraw_capital(&lp, &ONE_USDC).is_ok());
 }
 
 #[test]
@@ -765,6 +851,7 @@ fn quote_withdrawal_matches_what_withdraw_capital_actually_returns() {
     let f = setup();
     let lp = funded(&f, 10_000 * ONE_USDC);
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    past_lockup(&f);
 
     // Quoting must not require auth or check/touch the caller's balance.
     let quoted = f.pool.quote_withdrawal(&shares);
@@ -795,6 +882,7 @@ fn quote_withdrawal_and_withdraw_capital_agree_when_utilization_would_be_exceede
     let f = setup();
     let lp = funded(&f, 10_000 * ONE_USDC);
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    past_lockup(&f);
 
     // 4,500 USDC stays under the pool's per-policy max_coverage (5,000 USDC
     // in this crate's default PoolConfig).

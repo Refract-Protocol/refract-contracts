@@ -74,6 +74,7 @@ pub enum DataKey {
     PoolConfig,
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
+    LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -95,6 +96,7 @@ pub enum PoolError {
     InsufficientShares = 12,
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
+    LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -272,6 +274,16 @@ impl RefractPool {
             .persistent()
             .set(&DataKey::Shares(provider.clone()), &user_shares);
 
+        // Resets the lockup clock on every deposit, including top-ups —
+        // simpler than tracking per-deposit tranches, at the cost of a
+        // top-up re-locking a provider's entire position rather than just
+        // the newly-added portion. Matches this contract's existing
+        // pool-wide (not per-tranche) granularity elsewhere.
+        env.storage().persistent().set(
+            &DataKey::LastDeposit(provider.clone()),
+            &env.ledger().timestamp(),
+        );
+
         env.events()
             .publish((symbol_short!("PROVIDE"), provider), (amount, shares));
         Ok(shares)
@@ -308,6 +320,18 @@ impl RefractPool {
             .unwrap_or(0);
         if user_shares < shares {
             return Err(PoolError::InsufficientShares);
+        }
+
+        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+        let last_deposit: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LastDeposit(provider.clone()));
+        if let Some(last_deposit) = last_deposit {
+            let unlocks_at = last_deposit + (config.lockup_days as u64) * 86_400;
+            if env.ledger().timestamp() < unlocks_at {
+                return Err(PoolError::LockupActive);
+            }
         }
 
         let usdc_out = Self::_quote_withdrawal(&env, shares)?;
@@ -780,6 +804,20 @@ impl RefractPool {
             .persistent()
             .get(&DataKey::Shares(user))
             .unwrap_or(0)
+    }
+
+    /// Unix timestamp at which `provider` may next successfully call
+    /// withdraw_capital(), or `None` if they've never deposited (and so
+    /// aren't subject to any lockup). Lets a caller check the same
+    /// `LockupActive` condition withdraw_capital() enforces without
+    /// submitting a transaction that would just be rejected.
+    pub fn lockup_expires_at(env: Env, provider: Address) -> Option<u64> {
+        let last_deposit: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LastDeposit(provider))?;
+        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+        Some(last_deposit + (config.lockup_days as u64) * 86_400)
     }
 
     /// The RefractPolicyRegistry address this pool currently indexes
