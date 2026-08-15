@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _},
+    Address, Env,
+};
 
 const TEN_USDC: i128 = 100_000_000;
 
@@ -147,6 +150,69 @@ fn deactivate_flips_active_flag() {
 
     f.registry.deactivate_policy(&f.pool, &id);
     assert!(!f.registry.get_policy(&id).is_active);
+}
+
+#[test]
+fn get_stats_tracks_total_and_active_policies_separately() {
+    let f = setup();
+    let holder = Address::generate(&f.env);
+    f.registry.register_policy(
+        &f.pool,
+        &registration(1, &holder, CoverageType::StablecoinDepeg),
+    );
+    f.registry.register_policy(
+        &f.pool,
+        &registration(2, &holder, CoverageType::MarketCrash),
+    );
+
+    let stats = f.registry.get_stats();
+    assert_eq!(stats.get(Symbol::new(&f.env, "total_policies")).unwrap(), 2);
+    assert_eq!(
+        stats.get(Symbol::new(&f.env, "active_policies")).unwrap(),
+        2
+    );
+
+    f.registry.deactivate_policy(&f.pool, &1);
+
+    let stats = f.registry.get_stats();
+    // total_policies is a historical count and doesn't drop on deactivation.
+    assert_eq!(stats.get(Symbol::new(&f.env, "total_policies")).unwrap(), 2);
+    assert_eq!(
+        stats.get(Symbol::new(&f.env, "active_policies")).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn deactivating_an_already_inactive_policy_is_a_no_op() {
+    let f = setup();
+    let holder = Address::generate(&f.env);
+    let id = f.registry.register_policy(
+        &f.pool,
+        &registration(1, &holder, CoverageType::StablecoinDepeg),
+    );
+
+    f.registry.deactivate_policy(&f.pool, &id);
+    let before_events = f.env.events().all().len();
+    let before_active = f
+        .registry
+        .get_stats()
+        .get(Symbol::new(&f.env, "active_policies"))
+        .unwrap();
+
+    // Deactivating an already-inactive policy again must not double-emit
+    // policy_deactivated or double-decrement ActivePolicies (which would
+    // underflow, since it's already at 0 here).
+    f.registry.deactivate_policy(&f.pool, &id);
+    let after_events = f.env.events().all().len();
+    let after_active = f
+        .registry
+        .get_stats()
+        .get(Symbol::new(&f.env, "active_policies"))
+        .unwrap();
+
+    assert_eq!(after_events, before_events);
+    assert_eq!(after_active, before_active);
 }
 
 #[test]

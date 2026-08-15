@@ -74,6 +74,7 @@ pub enum DataKey {
     HolderPolicies(Address), // address → Vec<u64>
     TotalPolicies,
     TotalPremium,
+    ActivePolicies,
 }
 
 #[contract]
@@ -97,6 +98,9 @@ impl RefractPolicyRegistry {
             .set(&DataKey::PoolContract, &pool_contract);
         env.storage().instance().set(&DataKey::TotalPolicies, &0u64);
         env.storage().instance().set(&DataKey::TotalPremium, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActivePolicies, &0u64);
         Ok(())
     }
 
@@ -170,6 +174,14 @@ impl RefractPolicyRegistry {
         env.storage()
             .instance()
             .set(&DataKey::TotalPremium, &(total_premium + premium));
+        let active: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActivePolicies)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActivePolicies, &(active + 1));
 
         env.events().publish(
             (Symbol::new(&env, "policy_registered"), policy_id),
@@ -190,10 +202,28 @@ impl RefractPolicyRegistry {
             .persistent()
             .get(&DataKey::Policy(policy_id))
             .ok_or(RegistryError::PolicyNotFound)?;
+
+        // Was already inactive — a no-op. Without this guard, calling
+        // deactivate_policy twice on the same policy_id would double-emit
+        // policy_deactivated and (since ActivePolicies was added) double-
+        // decrement the active count below zero.
+        if !record.is_active {
+            return Ok(());
+        }
+
         record.is_active = false;
         env.storage()
             .persistent()
             .set(&DataKey::Policy(policy_id), &record);
+
+        let active: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActivePolicies)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActivePolicies, &active.saturating_sub(1));
 
         env.events()
             .publish((Symbol::new(&env, "policy_deactivated"), policy_id), ());
@@ -254,8 +284,14 @@ impl RefractPolicyRegistry {
             .instance()
             .get(&DataKey::TotalPremium)
             .unwrap_or(0);
+        let active: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActivePolicies)
+            .unwrap_or(0);
         stats.set(Symbol::new(&env, "total_policies"), total as i128);
         stats.set(Symbol::new(&env, "total_premium"), premium);
+        stats.set(Symbol::new(&env, "active_policies"), active as i128);
         stats
     }
 
