@@ -135,6 +135,39 @@ fn stale_submission_is_rejected() {
 }
 
 #[test]
+fn future_dated_submission_is_rejected() {
+    let f = setup();
+    // Without a future-timestamp guard, ledger_time.saturating_sub(future)
+    // computes age=0 — indistinguishable from a perfectly fresh reading.
+    let now = f.env.ledger().timestamp();
+    let future_ts = now + 3_600;
+
+    let res = f.oracle.try_submit(
+        &f.relayer,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &9_000_000,
+        &future_ts,
+        &Symbol::new(&f.env, "test_source"),
+    );
+    assert_eq!(res, Err(Ok(OracleError::FutureTimestamp)));
+}
+
+#[test]
+fn a_timestamp_equal_to_the_current_ledger_time_is_accepted() {
+    let f = setup();
+    let now = f.env.ledger().timestamp();
+
+    let res = f.oracle.try_submit(
+        &f.relayer,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &9_000_000,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
+    assert!(res.is_ok());
+}
+
+#[test]
 fn get_reading_rejects_unknown_feed() {
     let f = setup();
     let res = f.oracle.try_get_reading(&Symbol::new(&f.env, "NOPE"));

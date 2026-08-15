@@ -38,6 +38,7 @@ pub enum OracleError {
     FeedNotFound = 4,
     StaleReading = 5,
     UnknownCoverageType = 6,
+    FutureTimestamp = 7,
 }
 
 /// Oracle reading stored on-chain.
@@ -144,9 +145,20 @@ impl RefractOracle {
         relayer.require_auth();
         Self::require_relayer(&env, &relayer)?;
 
-        // Reject readings older than MAX_STALENESS_SECS
         let ledger_time = env.ledger().timestamp();
-        let age = ledger_time.saturating_sub(timestamp);
+
+        // saturating_sub means a future-dated timestamp would otherwise
+        // compute age=0 and sail through the staleness check below as if
+        // it were perfectly fresh — and, once stored, get_reading()'s own
+        // staleness check has the same blind spot, so a bad reading like
+        // this wouldn't naturally expire until real time caught up to it.
+        // Reject it outright instead.
+        if timestamp > ledger_time {
+            return Err(OracleError::FutureTimestamp);
+        }
+
+        // Reject readings older than MAX_STALENESS_SECS
+        let age = ledger_time - timestamp;
         if age > MAX_STALENESS_SECS {
             return Err(OracleError::StaleReading);
         }
