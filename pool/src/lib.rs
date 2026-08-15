@@ -277,6 +277,22 @@ impl RefractPool {
         Ok(shares)
     }
 
+    /// Preview the USDC a withdrawal of `shares` would return right now,
+    /// including whether it would be rejected for pushing utilization above
+    /// max_utilization_bps — the same CapitalLocked check withdraw_capital()
+    /// enforces. Like quote_premium()/quote_shares(), this is a stateless
+    /// preview of the pool-wide math: it doesn't take a provider or check
+    /// any specific caller's share balance (withdraw_capital()'s
+    /// InsufficientShares check is caller-specific and can't be previewed
+    /// without knowing who's asking).
+    pub fn quote_withdrawal(env: Env, shares: i128) -> Result<i128, PoolError> {
+        Self::assert_initialized(&env)?;
+        if shares <= 0 {
+            return Err(PoolError::ZeroAmount);
+        }
+        Self::_quote_withdrawal(&env, shares)
+    }
+
     /// Withdraw capital by burning shares.
     pub fn withdraw_capital(env: Env, provider: Address, shares: i128) -> Result<i128, PoolError> {
         provider.require_auth();
@@ -294,37 +310,17 @@ impl RefractPool {
             return Err(PoolError::InsufficientShares);
         }
 
+        let usdc_out = Self::_quote_withdrawal(&env, shares)?;
         let total_capital: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let total_coverage: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCoverage)
             .unwrap_or(0);
         let total_shares: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalShares)
             .unwrap_or(0);
-        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
-
-        let usdc_out = if total_shares == 0 {
-            0
-        } else {
-            shares * total_capital / total_shares
-        };
-
-        // Check post-withdrawal utilization stays safe
-        let new_capital = total_capital - usdc_out;
-        if new_capital > 0 {
-            let new_util = total_coverage * BPS / new_capital;
-            if new_util > config.max_utilization_bps as i128 {
-                return Err(PoolError::CapitalLocked);
-            }
-        }
 
         env.storage()
             .instance()
@@ -863,6 +859,44 @@ impl RefractPool {
         } else {
             amount * total_shares / total_capital
         }
+    }
+
+    /// Shared by quote_withdrawal() and withdraw_capital() so the preview
+    /// and the real withdrawal path can never silently diverge.
+    fn _quote_withdrawal(env: &Env, shares: i128) -> Result<i128, PoolError> {
+        let total_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCapital)
+            .unwrap_or(0);
+        let total_coverage: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCoverage)
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalShares)
+            .unwrap_or(0);
+        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+
+        let usdc_out = if total_shares == 0 {
+            0
+        } else {
+            shares * total_capital / total_shares
+        };
+
+        // Check post-withdrawal utilization stays safe
+        let new_capital = total_capital - usdc_out;
+        if new_capital > 0 {
+            let new_util = total_coverage * BPS / new_capital;
+            if new_util > config.max_utilization_bps as i128 {
+                return Err(PoolError::CapitalLocked);
+            }
+        }
+
+        Ok(usdc_out)
     }
 
     fn assert_initialized(env: &Env) -> Result<(), PoolError> {

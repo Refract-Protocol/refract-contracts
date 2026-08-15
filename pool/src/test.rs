@@ -631,3 +631,65 @@ fn withdraw_capital_rejects_more_shares_than_owned() {
     let res = f.pool.try_withdraw_capital(&lp, &(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
+
+#[test]
+fn quote_withdrawal_matches_what_withdraw_capital_actually_returns() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    // Quoting must not require auth or check/touch the caller's balance.
+    let quoted = f.pool.quote_withdrawal(&shares);
+    let out = f.pool.withdraw_capital(&lp, &shares);
+    assert_eq!(quoted, out);
+}
+
+#[test]
+fn quote_withdrawal_rejects_a_non_positive_amount() {
+    let f = setup();
+    let res = f.pool.try_quote_withdrawal(&0);
+    assert_eq!(res, Err(Ok(PoolError::ZeroAmount)));
+}
+
+#[test]
+fn quote_withdrawal_rejects_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+
+    let res = pool.try_quote_withdrawal(&(10 * ONE_USDC));
+    assert_eq!(res, Err(Ok(PoolError::NotInitialized)));
+}
+
+#[test]
+fn quote_withdrawal_and_withdraw_capital_agree_when_utilization_would_be_exceeded() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    // 4,500 USDC stays under the pool's per-policy max_coverage (5,000 USDC
+    // in this crate's default PoolConfig).
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 4_500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    f.pool.buy_policy(&holder, &params);
+
+    // Withdrawing 6,000 of the LP's 10,000 shares drops capital to ~4,000,
+    // pushing the already-sold 4,500 USDC of coverage past the 80% max
+    // utilization (4,500 / 4,000 = 112.5%).
+    let six_thousand_shares = shares * 6 / 10;
+    let quoted = f.pool.try_quote_withdrawal(&six_thousand_shares);
+    assert_eq!(quoted, Err(Ok(PoolError::CapitalLocked)));
+
+    // withdraw_capital() must reject identically — the preview and the
+    // real path share the same check (_quote_withdrawal), so they can't
+    // silently diverge. This CapitalLocked path had no test coverage
+    // before this change.
+    let withdrawn = f.pool.try_withdraw_capital(&lp, &six_thousand_shares);
+    assert_eq!(withdrawn, Err(Ok(PoolError::CapitalLocked)));
+}
