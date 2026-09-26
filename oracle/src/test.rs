@@ -404,3 +404,27 @@ fn adding_the_same_relayer_twice_is_a_no_op() {
     );
     assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
 }
+
+
+#[test]
+fn test_spec_oracle_interface_and_error_snapshot() {
+    // Pin OracleError discriminants to catch breaking changes
+    assert_eq!(OracleError::AlreadyInitialized as u32, 1);
+    assert_eq!(OracleError::NotInitialized as u32, 2);
+    assert_eq!(OracleError::Unauthorized as u32, 3);
+    assert_eq!(OracleError::FeedNotFound as u32, 4);
+    assert_eq!(OracleError::StaleReading as u32, 5);
+    assert_eq!(OracleError::UnknownCoverageType as u32, 6);
+    assert_eq!(OracleError::FutureTimestamp as u32, 7);
+    assert_eq!(OracleError::StaleSubmission as u32, 8);
+
+    // Pin OracleReading struct layout
+    let env = Env::default();
+    let sample = OracleReading {
+        value: 10_000_000,
+        updated_at: 1_700_000_000,
+        source: Symbol::new(&env, "TEST_FEED"),
+    };
+    assert_eq!(sample.value, 10_000_000);
+    assert_eq!(sample.updated_at, 1_700_000_000);
+}

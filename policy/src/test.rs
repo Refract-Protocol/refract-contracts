@@ -347,3 +347,51 @@ fn pool_contract_reflects_initialize_and_tracks_repointing() {
     f.registry.set_pool_contract(&f.admin, &new_pool);
     assert_eq!(f.registry.pool_contract(), Some(new_pool));
 }
+
+
+#[test]
+fn test_spec_policy_registry_interface_and_error_snapshot() {
+    // Pin RegistryError discriminants
+    assert_eq!(RegistryError::AlreadyInitialized as u32, 1);
+    assert_eq!(RegistryError::NotInitialized as u32, 2);
+    assert_eq!(RegistryError::Unauthorized as u32, 3);
+    assert_eq!(RegistryError::PolicyNotFound as u32, 4);
+    assert_eq!(RegistryError::PolicyAlreadyExists as u32, 5);
+
+    // Pin CoverageType variants and discriminants
+    assert_eq!(CoverageType::StablecoinDepeg as u32, 0);
+    assert_eq!(CoverageType::MarketCrash as u32, 1);
+    assert_eq!(CoverageType::LiquidationShield as u32, 2);
+    assert_eq!(CoverageType::SmartContractRisk as u32, 3);
+    assert_eq!(CoverageType::FlightDelay as u32, 4);
+
+    // Pin PolicyRegistration layout
+    let env = Env::default();
+    let holder = Address::generate(&env);
+    let reg = PolicyRegistration {
+        policy_id: 1,
+        holder: holder.clone(),
+        coverage_type: CoverageType::StablecoinDepeg,
+        coverage_amount: 100_000_000,
+        premium: 1_000_000,
+        expires_at: 1_800_000_000,
+    };
+    assert_eq!(reg.policy_id, 1);
+    assert_eq!(reg.coverage_amount, 100_000_000);
+    assert_eq!(reg.premium, 1_000_000);
+    assert_eq!(reg.expires_at, 1_800_000_000);
+
+    // Pin PolicyRecord layout
+    let record = PolicyRecord {
+        policy_id: 1,
+        holder: holder.clone(),
+        coverage_type: CoverageType::StablecoinDepeg,
+        coverage_amount: 100_000_000,
+        premium_paid: 1_000_000,
+        start_time: 1_700_000_000,
+        end_time: 1_800_000_000,
+        is_active: true,
+    };
+    assert_eq!(record.policy_id, 1);
+    assert!(record.is_active);
+}

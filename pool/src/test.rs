@@ -1068,3 +1068,56 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
+
+
+#[test]
+fn test_spec_pool_interface_and_error_snapshot() {
+    // Pin PoolError discriminants
+    assert_eq!(PoolError::AlreadyInitialized as u32, 1);
+    assert_eq!(PoolError::NotInitialized as u32, 2);
+    assert_eq!(PoolError::Unauthorized as u32, 3);
+    assert_eq!(PoolError::InsufficientCapacity as u32, 4);
+    assert_eq!(PoolError::PolicyNotFound as u32, 5);
+    assert_eq!(PoolError::PolicyExpired as u32, 6);
+    assert_eq!(PoolError::PolicyNotTriggered as u32, 7);
+    assert_eq!(PoolError::NotPolicyholder as u32, 8);
+    assert_eq!(PoolError::AlreadyClaimed as u32, 9);
+    assert_eq!(PoolError::InsufficientPremium as u32, 10);
+    assert_eq!(PoolError::ZeroAmount as u32, 11);
+    assert_eq!(PoolError::InsufficientShares as u32, 12);
+    assert_eq!(PoolError::CapitalLocked as u32, 13);
+    assert_eq!(PoolError::PolicyNotYetExpired as u32, 14);
+    assert_eq!(PoolError::LockupActive as u32, 15);
+
+    // Pin CoverageType variants and discriminants in pool
+    assert_eq!(CoverageType::StablecoinDepeg as u32, 0);
+    assert_eq!(CoverageType::MarketCrash as u32, 1);
+    assert_eq!(CoverageType::LiquidationShield as u32, 2);
+    assert_eq!(CoverageType::SmartContractRisk as u32, 3);
+    assert_eq!(CoverageType::FlightDelay as u32, 4);
+
+    // Pin PoolConfig layout
+    let config = PoolConfig {
+        base_premium_rate_bps: 200,
+        max_utilization_bps: 8000,
+        min_coverage: 10_000_000,
+        max_coverage: 1_000_000_000,
+        lockup_days: 7,
+    };
+    assert_eq!(config.base_premium_rate_bps, 200);
+    assert_eq!(config.max_utilization_bps, 8000);
+    assert_eq!(config.lockup_days, 7);
+
+    // Pin PoolStats layout
+    let stats = PoolStats {
+        total_capital: 100_000_000,
+        total_coverage: 20_000_000,
+        total_shares: 100_000_000,
+        utilization_bps: 2000,
+        share_price: 10_000_000,
+        available_capacity: 60_000_000,
+        apy_estimate_bps: 40,
+    };
+    assert_eq!(stats.utilization_bps, 2000);
+    assert_eq!(stats.available_capacity, 60_000_000);
+}
