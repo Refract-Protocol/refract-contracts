@@ -347,3 +347,51 @@ fn pool_contract_reflects_initialize_and_tracks_repointing() {
     f.registry.set_pool_contract(&f.admin, &new_pool);
     assert_eq!(f.registry.pool_contract(), Some(new_pool));
 }
+
+
+#[test]
+fn test_adversarial_direct_registry_access_bypassing_pool() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let policy_id = 8888u64;
+
+    // Stranger cannot register a policy directly
+    let res = f.registry.try_register(
+        &stranger,
+        &policy_id,
+        &stranger,
+        &CoverageType::StablecoinDepeg,
+        &10_000_000,
+        &500_000,
+        &2_000_000_000,
+    );
+    assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
+
+    // Stranger cannot deactivate a policy directly
+    let res_deact = f.registry.try_deactivate(&stranger, &policy_id);
+    assert_eq!(res_deact, Err(Ok(RegistryError::Unauthorized)));
+
+    // Admin can register directly without pool involvement
+    f.registry.register(
+        &f.admin,
+        &policy_id,
+        &stranger,
+        &CoverageType::StablecoinDepeg,
+        &10_000_000,
+        &500_000,
+        &2_000_000_000,
+    );
+    assert!(f.registry.is_active(&policy_id));
+
+    // Duplicate registration under same policy_id by admin is strictly rejected
+    let res_dup = f.registry.try_register(
+        &f.admin,
+        &policy_id,
+        &stranger,
+        &CoverageType::StablecoinDepeg,
+        &10_000_000,
+        &500_000,
+        &2_000_000_000,
+    );
+    assert_eq!(res_dup, Err(Ok(RegistryError::PolicyAlreadyExists)));
+}

@@ -1068,3 +1068,32 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
+
+
+#[test]
+fn test_cross_contract_and_token_transfer_failure_paths() {
+    let f = setup();
+    let provider = funded(&f, 10_000 * ONE_USDC);
+
+    // 1. Zero capital deposit is rejected
+    let res_zero_dep = f.pool.try_provide_capital(&provider, &0);
+    assert_eq!(res_zero_dep, Err(Ok(PoolError::ZeroAmount)));
+
+    // 2. Negative capital deposit is rejected
+    let res_neg_dep = f.pool.try_provide_capital(&provider, &-100);
+    assert_eq!(res_neg_dep, Err(Ok(PoolError::ZeroAmount)));
+
+    // 3. Withdraw shares greater than LP balance is rejected
+    let res_excess_wdr = f.pool.try_withdraw_capital(&provider, &(100_000 * ONE_USDC));
+    assert_eq!(res_excess_wdr, Err(Ok(PoolError::InsufficientShares)));
+
+    // 4. Buy policy with duration violating bounds is rejected
+    let buyer = funded(&f, 5_000 * ONE_USDC);
+    let quote = 100 * ONE_USDC;
+    let res_dur = f.pool.try_buy_policy(&buyer, &CoverageType::StablecoinDepeg, &(1_000 * ONE_USDC), &0u32, &quote);
+    assert_eq!(res_dur, Err(Ok(PoolError::DurationOutOfBounds)));
+
+    // 5. Expiring non-existent policy is rejected
+    let res_exp = f.pool.try_expire_policy(&buyer, &999999u64);
+    assert_eq!(res_exp, Err(Ok(PoolError::PolicyNotFound)));
+}
