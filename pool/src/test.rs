@@ -1068,3 +1068,101 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
+
+
+#[test]
+fn test_systematic_pool_event_topics_and_payloads() {
+    let f = setup();
+    let contract_id = f.pool.address.clone();
+    let provider = funded(&f, 50_000 * ONE_USDC);
+
+    // 1. provide_capital event assertion: topics: (symbol_short!("DEP_CAP"), provider), data: (amount, shares_minted)
+    let deposit_amount = 20_000 * ONE_USDC;
+    let before_count = f.env.events().all().len();
+    let shares = f.pool.provide_capital(&provider, &deposit_amount);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_provider: Address = Address::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("DEP_CAP"));
+    assert_eq!(topic_provider, provider);
+    let (amt, sh): (i128, i128) = <(i128, i128)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(amt, deposit_amount);
+    assert_eq!(sh, shares);
+
+    // 2. buy_policy event assertion: topics: (symbol_short!("POL_BUY"), holder), data: (policy_id, premium, coverage_amount, end_time)
+    let buyer = funded(&f, 5_000 * ONE_USDC);
+    let cov_amount = 5_000 * ONE_USDC;
+    let duration_days = 30u32;
+    let quote = f.pool.quote_policy(&CoverageType::StablecoinDepeg, &cov_amount, &duration_days);
+    let before_count = f.env.events().all().len();
+    let policy_id = f.pool.buy_policy(&buyer, &CoverageType::StablecoinDepeg, &cov_amount, &duration_days, &quote);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_buyer: Address = Address::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("POL_BUY"));
+    assert_eq!(topic_buyer, buyer);
+    let (pid, prem, cov, _et): (u64, i128, i128, u64) = <(u64, i128, i128, u64)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(pid, policy_id);
+    assert_eq!(prem, quote);
+    assert_eq!(cov, cov_amount);
+
+    // 3. withdraw_capital event assertion: topics: (symbol_short!("WDR_CAP"), provider), data: (shares, usdc_out)
+    advance_past_lockup(&f);
+    let withdraw_shares = 5_000 * ONE_USDC;
+    let before_count = f.env.events().all().len();
+    let usdc_out = f.pool.withdraw_capital(&provider, &withdraw_shares);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_provider: Address = Address::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("WDR_CAP"));
+    assert_eq!(topic_provider, provider);
+    let (sh_out, u_out): (i128, i128) = <(i128, i128)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(sh_out, withdraw_shares);
+    assert_eq!(u_out, usdc_out);
+
+    // 4. set_admin event assertion: topics: (symbol_short!("ADM_SET"),), data: (new_admin,)
+    let new_admin = Address::generate(&f.env);
+    let before_count = f.env.events().all().len();
+    f.pool.set_admin(&f.admin, &new_admin);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("ADM_SET"));
+    let payload_admin: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_admin, new_admin);
+
+    // 5. set_policy_registry event assertion: topics: (symbol_short!("REG_SET"),), data: (new_registry,)
+    let new_registry = Address::generate(&f.env);
+    let before_count = f.env.events().all().len();
+    f.pool.set_policy_registry(&new_admin, &new_registry);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("REG_SET"));
+    let payload_registry: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_registry, new_registry);
+
+    // 6. set_pool_config event assertion: topics: (symbol_short!("CFG_SET"),), data: ()
+    let cfg = PoolConfig::default(&f.env);
+    let before_count = f.env.events().all().len();
+    f.pool.set_pool_config(&new_admin, &cfg);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, _data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("CFG_SET"));
+}
