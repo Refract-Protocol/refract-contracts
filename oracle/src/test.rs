@@ -404,3 +404,17 @@ fn adding_the_same_relayer_twice_is_a_no_op() {
     );
     assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
 }
+
+
+#[test]
+fn test_oracle_wasm_artifact_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle_id = env.register_contract(None, RefractOracle);
+    let oracle = RefractOracleClient::new(&env, &oracle_id);
+
+    oracle.initialize(&admin);
+    assert_eq!(oracle.admin(), Some(admin));
+}

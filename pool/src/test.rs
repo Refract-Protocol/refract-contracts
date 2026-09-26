@@ -1068,3 +1068,23 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
+
+
+#[test]
+fn test_pool_wasm_artifact_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    pool.initialize(&admin, &sac.address(), &registry_id);
+    assert_eq!(pool.admin(), Some(admin));
+
+    let stats = pool.pool_stats();
+    assert_eq!(stats.total_capital, 0);
+    assert_eq!(stats.total_coverage, 0);
+}

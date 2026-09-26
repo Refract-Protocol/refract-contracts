@@ -36,3 +36,6 @@ jobs:
 
       - name: Build optimized wasm
         run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Run wasm-level tests
+        run: cargo test --all
