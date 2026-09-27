@@ -1,3 +1,23 @@
+//! RefractPool — holds USDC risk capital, prices & sells policies, settles
+//! claims against oracle data.
+//!
+//! ## Oracle integration (issue #102)
+//!
+//! The previous admin-push shortcut (`update_oracle` / `DataKey::OracleData`)
+//! has been **removed**. `process_claim` now calls the real `RefractOracle`
+//! contract via a cross-contract invocation, reading `is_triggered` to decide
+//! whether a payout is warranted.
+//!
+//! ### Migration note
+//! `DataKey::OracleData` and the `OracleData` struct no longer exist.
+//! Any client that previously called `update_oracle` to set up trigger state
+//! must now submit readings directly to the deployed `RefractOracle` contract.
+//!
+//! ### Authorization model update
+//! `update_oracle` is no longer listed in the pool's authorization model.
+//! The admin-gated functions are now: `set_policy_registry`, `set_oracle`,
+//! `set_admin`, and `set_pool_config`.
+
 #![no_std]
 
 use soroban_sdk::{
@@ -63,6 +83,7 @@ pub enum DataKey {
     Admin,
     UsdcToken,
     PolicyRegistry, // RefractPolicyRegistry contract address
+    OracleContract, // RefractOracle contract address (issue #102)
     TotalCapital,
     TotalCoverage, // sum of all active policy coverage amounts
     TotalPremiums, // accumulated premiums (protocol revenue)
@@ -73,8 +94,7 @@ pub enum DataKey {
     NextPolicyId,
     PoolConfig,
     Initialized,
-    OracleData(CoverageType), // latest oracle reading per type
-    LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    LastDeposit(Address), // provider → timestamp of their most recent provide_capital()
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -155,14 +175,6 @@ pub struct PoolStats {
     /// rejecting on InsufficientCapacity, i.e. max(0, max_utilization_bps
     /// of total_capital, minus total_coverage already committed).
     pub available_capacity: i128,
-}
-
-// ── Oracle Reading ────────────────────────────────────────────────────────────
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleData {
-    pub value: i128, // current metric (price, percentage change, etc)
-    pub updated_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -510,8 +522,16 @@ impl RefractPool {
 
     // ── Claims ────────────────────────────────────────────────────────────────
 
-    /// Process a payout when the trigger condition is verified by oracle.
-    /// Anyone can call this once the oracle confirms the trigger.
+    /// Process a payout when the trigger condition is verified by the real
+    /// RefractOracle contract (issue #102).
+    ///
+    /// The pool calls `RefractOracle::is_triggered(coverage_type_u32, feed_id)`
+    /// cross-contract.  The feed_id is derived from the policy's coverage type
+    /// using the same mapping that the oracle's own trigger logic uses.
+    ///
+    /// If no oracle contract has been wired via `set_oracle`, the claim is
+    /// rejected with `PolicyNotTriggered` (safe default — no oracle means no
+    /// verified trigger).
     pub fn process_claim(env: Env, policy_id: u64) -> Result<i128, PoolError> {
         let mut policy: Policy = env
             .storage()
@@ -528,27 +548,39 @@ impl RefractPool {
             return Err(PoolError::PolicyExpired);
         }
 
-        // Read oracle data
-        let oracle: Option<OracleData> = env
-            .storage()
-            .instance()
-            .get(&DataKey::OracleData(policy.coverage_type.clone()));
+        // ── Real oracle cross-contract call (issue #102) ─────────────────────
+        // Map the policy's CoverageType to the integer coverage_type the oracle
+        // uses for is_triggered(), and derive the canonical feed_id symbol.
+        let (coverage_type_u32, feed_id) =
+            Self::_coverage_to_oracle_params(&env, &policy.coverage_type);
 
-        let triggered = match oracle {
-            None => false,
-            Some(data) => {
-                // Oracle value must be fresh (within 30 minutes)
-                let fresh = now - data.updated_at < 1_800;
-                let triggered_value = match policy.coverage_type {
-                    CoverageType::StablecoinDepeg => {
-                        data.value < (PRECISION - policy.trigger_threshold * PRECISION / BPS)
-                    }
-                    CoverageType::MarketCrash => data.value < -policy.trigger_threshold, // negative percent
-                    CoverageType::LiquidationShield => data.value > 0, // position was liquidated
-                    CoverageType::SmartContractRisk => data.value > 0, // exploit detected
-                    CoverageType::FlightDelay => data.value > policy.trigger_threshold, // delay minutes
-                };
-                fresh && triggered_value
+        let triggered = match env.storage().instance().get::<DataKey, Address>(&DataKey::OracleContract) {
+            None => false, // no oracle wired — conservatively reject
+            Some(oracle_addr) => {
+                // is_triggered returns Ok(bool) or an OracleError.
+                // Any oracle error (FeedNotFound, StaleReading, etc.) is treated
+                // as "not triggered" — the claim cannot proceed if oracle data is
+                // unavailable or stale.
+                let result: Result<bool, soroban_sdk::InvokeError> = env
+                    .try_invoke_contract(
+                        &oracle_addr,
+                        &Symbol::new(&env, "is_triggered"),
+                        Vec::from_array(
+                            &env,
+                            [
+                                coverage_type_u32.into_val(&env),
+                                feed_id.into_val(&env),
+                            ],
+                        ),
+                    );
+                // try_invoke_contract returns Result<T, InvokeError> where T is
+                // the return type of the callee.  For is_triggered the callee
+                // returns Result<bool, OracleError>; the outer layer is the
+                // host/VM error, the inner is the contract error.
+                match result {
+                    Ok(b) => b,
+                    Err(_) => false,
+                }
             }
         };
 
@@ -673,9 +705,31 @@ impl RefractPool {
         Ok(())
     }
 
+    /// Wire (or re-wire) the RefractOracle contract this pool uses to evaluate
+    /// trigger conditions in `process_claim`.
+    ///
+    /// Must be called after `initialize` for `process_claim` to work.
+    /// Can be called again to update the oracle address (e.g. after a
+    /// redeployment of the oracle contract).
+    pub fn set_oracle(env: Env, caller: Address, oracle: Address) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleContract, &oracle);
+        env.events()
+            .publish((symbol_short!("ORC_SET"), caller), (oracle,));
+        Ok(())
+    }
+
+    /// The RefractOracle contract address currently wired for claim evaluation,
+    /// or `None` if `set_oracle` has not been called yet.
+    pub fn oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::OracleContract)
+    }
+
     /// Rotate the admin key. The only recovery path if the current admin
     /// key is lost or compromised — without it, every admin-gated call
-    /// (set_policy_registry, update_oracle, set_pool_config, this function
+    /// (set_policy_registry, set_oracle, set_pool_config, this function
     /// itself) would be permanently stuck on whatever key was set at
     /// initialize().
     pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), PoolError> {
@@ -697,29 +751,6 @@ impl RefractPool {
         env.storage().instance().set(&DataKey::PoolConfig, &config);
 
         env.events().publish((symbol_short!("CFG_SET"),), ());
-        Ok(())
-    }
-
-    // ── Oracle (Admin-controlled, upgradeable to decentralized oracle) ─────────
-
-    pub fn update_oracle(
-        env: Env,
-        caller: Address,
-        coverage_type: CoverageType,
-        value: i128,
-    ) -> Result<(), PoolError> {
-        Self::require_admin(&env, &caller)?;
-
-        env.storage().instance().set(
-            &DataKey::OracleData(coverage_type.clone()),
-            &OracleData {
-                value,
-                updated_at: env.ledger().timestamp(),
-            },
-        );
-
-        env.events()
-            .publish((symbol_short!("ORACLE"), coverage_type), (value,));
         Ok(())
     }
 
@@ -838,7 +869,7 @@ impl RefractPool {
     }
 
     /// The address currently authorized to call every admin-gated function
-    /// (set_admin, set_policy_registry, set_pool_config, update_oracle).
+    /// (set_admin, set_policy_registry, set_oracle, set_pool_config).
     /// Without this, verifying who holds admin control — e.g. confirming a
     /// set_admin() rotation actually landed — meant replaying event history
     /// instead of just reading current state.
@@ -856,6 +887,23 @@ impl RefractPool {
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
+
+    /// Map a CoverageType to the (coverage_type_u32, feed_id) pair that the
+    /// oracle's `is_triggered` function expects.
+    ///
+    /// The integer mapping mirrors the oracle's match arms:
+    ///   0=Depeg, 1=Crash, 2=Liquidation, 3=SmartContract, 4=Flight
+    ///
+    /// The feed_id symbols are the canonical names used by Refract relayers.
+    fn _coverage_to_oracle_params(env: &Env, coverage_type: &CoverageType) -> (u32, Symbol) {
+        match coverage_type {
+            CoverageType::StablecoinDepeg => (0u32, Symbol::new(env, "USDC_PRICE")),
+            CoverageType::MarketCrash => (1u32, Symbol::new(env, "MARKET_24H")),
+            CoverageType::LiquidationShield => (2u32, Symbol::new(env, "LIQ_RATIO")),
+            CoverageType::SmartContractRisk => (3u32, Symbol::new(env, "PROTOCOL_TVL")),
+            CoverageType::FlightDelay => (4u32, Symbol::new(env, "FLIGHT_DELAY")),
+        }
+    }
 
     /// Translate the pool's own `CoverageType` into the wire-compatible
     /// mirror used for the registry's ABI (see the "RefractPolicyRegistry
@@ -1027,7 +1075,7 @@ impl RefractPool {
     }
 
     /// Shared by every admin-gated entrypoint (set_policy_registry,
-    /// set_admin, set_pool_config, update_oracle) so the auth + principal
+    /// set_oracle, set_admin, set_pool_config) so the auth + principal
     /// check can't drift between them.
     fn require_admin(env: &Env, caller: &Address) -> Result<(), PoolError> {
         caller.require_auth();
