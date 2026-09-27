@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
-    IntoVal, Symbol, Vec,
+    IntoVal, Symbol, Val, Vec,
 };
 
 const PRECISION: i128 = 10_000_000i128;
@@ -254,11 +254,11 @@ impl RefractPool {
             .instance()
             .get(&DataKey::TotalShares)
             .unwrap_or(0);
-        let mut user_shares: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Shares(provider.clone()))
-            .unwrap_or(0);
+        // Storage calls serialise a DataKey into a host key every time
+        // they're handed one, so convert once and reuse the Val for the
+        // paired read and write below.
+        let shares_key: Val = DataKey::Shares(provider.clone()).into_val(&env);
+        let mut user_shares: i128 = env.storage().persistent().get(&shares_key).unwrap_or(0);
 
         total_capital += amount;
         total_shares += shares;
@@ -270,9 +270,7 @@ impl RefractPool {
         env.storage()
             .instance()
             .set(&DataKey::TotalShares, &total_shares);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Shares(provider.clone()), &user_shares);
+        env.storage().persistent().set(&shares_key, &user_shares);
 
         // Resets the lockup clock on every deposit, including top-ups —
         // simpler than tracking per-deposit tranches, at the cost of a
@@ -313,11 +311,10 @@ impl RefractPool {
             return Err(PoolError::ZeroAmount);
         }
 
-        let user_shares: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Shares(provider.clone()))
-            .unwrap_or(0);
+        // Built once for the read here and the write further down (see
+        // provide_capital).
+        let shares_key: Val = DataKey::Shares(provider.clone()).into_val(&env);
+        let user_shares: i128 = env.storage().persistent().get(&shares_key).unwrap_or(0);
         if user_shares < shares {
             return Err(PoolError::InsufficientShares);
         }
@@ -354,7 +351,7 @@ impl RefractPool {
             .set(&DataKey::TotalShares, &(total_shares - shares));
         env.storage()
             .persistent()
-            .set(&DataKey::Shares(provider.clone()), &(user_shares - shares));
+            .set(&shares_key, &(user_shares - shares));
 
         let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc).transfer(

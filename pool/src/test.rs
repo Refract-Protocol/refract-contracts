@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
@@ -1067,4 +1069,102 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     // larger than the entire pool holds (see _quote_withdrawal).
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}
+
+/// CPU instructions for one call, measured from an empty ledger footprint.
+/// The test host otherwise accumulates a single footprint over the whole
+/// env and copies it on every insert, which would make the number depend
+/// on how much setup ran first rather than on the call itself.
+fn cpu_cost_of<R>(env: &Env, call: impl FnOnce() -> R) -> u64 {
+    env.host()
+        .with_mut_storage(|s| {
+            s.footprint = Default::default();
+            Ok(())
+        })
+        .unwrap();
+    env.budget().reset_default();
+    call();
+    let cost = env.budget().cpu_instruction_cost();
+    env.budget().reset_unlimited();
+    cost
+}
+
+/// (first deposit, top-up deposit, withdrawal) CPU instruction counts for
+/// one provider.
+fn capital_path_costs() -> (u64, u64, u64) {
+    let f = setup();
+    f.env.budget().reset_unlimited();
+    let lp = funded(&f, 20_000 * ONE_USDC);
+    let first = cpu_cost_of(&f.env, || f.pool.provide_capital(&lp, &(10_000 * ONE_USDC)));
+    let top_up = cpu_cost_of(&f.env, || f.pool.provide_capital(&lp, &(10_000 * ONE_USDC)));
+    past_lockup(&f);
+    let withdraw = cpu_cost_of(&f.env, || f.pool.withdraw_capital(&lp, &(5_000 * ONE_USDC)));
+    (first, top_up, withdraw)
+}
+
+// Recorded with the Shares key built once per call (host-side
+// instructions; the contract's own Rust runs natively in these tests and
+// isn't metered). Deterministic for the soroban-env-host version pinned in
+// Cargo.lock, so any growth is a real regression on these paths. If a
+// change legitimately costs more, re-record these in the same PR.
+const PROVIDE_CAPITAL_FIRST_CPU: u64 = 362_822;
+const PROVIDE_CAPITAL_TOP_UP_CPU: u64 = 371_318;
+const WITHDRAW_CAPITAL_CPU: u64 = 394_222;
+
+#[test]
+fn capital_paths_stay_within_their_recorded_cpu_baselines() {
+    let (first, top_up, withdraw) = capital_path_costs();
+    assert!(
+        first <= PROVIDE_CAPITAL_FIRST_CPU,
+        "provide_capital (first deposit) cost {first} insns, baseline {PROVIDE_CAPITAL_FIRST_CPU}"
+    );
+    assert!(
+        top_up <= PROVIDE_CAPITAL_TOP_UP_CPU,
+        "provide_capital (top-up) cost {top_up} insns, baseline {PROVIDE_CAPITAL_TOP_UP_CPU}"
+    );
+    assert!(
+        withdraw <= WITHDRAW_CAPITAL_CPU,
+        "withdraw_capital cost {withdraw} insns, baseline {WITHDRAW_CAPITAL_CPU}"
+    );
+}
+
+#[test]
+fn deposit_then_withdraw_emits_exactly_the_expected_pool_events() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    past_lockup(&f);
+    let out = f.pool.withdraw_capital(&lp, &shares);
+
+    // The token transfers emit their own events from the USDC contract;
+    // only the pool's stream is under test here.
+    let mut pool_events = Vec::new(&f.env);
+    for e in f.env.events().all().iter() {
+        if e.0 == f.pool.address {
+            pool_events.push_back(e);
+        }
+    }
+
+    let expected = Vec::from_array(
+        &f.env,
+        [
+            (
+                f.pool.address.clone(),
+                (symbol_short!("INIT"),).into_val(&f.env),
+                (f.admin.clone(),).into_val(&f.env),
+            ),
+            (
+                f.pool.address.clone(),
+                (symbol_short!("PROVIDE"), lp.clone()).into_val(&f.env),
+                (10_000 * ONE_USDC, shares).into_val(&f.env),
+            ),
+            (
+                f.pool.address.clone(),
+                (symbol_short!("WITHDRAW"), lp.clone()).into_val(&f.env),
+                (shares, out).into_val(&f.env),
+            ),
+        ],
+    );
+    assert_eq!(pool_events, expected);
 }
