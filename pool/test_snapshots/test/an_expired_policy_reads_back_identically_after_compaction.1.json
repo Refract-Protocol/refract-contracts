@@ -64,7 +64,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -89,7 +89,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -111,7 +111,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 1000000000000
+                        "lo": 10000000000
                       }
                     }
                   ]
@@ -169,7 +169,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000000
+                          "lo": 5000000000
                         }
                       }
                     },
@@ -225,7 +225,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 24657510
+                        "lo": 12328755
                       }
                     }
                   ]
@@ -237,38 +237,10 @@
         }
       ]
     ],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-              "function_name": "update_oracle",
-              "args": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                },
-                {
-                  "vec": [
-                    {
-                      "symbol": "StablecoinDepeg"
-                    }
-                  ]
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 9000000
-                  }
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
+    [],
+    [],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -444,39 +416,6 @@
       [
         {
           "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            "key": {
-              "ledger_key_nonce": {
-                "nonce": 8370022561469687789
-              }
-            },
-            "durability": "temporary"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-                "key": {
-                  "ledger_key_nonce": {
-                    "nonce": 8370022561469687789
-                  }
-                },
-                "durability": "temporary",
-                "val": "void"
-              }
-            },
-            "ext": "v0"
-          },
-          6311999
-        ]
-      ],
-      [
-        {
-          "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
             "key": {
               "vec": [
@@ -526,7 +465,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "Policy"
+                  "symbol": "Settled"
                 },
                 {
                   "u64": 0
@@ -546,7 +485,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "Policy"
+                      "symbol": "Settled"
                     },
                     {
                       "u64": 0
@@ -555,102 +494,38 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "map": [
+                  "vec": [
                     {
-                      "key": {
-                        "symbol": "coverage_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 10000000000
-                        }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                    },
+                    {
+                      "u32": 0
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 5000000000
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "coverage_type"
-                      },
-                      "val": {
-                        "vec": [
-                          {
-                            "symbol": "StablecoinDepeg"
-                          }
-                        ]
+                      "i128": {
+                        "hi": 0,
+                        "lo": 12328755
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "end_time"
-                      },
-                      "val": {
-                        "u64": 2592000
+                      "i128": {
+                        "hi": 0,
+                        "lo": 500
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "holder"
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                      }
+                      "u64": 0
                     },
                     {
-                      "key": {
-                        "symbol": "id"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
+                      "u64": 2592000
                     },
-                    {
-                      "key": {
-                        "symbol": "payout_at"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
-                        "symbol": "premium_paid"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 24657510
-                        }
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "start_time"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "status"
-                      },
-                      "val": {
-                        "vec": [
-                          {
-                            "symbol": "Active"
-                          }
-                        ]
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "trigger_threshold"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 500
-                        }
-                      }
-                    }
+                    "void"
                   ]
                 }
               }
@@ -698,7 +573,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               }
@@ -820,45 +695,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "OracleData"
-                            },
-                            {
-                              "vec": [
-                                {
-                                  "symbol": "StablecoinDepeg"
-                                }
-                              ]
-                            }
-                          ]
-                        },
-                        "val": {
-                          "map": [
-                            {
-                              "key": {
-                                "symbol": "updated_at"
-                              },
-                              "val": {
-                                "u64": 0
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "value"
-                              },
-                              "val": {
-                                "i128": {
-                                  "hi": 0,
-                                  "lo": 9000000
-                                }
-                              }
-                            }
-                          ]
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "PolicyRegistry"
                             }
                           ]
@@ -937,7 +773,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 1000024657510
+                            "lo": 10012328755
                           }
                         }
                       },
@@ -952,7 +788,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 10000000000
+                            "lo": 0
                           }
                         }
                       },
@@ -967,7 +803,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 24657510
+                            "lo": 12328755
                           }
                         }
                       },
@@ -982,7 +818,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 1000000000000
+                            "lo": 10000000000
                           }
                         }
                       },
@@ -1101,7 +937,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000000
+                          "lo": 5000000000
                         }
                       }
                     },
@@ -1142,7 +978,7 @@
                         "symbol": "is_active"
                       },
                       "val": {
-                        "bool": true
+                        "bool": false
                       }
                     },
                     {
@@ -1160,7 +996,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 24657510
+                          "lo": 12328755
                         }
                       }
                     }
@@ -1205,7 +1041,7 @@
                           ]
                         },
                         "val": {
-                          "u64": 1
+                          "u64": 0
                         }
                       },
                       {
@@ -1255,7 +1091,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 24657510
+                            "lo": 12328755
                           }
                         }
                       }
@@ -1379,7 +1215,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 1000024657510
+                          "lo": 10012328755
                         }
                       }
                     },
@@ -1525,7 +1361,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 9975342490
+                          "lo": 9987671245
                         }
                       }
                     },
@@ -1971,7 +1807,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -2005,7 +1841,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1000000000000
+                "lo": 10000000000
               }
             }
           }
@@ -2060,7 +1896,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -2099,7 +1935,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -2133,7 +1969,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1000000000000
+                "lo": 10000000000
               }
             }
           }
@@ -2182,13 +2018,13 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 },
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -2216,7 +2052,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1000000000000
+                "lo": 10000000000
               }
             }
           }
@@ -2345,7 +2181,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000000
+                          "lo": 5000000000
                         }
                       }
                     },
@@ -2418,7 +2254,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 24657510
+                    "lo": 12328755
                   }
                 }
               ]
@@ -2452,7 +2288,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 24657510
+                "lo": 12328755
               }
             }
           }
@@ -2513,7 +2349,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000000
+                          "lo": 5000000000
                         }
                       }
                     },
@@ -2556,7 +2392,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 24657510
+                          "lo": 12328755
                         }
                       }
                     }
@@ -2592,7 +2428,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000000000
+                    "lo": 5000000000
                   }
                 }
               ]
@@ -2648,13 +2484,13 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000000000
+                    "lo": 5000000000
                   }
                 },
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 24657510
+                    "lo": 12328755
                   }
                 },
                 {
@@ -2705,29 +2541,232 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000003"
               },
               {
-                "symbol": "update_oracle"
+                "symbol": "get_policy"
+              }
+            ],
+            "data": {
+              "u64": 0
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "get_policy"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "coverage_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 5000000000
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "coverage_type"
+                  },
+                  "val": {
+                    "vec": [
+                      {
+                        "symbol": "StablecoinDepeg"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "end_time"
+                  },
+                  "val": {
+                    "u64": 2592000
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "holder"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "id"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "payout_at"
+                  },
+                  "val": "void"
+                },
+                {
+                  "key": {
+                    "symbol": "premium_paid"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 12328755
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "start_time"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "status"
+                  },
+                  "val": {
+                    "vec": [
+                      {
+                        "symbol": "Active"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "trigger_threshold"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 500
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000003"
+              },
+              {
+                "symbol": "expire_policy"
+              }
+            ],
+            "data": {
+              "u64": 0
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000004"
+              },
+              {
+                "symbol": "deactivate_policy"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "vec": [
-                    {
-                      "symbol": "StablecoinDepeg"
-                    }
-                  ]
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 9000000
-                  }
+                  "u64": 0
                 }
               ]
             }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000004",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "policy_deactivated"
+              },
+              {
+                "u64": 0
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000004",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "deactivate_policy"
+              }
+            ],
+            "data": "void"
           }
         }
       },
@@ -2742,23 +2781,19 @@
           "v0": {
             "topics": [
               {
-                "symbol": "ORACLE"
+                "symbol": "EXPIRE"
               },
               {
-                "vec": [
-                  {
-                    "symbol": "StablecoinDepeg"
-                  }
-                ]
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
               }
             ],
             "data": {
               "vec": [
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 9000000
-                  }
+                  "u64": 0
+                },
+                {
+                  "u64": 2678400
                 }
               ]
             }
@@ -2779,7 +2814,7 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "update_oracle"
+                "symbol": "expire_policy"
               }
             ],
             "data": "void"
@@ -2803,7 +2838,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000003"
               },
               {
-                "symbol": "process_claim"
+                "symbol": "get_policy"
               }
             ],
             "data": {
@@ -2826,75 +2861,105 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "process_claim"
+                "symbol": "get_policy"
               }
             ],
             "data": {
-              "error": {
-                "contract": 6
-              }
-            }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "contract": 6
-                }
-              }
-            ],
-            "data": {
-              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
-            }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "contract": 6
-                }
-              }
-            ],
-            "data": {
-              "vec": [
+              "map": [
                 {
-                  "string": "contract try_call failed"
-                },
-                {
-                  "symbol": "process_claim"
-                },
-                {
-                  "vec": [
-                    {
-                      "u64": 0
+                  "key": {
+                    "symbol": "coverage_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 5000000000
                     }
-                  ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "coverage_type"
+                  },
+                  "val": {
+                    "vec": [
+                      {
+                        "symbol": "StablecoinDepeg"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "end_time"
+                  },
+                  "val": {
+                    "u64": 2592000
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "holder"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "id"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "payout_at"
+                  },
+                  "val": "void"
+                },
+                {
+                  "key": {
+                    "symbol": "premium_paid"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 12328755
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "start_time"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "status"
+                  },
+                  "val": {
+                    "vec": [
+                      {
+                        "symbol": "Expired"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "trigger_threshold"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 500
+                    }
+                  }
                 }
               ]
             }

@@ -64,7 +64,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -89,7 +89,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -111,7 +111,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 1000000000000
+                        "lo": 10000000000
                       }
                     }
                   ]
@@ -169,7 +169,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000000
+                          "lo": 5000000000
                         }
                       }
                     },
@@ -225,7 +225,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 24657510
+                        "lo": 12328755
                       }
                     }
                   ]
@@ -237,6 +237,7 @@
         }
       ]
     ],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
@@ -269,6 +270,8 @@
         }
       ]
     ],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -526,7 +529,7 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "Policy"
+                  "symbol": "Settled"
                 },
                 {
                   "u64": 0
@@ -546,7 +549,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "Policy"
+                      "symbol": "Settled"
                     },
                     {
                       "u64": 0
@@ -555,102 +558,38 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "map": [
+                  "vec": [
                     {
-                      "key": {
-                        "symbol": "coverage_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 10000000000
-                        }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                    },
+                    {
+                      "u32": 0
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 5000000000
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "coverage_type"
-                      },
-                      "val": {
-                        "vec": [
-                          {
-                            "symbol": "StablecoinDepeg"
-                          }
-                        ]
+                      "i128": {
+                        "hi": 0,
+                        "lo": 12328755
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "end_time"
-                      },
-                      "val": {
-                        "u64": 2592000
+                      "i128": {
+                        "hi": 0,
+                        "lo": 500
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "holder"
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                      }
+                      "u64": 0
                     },
                     {
-                      "key": {
-                        "symbol": "id"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
+                      "u64": 2592000
                     },
-                    {
-                      "key": {
-                        "symbol": "payout_at"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
-                        "symbol": "premium_paid"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 24657510
-                        }
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "start_time"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "status"
-                      },
-                      "val": {
-                        "vec": [
-                          {
-                            "symbol": "Active"
-                          }
-                        ]
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "trigger_threshold"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 500
-                        }
-                      }
-                    }
+                    "void"
                   ]
                 }
               }
@@ -698,7 +637,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               }
@@ -838,7 +777,7 @@
                                 "symbol": "updated_at"
                               },
                               "val": {
-                                "u64": 0
+                                "u64": 2678400
                               }
                             },
                             {
@@ -937,7 +876,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 1000024657510
+                            "lo": 10012328755
                           }
                         }
                       },
@@ -952,7 +891,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 10000000000
+                            "lo": 0
                           }
                         }
                       },
@@ -967,7 +906,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 24657510
+                            "lo": 12328755
                           }
                         }
                       },
@@ -982,7 +921,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 1000000000000
+                            "lo": 10000000000
                           }
                         }
                       },
@@ -1101,7 +1040,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000000
+                          "lo": 5000000000
                         }
                       }
                     },
@@ -1142,7 +1081,7 @@
                         "symbol": "is_active"
                       },
                       "val": {
-                        "bool": true
+                        "bool": false
                       }
                     },
                     {
@@ -1160,7 +1099,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 24657510
+                          "lo": 12328755
                         }
                       }
                     }
@@ -1205,7 +1144,7 @@
                           ]
                         },
                         "val": {
-                          "u64": 1
+                          "u64": 0
                         }
                       },
                       {
@@ -1255,7 +1194,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 24657510
+                            "lo": 12328755
                           }
                         }
                       }
@@ -1379,7 +1318,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 1000024657510
+                          "lo": 10012328755
                         }
                       }
                     },
@@ -1525,7 +1464,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 9975342490
+                          "lo": 9987671245
                         }
                       }
                     },
@@ -1971,7 +1910,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -2005,7 +1944,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1000000000000
+                "lo": 10000000000
               }
             }
           }
@@ -2060,7 +1999,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -2099,7 +2038,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -2133,7 +2072,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1000000000000
+                "lo": 10000000000
               }
             }
           }
@@ -2182,13 +2121,13 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 },
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000000000000
+                    "lo": 10000000000
                   }
                 }
               ]
@@ -2216,7 +2155,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1000000000000
+                "lo": 10000000000
               }
             }
           }
@@ -2345,7 +2284,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000000
+                          "lo": 5000000000
                         }
                       }
                     },
@@ -2418,7 +2357,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 24657510
+                    "lo": 12328755
                   }
                 }
               ]
@@ -2452,7 +2391,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 24657510
+                "lo": 12328755
               }
             }
           }
@@ -2513,7 +2452,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 10000000000
+                          "lo": 5000000000
                         }
                       }
                     },
@@ -2556,7 +2495,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 24657510
+                          "lo": 12328755
                         }
                       }
                     }
@@ -2592,7 +2531,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000000000
+                    "lo": 5000000000
                   }
                 }
               ]
@@ -2648,13 +2587,13 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 10000000000
+                    "lo": 5000000000
                   }
                 },
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 24657510
+                    "lo": 12328755
                   }
                 },
                 {
@@ -2685,6 +2624,158 @@
             "data": {
               "u64": 0
             }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000003"
+              },
+              {
+                "symbol": "expire_policy"
+              }
+            ],
+            "data": {
+              "u64": 0
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000004"
+              },
+              {
+                "symbol": "deactivate_policy"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "u64": 0
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000004",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "policy_deactivated"
+              },
+              {
+                "u64": 0
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000004",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "deactivate_policy"
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "EXPIRE"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "u64": 0
+                },
+                {
+                  "u64": 2678400
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "expire_policy"
+              }
+            ],
+            "data": "void"
           }
         }
       },
@@ -2831,7 +2922,7 @@
             ],
             "data": {
               "error": {
-                "contract": 6
+                "contract": 9
               }
             }
           }
@@ -2852,7 +2943,7 @@
               },
               {
                 "error": {
-                  "contract": 6
+                  "contract": 9
                 }
               }
             ],
@@ -2877,7 +2968,7 @@
               },
               {
                 "error": {
-                  "contract": 6
+                  "contract": 9
                 }
               }
             ],
@@ -2895,6 +2986,266 @@
                       "u64": 0
                     }
                   ]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000003"
+              },
+              {
+                "symbol": "expire_policy"
+              }
+            ],
+            "data": {
+              "u64": 0
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "expire_policy"
+              }
+            ],
+            "data": {
+              "error": {
+                "contract": 9
+              }
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 9
+                }
+              }
+            ],
+            "data": {
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "error"
+              },
+              {
+                "error": {
+                  "contract": 9
+                }
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "string": "contract try_call failed"
+                },
+                {
+                  "symbol": "expire_policy"
+                },
+                {
+                  "vec": [
+                    {
+                      "u64": 0
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000003"
+              },
+              {
+                "symbol": "get_policy"
+              }
+            ],
+            "data": {
+              "u64": 0
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "get_policy"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "coverage_amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 5000000000
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "coverage_type"
+                  },
+                  "val": {
+                    "vec": [
+                      {
+                        "symbol": "StablecoinDepeg"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "end_time"
+                  },
+                  "val": {
+                    "u64": 2592000
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "holder"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "id"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "payout_at"
+                  },
+                  "val": "void"
+                },
+                {
+                  "key": {
+                    "symbol": "premium_paid"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 12328755
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "start_time"
+                  },
+                  "val": {
+                    "u64": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "status"
+                  },
+                  "val": {
+                    "vec": [
+                      {
+                        "symbol": "Expired"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "trigger_threshold"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 500
+                    }
+                  }
                 }
               ]
             }
