@@ -39,6 +39,40 @@ cargo build --target wasm32-unknown-unknown --release   # optimized wasm
 
 The release `.wasm` artifacts land in `target/wasm32-unknown-unknown/release/`.
 
+### Build artefacts and manifest
+
+Every CI run uploads the three release contracts as a workflow artefact named `refract-wasm-<commit sha>`. It holds `refract_pool.wasm`, `refract_policy.wasm`, `refract_oracle.wasm`, a `manifest.json` and a `SHA256SUMS` file. The checksums also appear in the run's job summary, so you can read them without downloading anything. Artefacts from pushes to `main` are kept for **90 days**, and artefacts from pull requests for **14 days**. On a pull request, the recorded commit is the merge commit GitHub built (`GITHUB_SHA`).
+
+CI produces these files with a committed script, so you can reproduce them locally:
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+python3 scripts/wasm_manifest.py collect --out dist/wasm   # copy, hash, write manifest
+python3 scripts/wasm_manifest.py verify dist/wasm          # re-check files against manifest
+```
+
+If you rebuild the same commit with the same toolchain (see `toolchain.rustc` in the manifest), you get identical SHA-256 values. You can compare them with a deployed contract's wasm hash.
+
+`manifest.json` (`schema_version: 1`) is the shared format for the wasm-size gate, the reproducible-build check and the release workflow:
+
+```jsonc
+{
+  "schema_version": 1,
+  "git_commit": "<40-char sha>",
+  "git_dirty": false,               // true if built from a modified tree
+  "toolchain": {
+    "rustc": "rustc 1.x.y (...)", "rustc_commit_hash": "...", "llvm_version": "...",
+    "host": "x86_64-unknown-linux-gnu", "cargo": "cargo 1.x.y (...)",
+    "target": "wasm32-unknown-unknown", "profile": "release"
+  },
+  "contracts": [
+    { "file": "refract_pool.wasm", "package": "refract-pool", "version": "0.1.0",
+      "cargo_toml": "pool/Cargo.toml", "size_bytes": 55971, "sha256": "<hex>" }
+    // one entry per contract, sorted by file name
+  ]
+}
+```
+
 ## Deploy (testnet)
 
 Deploy in dependency order — the oracle first, then the pool, then the registry:

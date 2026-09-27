@@ -17,6 +17,9 @@ Instead, email **security@refract.example** with:
 - A description of the issue and its impact
 - Steps to reproduce (proof-of-concept where possible)
 - Affected contract/service and version/commit
+  (for contracts, the SHA-256 from the `manifest.json` in that commit's
+  `refract-wasm-<sha>` CI artefact identifies the exact binary; see the
+  README's "Build artefacts and manifest" section)
 
 We aim to acknowledge reports within **72 hours** and to provide a remediation
 timeline after triage. We will credit reporters who wish to be named once a fix

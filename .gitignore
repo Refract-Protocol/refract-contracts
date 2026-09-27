@@ -14,3 +14,6 @@ deployments.local.json
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Collected release artefacts (scripts/wasm_manifest.py)
+/dist
