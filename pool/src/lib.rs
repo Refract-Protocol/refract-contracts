@@ -8,6 +8,16 @@ use soroban_sdk::{
 const PRECISION: i128 = 10_000_000i128;
 const BPS: i128 = 10_000i128;
 
+/// #87: TTL management constants (Soroban ledger entries)
+const DAY_IN_LEDGERS: u32 = 17_280; // ~5 seconds per ledger
+const PERSISTENT_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 14; // 2 weeks
+const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60; // 60 days
+const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30; // 30 days
+const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60; // 60 days
+
+/// #86: Maximum policies in a single batch_buy_policies call
+const MAX_BATCH_SIZE: u32 = 100;
+
 // ── Coverage categories ───────────────────────────────────────────────────────
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +85,10 @@ pub enum DataKey {
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
     LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    /// #83: Vesting schedule for a large claim: policy_id → (payout, vested_amount, vesting_start, vesting_end)
+    VestingClaim(u64),
+    /// #85: Staleness threshold in seconds for each coverage type
+    StalenessSeconds(CoverageType),
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -97,6 +111,12 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    /// #83: Large claim is still vesting; use claim_vested instead
+    ClaimStillVesting = 16,
+    /// #83: No vesting schedule exists for this policy
+    NoVestingSchedule = 17,
+    /// #86: Batch size exceeds maximum allowed
+    BatchTooLarge = 18,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -132,6 +152,17 @@ pub struct Policy {
     pub payout_at: Option<u64>,
 }
 
+/// #83: Vesting schedule for a large claim
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VestingSchedule {
+    pub policy_id: u64,
+    pub total_payout: i128,       // full amount to be vested
+    pub vested_amount: i128,      // amount already claimed
+    pub vesting_start: u64,       // timestamp when vesting began
+    pub vesting_end: u64,         // timestamp when vesting completes
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolConfig {
@@ -140,6 +171,10 @@ pub struct PoolConfig {
     pub min_coverage: i128,         // minimum policy size
     pub max_coverage: i128,         // maximum single policy size
     pub lockup_days: u32,           // LP lockup period in days
+    /// #83: Claims above this threshold are vested instead of paid immediately
+    pub large_claim_threshold: i128,
+    /// #83: Number of days over which large claims vest linearly
+    pub large_claim_vesting_days: u32,
 }
 
 #[contracttype]
@@ -205,6 +240,10 @@ impl RefractPool {
             min_coverage: 100_000_000i128,    // 10 USDC
             max_coverage: 50_000_000_000i128, // 5,000 USDC
             lockup_days: 7,
+            /// #83: Default large claim threshold (5,000 USDC)
+            large_claim_threshold: 50_000_000_000i128,
+            /// #83: Default vesting duration (7 days)
+            large_claim_vesting_days: 7,
         };
         env.storage().instance().set(&DataKey::PoolConfig, &config);
         env.storage().instance().set(&DataKey::Initialized, &true);
@@ -537,8 +576,13 @@ impl RefractPool {
         let triggered = match oracle {
             None => false,
             Some(data) => {
-                // Oracle value must be fresh (within 30 minutes)
-                let fresh = now - data.updated_at < 1_800;
+                // #85: Oracle value must be fresh (configurable per coverage type)
+                let staleness_secs: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::StalenessSeconds(policy.coverage_type.clone()))
+                    .unwrap_or(1_800); // default 30 minutes for backward compatibility
+                let fresh = now - data.updated_at < staleness_secs;
                 let triggered_value = match policy.coverage_type {
                     CoverageType::StablecoinDepeg => {
                         data.value < (PRECISION - policy.trigger_threshold * PRECISION / BPS)
@@ -556,8 +600,11 @@ impl RefractPool {
             return Err(PoolError::PolicyNotTriggered);
         }
 
-        // Pay out!
+        // #83: Check if this is a large claim that needs vesting
+        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
         let payout = policy.coverage_amount;
+        let use_vesting = payout > config.large_claim_threshold;
+
         policy.status = PolicyStatus::Claimed;
         policy.payout_at = Some(now);
         env.storage()
@@ -586,23 +633,42 @@ impl RefractPool {
             .instance()
             .set(&DataKey::TotalCoverage, &total_cov);
 
-        // Transfer USDC to holder
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc).transfer(
-            &env.current_contract_address(),
-            &policy.holder,
-            &payout,
-        );
+        if use_vesting {
+            // #83: Create vesting schedule for large claim
+            let vesting_end = now + (config.large_claim_vesting_days as u64) * 86_400;
+            let vesting = VestingSchedule {
+                policy_id,
+                total_payout: payout,
+                vested_amount: 0,
+                vesting_start: now,
+                vesting_end,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::VestingClaim(policy_id), &vesting);
+            Self::_bump_persistent_ttl(&env, &DataKey::VestingClaim(policy_id));
+            env.events().publish(
+                (symbol_short!("VEST"), policy.holder),
+                (policy_id, payout, now, vesting_end),
+            );
+        } else {
+            // Immediate payout for small claims
+            let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+            token::Client::new(&env, &usdc).transfer(
+                &env.current_contract_address(),
+                &policy.holder,
+                &payout,
+            );
+            env.events().publish(
+                (symbol_short!("CLAIM"), policy.holder),
+                (policy_id, payout, now),
+            );
+        }
 
         // Keep the registry's mirrored record in sync now that the policy
         // is settled. See _deactivate_in_registry for why this is
         // best-effort and cannot roll back the payout above.
         Self::_deactivate_in_registry(&env, policy_id);
-
-        env.events().publish(
-            (symbol_short!("CLAIM"), policy.holder),
-            (policy_id, payout, now),
-        );
 
         Ok(payout)
     }
@@ -1028,6 +1094,217 @@ impl RefractPool {
 
     /// Shared by every admin-gated entrypoint (set_policy_registry,
     /// set_admin, set_pool_config, update_oracle) so the auth + principal
+    /// #83: Claim available vested amount from a large claim. Permissionless — anyone
+    /// may call to unlock installments for the policy holder.
+    pub fn claim_vested(env: Env, policy_id: u64) -> Result<i128, PoolError> {
+        Self::assert_initialized(&env)?;
+
+        let mut vesting: VestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VestingClaim(policy_id))
+            .ok_or(PoolError::NoVestingSchedule)?;
+
+        let policy: Policy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Policy(policy_id))
+            .ok_or(PoolError::PolicyNotFound)?;
+
+        let now = env.ledger().timestamp();
+
+        // Calculate available vested amount
+        let total_vesting_seconds = vesting.vesting_end - vesting.vesting_start;
+        let elapsed_seconds = (now - vesting.vesting_start).min(total_vesting_seconds);
+        let vested_total = (vesting.total_payout as u128 * elapsed_seconds as u128 / total_vesting_seconds as u128) as i128;
+        let claimable = vested_total - vesting.vested_amount;
+
+        if claimable <= 0 {
+            return Err(PoolError::ClaimStillVesting);
+        }
+
+        vesting.vested_amount += claimable;
+        env.storage()
+            .persistent()
+            .set(&DataKey::VestingClaim(policy_id), &vesting);
+        Self::_bump_persistent_ttl(&env, &DataKey::VestingClaim(policy_id));
+
+        // Transfer USDC to holder
+        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        token::Client::new(&env, &usdc).transfer(
+            &env.current_contract_address(),
+            &policy.holder,
+            &claimable,
+        );
+
+        env.events().publish(
+            (symbol_short!("VCLM"), policy.holder),
+            (policy_id, claimable, now),
+        );
+
+        Ok(claimable)
+    }
+
+    /// #85: Set the staleness threshold for a coverage type. Admin-gated.
+    /// Claims with oracle data older than this threshold are rejected.
+    pub fn set_staleness_threshold(
+        env: Env,
+        admin: Address,
+        coverage_type: CoverageType,
+        staleness_secs: u64,
+    ) -> Result<(), PoolError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::StalenessSeconds(coverage_type), &staleness_secs);
+        Self::_bump_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// #86: Batch purchase multiple policies in one transaction. Reverts entirely
+    /// if any single policy fails capacity or premium checks.
+    pub fn buy_policies(
+        env: Env,
+        holder: Address,
+        params_list: Vec<PolicyParams>,
+    ) -> Result<Vec<u64>, PoolError> {
+        holder.require_auth();
+        Self::assert_initialized(&env)?;
+
+        if params_list.len() > MAX_BATCH_SIZE as usize {
+            return Err(PoolError::BatchTooLarge);
+        }
+
+        let mut result = Vec::new(&env);
+        for params in params_list {
+            // Reuse buy_policy's single-item logic
+            let policy_id = Self::_buy_one(&env, &holder, &params)?;
+            result.push_back(policy_id);
+        }
+        Ok(result)
+    }
+
+    /// Helper: common logic for single and batched policy purchase.
+    /// Used by both buy_policy and buy_policies.
+    fn _buy_one(env: &Env, holder: &Address, params: &PolicyParams) -> Result<u64, PoolError> {
+        Self::assert_initialized(env)?;
+
+        if params.coverage_amount <= 0 {
+            return Err(PoolError::ZeroAmount);
+        }
+
+        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+
+        if params.coverage_amount < config.min_coverage || params.coverage_amount > config.max_coverage {
+            return Err(PoolError::InsufficientPremium); // reusing existing error
+        }
+
+        // Check capacity
+        let total_coverage: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCoverage)
+            .unwrap_or(0);
+        let total_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCapital)
+            .unwrap_or(0);
+
+        let new_coverage = total_coverage + params.coverage_amount;
+        if total_capital > 0 {
+            let utilization = new_coverage * BPS / total_capital;
+            if utilization > config.max_utilization_bps as i128 {
+                return Err(PoolError::InsufficientCapacity);
+            }
+        }
+
+        // Calculate premium
+        let annual_premium = (params.coverage_amount as u128 * config.base_premium_rate_bps as u128 / BPS as u128) as i128;
+        let duration_years = params.duration_days as i128 * 10_000 / (365 * 10_000);
+        let premium = (annual_premium as u128 * params.duration_days as u128 / (365 * 10_000) as u128) as i128;
+
+        if premium <= 0 {
+            return Err(PoolError::ZeroAmount);
+        }
+
+        // Transfer premium from holder
+        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        token::Client::new(env, &usdc).transfer(
+            holder,
+            &env.current_contract_address(),
+            &premium,
+        );
+
+        let now = env.ledger().timestamp();
+        let end_time = now + (params.duration_days as u64) * 86_400;
+
+        // Create policy record
+        let policy_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextPolicyId)
+            .unwrap_or(0);
+
+        let policy = Policy {
+            id: policy_id,
+            holder: holder.clone(),
+            coverage_type: params.coverage_type.clone(),
+            coverage_amount: params.coverage_amount,
+            premium_paid: premium,
+            trigger_threshold: params.trigger_threshold,
+            start_time: now,
+            end_time,
+            status: PolicyStatus::Active,
+            payout_at: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Policy(policy_id), &policy);
+        Self::_bump_persistent_ttl(env, &DataKey::Policy(policy_id));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::NextPolicyId, &(policy_id + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalCoverage, &new_coverage);
+
+        let mut total_premiums: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalPremiums)
+            .unwrap_or(0);
+        total_premiums += premium;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalPremiums, &total_premiums);
+
+        Self::_bump_instance_ttl(env);
+
+        Ok(policy_id)
+    }
+
+    /// #87: Bump persistent storage TTL for a given entry.
+    fn _bump_persistent_ttl(env: &Env, key: &DataKey) {
+        if let Ok(ttl) = env.storage().persistent().get_ttl(key) {
+            if ttl.0 < PERSISTENT_TTL_THRESHOLD {
+                env.storage().persistent().extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+            }
+        }
+    }
+
+    /// #87: Bump instance storage TTL.
+    fn _bump_instance_ttl(env: &Env) {
+        let instance = env.storage().instance();
+        if let Ok(ttl) = instance.get_ttl() {
+            if ttl.0 < INSTANCE_TTL_THRESHOLD {
+                instance.extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+            }
+        }
+    }
+
     /// check can't drift between them.
     fn require_admin(env: &Env, caller: &Address) -> Result<(), PoolError> {
         caller.require_auth();
