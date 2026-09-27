@@ -1053,6 +1053,7 @@ dependencies = [
 name = "refract-oracle"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "soroban-sdk",
 ]
 

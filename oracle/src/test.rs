@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
@@ -403,4 +405,206 @@ fn adding_the_same_relayer_twice_is_a_no_op() {
         &Symbol::new(&f.env, "test_source"),
     );
     assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
+}
+
+/// Ledger footprint of one `submit` from the most recently added of `n`
+/// registered relayers, onto a feed that already has a reading on file (so
+/// the ordering check actually reads the stored entry): the number of
+/// entries it touches and their total XDR size. Read entries and read bytes
+/// are what the network charges a submission for.
+fn submit_footprint_with_relayers(n: u32) -> (u32, usize) {
+    use soroban_sdk::xdr::{LedgerKey, Limits, WriteXdr};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    env.budget().reset_unlimited();
+    let id = env.register_contract(None, RefractOracle);
+    let oracle = RefractOracleClient::new(&env, &id);
+    oracle.initialize(&Address::generate(&env));
+    let mut relayer = Address::generate(&env);
+    for _ in 0..n {
+        relayer = Address::generate(&env);
+        oracle.add_relayer(&relayer);
+    }
+    let feed = Symbol::new(&env, "USDC_PRICE");
+    let source = Symbol::new(&env, "test_source");
+    let now = env.ledger().timestamp();
+    oracle.submit(&relayer, &feed, &9_990_000, &now, &source);
+
+    // The test host accumulates one footprint over the env's lifetime;
+    // on-chain it's per transaction, so measure the submit on its own.
+    env.host()
+        .with_mut_storage(|s| {
+            s.footprint = Default::default();
+            Ok(())
+        })
+        .unwrap();
+    oracle.submit(&relayer, &feed, &9_980_000, &now, &source);
+
+    let budget = env.host().budget_cloned();
+    env.host()
+        .with_mut_storage(|s| {
+            let (mut entries, mut bytes) = (0u32, 0usize);
+            for (key, _) in s.footprint.0.iter(&budget)? {
+                entries += 1;
+                if let Some(Some((entry, _))) = s.map.get::<std::rc::Rc<LedgerKey>>(key, &budget)? {
+                    bytes += entry.to_xdr(Limits::none()).unwrap().len();
+                }
+            }
+            Ok((entries, bytes))
+        })
+        .unwrap()
+}
+
+#[test]
+fn submission_cost_does_not_scale_with_relayer_count() {
+    // Before relayers moved out of instance storage, every submit read the
+    // whole relayer list as part of the instance entry (~40 bytes per
+    // relayer) and scanned it linearly. Authorisation is now one marker
+    // lookup, so 50 relayers must cost exactly what 1 does.
+    let one = submit_footprint_with_relayers(1);
+    let fifty = submit_footprint_with_relayers(50);
+    assert_eq!(one, fifty);
+}
+
+#[test]
+fn list_relayers_and_authorisation_stay_in_sync() {
+    let f = setup();
+    let second = Address::generate(&f.env);
+    f.oracle.add_relayer(&second);
+    f.oracle.remove_relayer(&f.relayer);
+    f.oracle.add_relayer(&f.relayer); // re-adding after removal works
+
+    assert_eq!(
+        f.oracle.list_relayers(),
+        Vec::from_array(&f.env, [second.clone(), f.relayer.clone()])
+    );
+    submit(&f, "USDC_PRICE", 9_990_000);
+
+    f.oracle.remove_relayer(&second);
+    let now = f.env.ledger().timestamp();
+    let res = f.oracle.try_submit(
+        &second,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &9_990_000,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
+    assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
+}
+
+#[test]
+fn admin_can_submit_without_being_a_relayer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register_contract(None, RefractOracle);
+    let oracle = RefractOracleClient::new(&env, &id);
+    oracle.initialize(&admin);
+
+    let feed = Symbol::new(&env, "USDC_PRICE");
+    let now = env.ledger().timestamp();
+    oracle.submit(&admin, &feed, &9_990_000, &now, &Symbol::new(&env, "admin"));
+    assert_eq!(oracle.get_reading(&feed).source, Symbol::new(&env, "admin"));
+}
+
+fn feed_ids(env: &Env, n: u32) -> Vec<Symbol> {
+    let mut ids = Vec::new(env);
+    for i in 0..n {
+        ids.push_back(Symbol::new(env, &std::format!("FEED_{i}")));
+    }
+    ids
+}
+
+#[test]
+fn list_feeds_accepts_exactly_the_cap() {
+    let f = setup();
+    let ids = feed_ids(&f.env, MAX_LIST_FEEDS);
+    let now = f.env.ledger().timestamp();
+    for id in ids.iter() {
+        f.oracle.submit(
+            &f.relayer,
+            &id,
+            &1,
+            &now,
+            &Symbol::new(&f.env, "test_source"),
+        );
+    }
+    let feeds = f.oracle.list_feeds(&ids);
+    assert_eq!(feeds.len(), MAX_LIST_FEEDS);
+    assert_eq!(feeds.get(ids.get(0).unwrap()), Some(now as i64));
+}
+
+#[test]
+fn list_feeds_rejects_one_past_the_cap() {
+    let f = setup();
+    let res = f
+        .oracle
+        .try_list_feeds(&feed_ids(&f.env, MAX_LIST_FEEDS + 1));
+    assert_eq!(res, Err(Ok(OracleError::TooManyFeeds)));
+}
+
+#[test]
+fn list_feeds_skips_unknown_feeds() {
+    let f = setup();
+    submit(&f, "USDC_PRICE", 9_990_000);
+    let ids = Vec::from_array(
+        &f.env,
+        [
+            Symbol::new(&f.env, "USDC_PRICE"),
+            Symbol::new(&f.env, "NOPE"),
+        ],
+    );
+    let feeds = f.oracle.list_feeds(&ids);
+    assert_eq!(feeds.len(), 1);
+    assert!(feeds.contains_key(Symbol::new(&f.env, "USDC_PRICE")));
+}
+
+mod ordering_proptest {
+    use super::*;
+    use ::proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// Whatever order submissions arrive in, the stored reading is
+        /// always the last one that was accepted, every accepted
+        /// submission is at least as new as everything before it, and a
+        /// rejected one leaves the stored reading untouched.
+        #[test]
+        fn stored_reading_is_always_the_latest_accepted_one(
+            offsets in ::proptest::collection::vec(0u64..=MAX_STALENESS_SECS, 1..24),
+        ) {
+            let f = setup();
+            let feed = Symbol::new(&f.env, "USDC_PRICE");
+            let base = 10_000u64;
+            f.env.ledger().with_mut(|li| li.timestamp = base + MAX_STALENESS_SECS);
+
+            let mut latest: Option<(u64, i128)> = None;
+            for (i, offset) in offsets.iter().enumerate() {
+                let ts = base + offset;
+                let value = i as i128;
+                let res = f.oracle.try_submit(
+                    &f.relayer,
+                    &feed,
+                    &value,
+                    &ts,
+                    &Symbol::new(&f.env, "test_source"),
+                );
+                match latest {
+                    Some((prev_ts, _)) if ts < prev_ts => {
+                        prop_assert_eq!(res, Err(Ok(OracleError::StaleSubmission)));
+                    }
+                    _ => {
+                        prop_assert!(res.is_ok());
+                        latest = Some((ts, value));
+                    }
+                }
+                let (want_ts, want_value) = latest.unwrap();
+                let stored = f.oracle.get_reading(&feed);
+                prop_assert_eq!(stored.timestamp, want_ts);
+                prop_assert_eq!(stored.value, want_value);
+            }
+        }
+    }
 }
