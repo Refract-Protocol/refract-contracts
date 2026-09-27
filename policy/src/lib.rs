@@ -75,6 +75,8 @@ pub enum DataKey {
     TotalPolicies,
     TotalPremium,
     ActivePolicies,
+    /// #70: Track contract version for migration purposes
+    ContractVersion,
 }
 
 #[contract]
@@ -264,6 +266,30 @@ impl RefractPolicyRegistry {
 
         env.events()
             .publish((Symbol::new(&env, "admin_set"),), (new_admin,));
+        Ok(())
+    }
+
+    /// #70: Admin-gated contract upgrade.
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+
+        let old_wasm_hash = env.deployer().get_current_contract_wasm().unwrap_or_default();
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Bump contract version for migration tracking
+        let version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &(version + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
         Ok(())
     }
 
