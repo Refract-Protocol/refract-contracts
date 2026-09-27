@@ -40,6 +40,9 @@ pub enum OracleError {
     UnknownCoverageType = 6,
     FutureTimestamp = 7,
     StaleSubmission = 8, // older than the reading already stored for this feed
+    InsufficientBond = 9,    // Issue #94: relayer bond too low
+    RelayerNotBonded = 10,   // Issue #94: relayer has no stake
+    InvalidSlashAmount = 11, // Issue #94: slash exceeds bond
 }
 
 /// Oracle reading stored on-chain.
@@ -55,11 +58,30 @@ pub struct OracleReading {
     pub source: Symbol,
 }
 
+/// Issue #94: Relayer bond record
+#[contracttype]
+#[derive(Clone)]
+pub struct RelayerBondRecord {
+    pub relayer: Address,
+    pub bond_amount: i128,
+    pub bonded_at: u64,
+    /// Timestamp after which relayer can unstake
+    pub unstake_available_at: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
     Relayers,
     Reading(Symbol), // feed_id → OracleReading
+    /// Issue #95: Fallback oracle address for failover on primary staleness
+    FallbackOracle,
+    /// Issue #91: Per-relayer readings for median aggregation
+    RelayerReading(Symbol, Address), // (feed_id, relayer) → OracleReading
+    /// Issue #93: Historical readings per feed
+    ReadingHistory(Symbol), // feed_id → Vec<OracleReading>
+    /// Issue #94: Relayer bond amounts
+    RelayerBond(Address), // relayer → i128
 }
 
 #[contract]
