@@ -40,6 +40,7 @@ pub enum OracleError {
     UnknownCoverageType = 6,
     FutureTimestamp = 7,
     StaleSubmission = 8, // older than the reading already stored for this feed
+    NoPendingAdmin = 9,  // Issue #88: no pending admin to accept
 }
 
 /// Oracle reading stored on-chain.
@@ -60,6 +61,10 @@ pub enum DataKey {
     Admin,
     Relayers,
     Reading(Symbol), // feed_id → OracleReading
+    /// Issue #88: Pending admin awaiting acceptance
+    PendingAdmin,
+    /// Issue #92: Per-feed configurable trigger thresholds
+    Threshold(Symbol),
 }
 
 #[contract]
@@ -139,16 +144,49 @@ impl RefractOracle {
         env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// Rotate the admin key. The only recovery path if the current admin
-    /// key is lost or compromised — without it, add_relayer/remove_relayer
-    /// and this function itself would be permanently stuck on whatever key
-    /// was set at initialize().
-    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), OracleError> {
+    /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
         env.events()
-            .publish((Symbol::new(&env, "admin_set"),), (new_admin,));
+            .publish((Symbol::new(&env, "admin_proposed"),), (new_admin,));
         Ok(())
+    }
+
+    /// Issue #88: Accept admin role. Must be called by the proposed admin.
+    pub fn accept_admin(env: Env, caller: Address) -> Result<(), OracleError> {
+        caller.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(OracleError::NoPendingAdmin)?;
+        if pending != caller {
+            return Err(OracleError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((Symbol::new(&env, "admin_accepted"),), (caller,));
+        Ok(())
+    }
+
+    /// Issue #92: Set a configurable threshold for a feed.
+    pub fn set_threshold(env: Env, feed_id: Symbol, threshold: i128) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold(feed_id.clone()), &threshold);
+        env.events()
+            .publish((Symbol::new(&env, "threshold_set"),), (feed_id,));
+        Ok(())
+    }
+
+    /// Issue #92: Get the configured threshold for a feed, or None if using default.
+    pub fn get_threshold(env: Env, feed_id: Symbol) -> Option<i128> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Threshold(feed_id))
     }
 
     // ─── Data submission ─────────────────────────────────────────────────

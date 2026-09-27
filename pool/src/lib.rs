@@ -73,8 +73,14 @@ pub enum DataKey {
     NextPolicyId,
     PoolConfig,
     Initialized,
-    OracleData(CoverageType), // latest oracle reading per type
+    OracleData(CoverageType), // latest oracle reading per type (deprecated, use OracleContract)
     LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    /// Issue #88: Pending admin awaiting acceptance
+    PendingAdmin,
+    /// Issue #89: RefractOracle contract address for cross-contract calls
+    OracleContract,
+    /// Issue #90: CoverageType -> feed_id (Symbol) binding for oracle queries
+    FeedBinding(CoverageType),
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -97,6 +103,10 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    NoPendingAdmin = 16, // Issue #88: no pending admin to accept
+    OracleNotSet = 17,   // Issue #89: RefractOracle not configured
+    FeedBindingNotSet = 18, // Issue #90: coverage type not bound to feed_id
+    OracleQueryFailed = 19, // Issue #89: cross-contract call to oracle failed
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -673,17 +683,30 @@ impl RefractPool {
         Ok(())
     }
 
-    /// Rotate the admin key. The only recovery path if the current admin
-    /// key is lost or compromised — without it, every admin-gated call
-    /// (set_policy_registry, update_oracle, set_pool_config, this function
-    /// itself) would be permanently stuck on whatever key was set at
-    /// initialize().
-    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), PoolError> {
+    /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
+    pub fn propose_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), PoolError> {
         Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
         env.events()
-            .publish((symbol_short!("ADMIN_SET"),), (new_admin,));
+            .publish((symbol_short!("ADM_PROP"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Issue #88: Accept admin role. Must be called by the proposed admin.
+    pub fn accept_admin(env: Env, caller: Address) -> Result<(), PoolError> {
+        caller.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(PoolError::NoPendingAdmin)?;
+        if pending != caller {
+            return Err(PoolError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((symbol_short!("ADM_ACC"),), (caller,));
         Ok(())
     }
 
@@ -721,6 +744,49 @@ impl RefractPool {
         env.events()
             .publish((symbol_short!("ORACLE"), coverage_type), (value,));
         Ok(())
+    }
+
+    /// Issue #89: Set the RefractOracle contract address for real oracle queries.
+    pub fn set_oracle_contract(
+        env: Env,
+        caller: Address,
+        oracle_address: Address,
+    ) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleContract, &oracle_address);
+        env.events()
+            .publish((symbol_short!("ORA_SET"),), (oracle_address,));
+        Ok(())
+    }
+
+    /// Issue #90: Bind a CoverageType to its oracle feed_id (Symbol).
+    pub fn set_feed_binding(
+        env: Env,
+        caller: Address,
+        coverage_type: CoverageType,
+        feed_id: Symbol,
+    ) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::FeedBinding(coverage_type.clone()), &feed_id);
+        env.events()
+            .publish((symbol_short!("FEED_BND"),), (coverage_type,));
+        Ok(())
+    }
+
+    /// Issue #90: Get the feed_id bound to a CoverageType.
+    pub fn get_feed_binding(env: Env, coverage_type: CoverageType) -> Option<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeedBinding(coverage_type))
+    }
+
+    /// Issue #88: Get the pending admin.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     // ── View Functions ────────────────────────────────────────────────────────

@@ -35,6 +35,7 @@ pub enum RegistryError {
     Unauthorized = 3,
     PolicyNotFound = 4,
     PolicyAlreadyExists = 5,
+    NoPendingAdmin = 6,  // Issue #88: no pending admin to accept
 }
 
 /// Parameters for indexing a policy that the Pool contract already created.
@@ -75,6 +76,8 @@ pub enum DataKey {
     TotalPolicies,
     TotalPremium,
     ActivePolicies,
+    /// Issue #88: Pending admin awaiting acceptance
+    PendingAdmin,
 }
 
 #[contract]
@@ -255,15 +258,32 @@ impl RefractPolicyRegistry {
     }
 
     /// Rotate the admin key. The only recovery path if the current admin
-    /// key is lost or compromised — without it, set_pool_contract and this
-    /// function itself would be permanently stuck on whatever key was set
-    /// at initialize().
-    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), RegistryError> {
+    /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
+    pub fn propose_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
 
         env.events()
-            .publish((Symbol::new(&env, "admin_set"),), (new_admin,));
+            .publish((Symbol::new(&env, "admin_proposed"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Issue #88: Accept admin role. Must be called by the proposed admin.
+    pub fn accept_admin(env: Env, caller: Address) -> Result<(), RegistryError> {
+        caller.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(RegistryError::NoPendingAdmin)?;
+        if pending != caller {
+            return Err(RegistryError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_accepted"),), (caller,));
         Ok(())
     }
 
