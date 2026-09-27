@@ -1068,3 +1068,240 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
+
+// ── Emergency pause ─────────────────────────────────────────────────────────
+
+/// Helper: a pool with LP capital and one active StablecoinDepeg policy,
+/// so a test can exercise every guarded and unguarded entrypoint.
+fn funded_pool_with_policy(f: &Fixture) -> (Address, i128, Address, u64) {
+    let lp = funded(f, 100_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(50_000 * ONE_USDC));
+
+    let holder = funded(f, 1_000 * ONE_USDC);
+    let id = f.pool.buy_policy(&holder, &depeg_params());
+    (lp, shares, holder, id)
+}
+
+fn depeg_params() -> PolicyParams {
+    PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500, // depeg below $0.95
+    }
+}
+
+#[test]
+fn paused_defaults_to_false() {
+    let f = setup();
+    assert!(!f.pool.paused());
+}
+
+#[test]
+fn paused_is_false_before_initialize() {
+    let env = Env::default();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    assert!(!pool.paused());
+}
+
+#[test]
+fn set_paused_toggles_the_flag() {
+    let f = setup();
+    f.pool.set_paused(&f.admin, &true);
+    assert!(f.pool.paused());
+    f.pool.set_paused(&f.admin, &false);
+    assert!(!f.pool.paused());
+}
+
+#[test]
+fn set_paused_rejects_non_admin() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let res = f.pool.try_set_paused(&stranger, &true);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
+    assert!(!f.pool.paused());
+}
+
+#[test]
+fn set_paused_rejects_before_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let caller = Address::generate(&env);
+    let res = pool.try_set_paused(&caller, &true);
+    assert_eq!(res, Err(Ok(PoolError::NotInitialized)));
+}
+
+#[test]
+fn set_paused_is_idempotent_so_the_admin_is_never_locked_in() {
+    let f = setup();
+    f.pool.set_paused(&f.admin, &true);
+    // Pausing an already-paused pool must still succeed...
+    f.pool.set_paused(&f.admin, &true);
+    assert!(f.pool.paused());
+    // ...and so must unpausing an already-unpaused one.
+    f.pool.set_paused(&f.admin, &false);
+    f.pool.set_paused(&f.admin, &false);
+    assert!(!f.pool.paused());
+}
+
+#[test]
+fn set_paused_follows_admin_rotation() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+    f.pool.set_admin(&f.admin, &new_admin);
+
+    let res = f.pool.try_set_paused(&f.admin, &true);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
+
+    f.pool.set_paused(&new_admin, &true);
+    assert!(f.pool.paused());
+}
+
+#[test]
+fn set_paused_emits_a_pause_and_unpause_event_stream() {
+    let f = setup();
+
+    let before = f.env.events().all().len();
+    f.pool.set_paused(&f.admin, &true);
+    f.pool.set_paused(&f.admin, &false);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before + 2);
+
+    let expected_topics: Vec<soroban_sdk::Val> =
+        (symbol_short!("PAUSE_SET"), f.admin.clone()).into_val(&f.env);
+    for (i, paused) in [(before, true), (before + 1, false)] {
+        let (contract, topics, data) = events.get(i).unwrap();
+        assert_eq!(contract, f.pool.address);
+        assert_eq!(topics, expected_topics);
+        let (emitted,): (bool,) = soroban_sdk::FromVal::from_val(&f.env, &data);
+        assert_eq!(emitted, paused);
+    }
+}
+
+#[test]
+fn provide_capital_is_rejected_while_paused() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    f.pool.set_paused(&f.admin, &true);
+
+    let res = f.pool.try_provide_capital(&lp, &(10_000 * ONE_USDC));
+    assert_eq!(res, Err(Ok(PoolError::Paused)));
+    // No funds moved and no shares minted.
+    assert_eq!(f.usdc.balance(&lp), 10_000 * ONE_USDC);
+    assert_eq!(f.pool.shares_of(&lp), 0);
+    assert_eq!(f.pool.pool_stats().total_capital, 0);
+}
+
+#[test]
+fn withdraw_capital_is_rejected_while_paused() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    past_lockup(&f);
+    f.pool.set_paused(&f.admin, &true);
+
+    let res = f.pool.try_withdraw_capital(&lp, &shares);
+    assert_eq!(res, Err(Ok(PoolError::Paused)));
+    assert_eq!(f.pool.shares_of(&lp), shares);
+    assert_eq!(f.usdc.balance(&lp), 0);
+}
+
+#[test]
+fn buy_policy_is_rejected_while_paused() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    f.pool.set_paused(&f.admin, &true);
+
+    let res = f.pool.try_buy_policy(&holder, &depeg_params());
+    assert_eq!(res, Err(Ok(PoolError::Paused)));
+    assert_eq!(f.usdc.balance(&holder), 1_000 * ONE_USDC);
+    assert_eq!(f.pool.user_policies(&holder).len(), 0);
+    assert_eq!(f.pool.pool_stats().total_coverage, 0);
+}
+
+#[test]
+fn guarded_entrypoints_work_again_after_unpause() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    let holder = funded(&f, 1_000 * ONE_USDC);
+
+    f.pool.set_paused(&f.admin, &true);
+    f.pool.set_paused(&f.admin, &false);
+
+    // No re-initialization needed: every guarded path just works.
+    let shares = f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+    f.pool.buy_policy(&holder, &depeg_params());
+    past_lockup(&f);
+    let out = f.pool.withdraw_capital(&lp, &(shares / 2));
+    assert!(out > 0);
+}
+
+#[test]
+fn process_claim_still_pays_out_while_paused() {
+    let f = setup();
+    let (_lp, _shares, holder, id) = funded_pool_with_policy(&f);
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.set_paused(&f.admin, &true);
+
+    let holder_before = f.usdc.balance(&holder);
+    let payout = f.pool.process_claim(&id);
+    assert_eq!(payout, 1_000 * ONE_USDC);
+    assert_eq!(f.usdc.balance(&holder) - holder_before, 1_000 * ONE_USDC);
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Claimed
+    );
+}
+
+#[test]
+fn expire_policy_still_sweeps_while_paused() {
+    let f = setup();
+    let (_lp, _shares, _holder, id) = funded_pool_with_policy(&f);
+    f.pool.set_paused(&f.admin, &true);
+
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 31 * 86_400;
+    });
+    f.pool.expire_policy(&id);
+
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Expired
+    );
+    assert_eq!(f.pool.pool_stats().total_coverage, 0);
+    assert!(!f.registry.get_policy(&id).is_active);
+}
+
+#[test]
+fn pausing_mid_lockup_does_not_reset_the_lockup_clock() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    let expires_at = f.pool.lockup_expires_at(&lp).unwrap();
+
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 3 * 86_400;
+    });
+    f.pool.set_paused(&f.admin, &true);
+    assert_eq!(f.pool.lockup_expires_at(&lp), Some(expires_at));
+
+    // Stay paused past the original unlock time, then unpause: the
+    // provider can withdraw immediately rather than waiting out a fresh
+    // lockup.
+    f.env.ledger().with_mut(|li| {
+        li.timestamp = expires_at;
+    });
+    f.pool.set_paused(&f.admin, &false);
+    assert_eq!(f.pool.lockup_expires_at(&lp), Some(expires_at));
+    let out = f.pool.withdraw_capital(&lp, &shares);
+    assert_eq!(out, 10_000 * ONE_USDC);
+}

@@ -75,6 +75,7 @@ pub enum DataKey {
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
     LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    Paused,                   // bool — emergency stop; absent means not paused
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -97,6 +98,7 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    Paused = 16,       // admin has halted provide_capital/withdraw_capital/buy_policy
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -231,6 +233,7 @@ impl RefractPool {
     pub fn provide_capital(env: Env, provider: Address, amount: i128) -> Result<i128, PoolError> {
         provider.require_auth();
         Self::assert_initialized(&env)?;
+        Self::assert_not_paused(&env)?;
         if amount <= 0 {
             return Err(PoolError::ZeroAmount);
         }
@@ -309,6 +312,7 @@ impl RefractPool {
     pub fn withdraw_capital(env: Env, provider: Address, shares: i128) -> Result<i128, PoolError> {
         provider.require_auth();
         Self::assert_initialized(&env)?;
+        Self::assert_not_paused(&env)?;
         if shares <= 0 {
             return Err(PoolError::ZeroAmount);
         }
@@ -387,6 +391,7 @@ impl RefractPool {
     pub fn buy_policy(env: Env, holder: Address, params: PolicyParams) -> Result<u64, PoolError> {
         holder.require_auth();
         Self::assert_initialized(&env)?;
+        Self::assert_not_paused(&env)?;
 
         let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
         let new_coverage = Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
@@ -675,9 +680,9 @@ impl RefractPool {
 
     /// Rotate the admin key. The only recovery path if the current admin
     /// key is lost or compromised — without it, every admin-gated call
-    /// (set_policy_registry, update_oracle, set_pool_config, this function
-    /// itself) would be permanently stuck on whatever key was set at
-    /// initialize().
+    /// (set_policy_registry, update_oracle, set_pool_config, set_paused,
+    /// this function itself) would be permanently stuck on whatever key
+    /// was set at initialize().
     pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), PoolError> {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -697,6 +702,25 @@ impl RefractPool {
         env.storage().instance().set(&DataKey::PoolConfig, &config);
 
         env.events().publish((symbol_short!("CFG_SET"),), ());
+        Ok(())
+    }
+
+    /// Emergency stop. While paused, provide_capital(), withdraw_capital()
+    /// and buy_policy() return `PoolError::Paused` so no new capital or
+    /// coverage can enter or leave the pool while an incident (a bug, an
+    /// oracle malfunction, an exploit) is investigated. process_claim()
+    /// and expire_policy() are deliberately left callable: holders whose
+    /// trigger has fired must still be paid, and lapsed coverage must
+    /// still be freed. Pausing doesn't touch any other state (lockup
+    /// clocks, shares, config), so unpausing resumes exactly where the
+    /// pool left off. Idempotent — setting the flag to its current value
+    /// is allowed, so the admin can never be stuck in either state.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &paused);
+
+        env.events()
+            .publish((symbol_short!("PAUSE_SET"), caller), (paused,));
         Ok(())
     }
 
@@ -838,12 +862,22 @@ impl RefractPool {
     }
 
     /// The address currently authorized to call every admin-gated function
-    /// (set_admin, set_policy_registry, set_pool_config, update_oracle).
+    /// (set_admin, set_policy_registry, set_pool_config, set_paused,
+    /// update_oracle).
     /// Without this, verifying who holds admin control — e.g. confirming a
     /// set_admin() rotation actually landed — meant replaying event history
     /// instead of just reading current state.
     pub fn admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Whether the pool is currently paused (see set_paused()). `false`
+    /// before initialize() and whenever the flag has never been set.
+    pub fn paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// The pool's current operational parameters (rates, utilization cap,
@@ -1026,8 +1060,17 @@ impl RefractPool {
         Ok(())
     }
 
+    /// Guards the entrypoints that move capital into or out of the pool
+    /// (provide_capital, withdraw_capital, buy_policy). See set_paused().
+    fn assert_not_paused(env: &Env) -> Result<(), PoolError> {
+        if Self::paused(env.clone()) {
+            return Err(PoolError::Paused);
+        }
+        Ok(())
+    }
+
     /// Shared by every admin-gated entrypoint (set_policy_registry,
-    /// set_admin, set_pool_config, update_oracle) so the auth + principal
+    /// set_admin, set_pool_config, set_paused, update_oracle) so the auth + principal
     /// check can't drift between them.
     fn require_admin(env: &Env, caller: &Address) -> Result<(), PoolError> {
         caller.require_auth();

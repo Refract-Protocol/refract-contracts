@@ -61,7 +61,8 @@ Then `initialize` each contract (admin, USDC token address, and pool↔registry 
 
 ## Authorization model
 
-- **RefractPool** — `provide_capital`, `withdraw_capital`, and `buy_policy` require the caller's auth. `update_oracle` is admin-only.
+- **RefractPool** — `provide_capital`, `withdraw_capital`, and `buy_policy` require the caller's auth. `update_oracle`, `set_pool_config`, `set_policy_registry`, `set_admin`, and `set_paused` are admin-only.
+  - **Emergency pause.** `set_paused(caller, true)` (admin-only) halts `provide_capital`, `withdraw_capital`, and `buy_policy`, which then return `PoolError::Paused`. `process_claim` and `expire_policy` stay callable while paused so triggered policies are still paid out and lapsed coverage is still freed. Pausing changes no other state (shares, config, LP lockup clocks), so `set_paused(caller, false)` resumes the pool as it was; both calls are idempotent and emit a `PAUSE_SET` event. Read the current state with `paused()`.
 - **RefractOracle** — only registered relayers (or the admin) may `submit`; readings older than 30 minutes are rejected.
 - **RefractPolicyRegistry** — only the registered pool contract or the admin may `register_policy` / `deactivate_policy`.
 
