@@ -97,6 +97,14 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    /// #78: Policy transfer not allowed (policy not Active, or holder mismatch)
+    CannotTransferPolicy = 16,
+    /// #81: Cannot top-up non-Active policy
+    CannotTopUpPolicy = 17,
+    /// #82: Token transfer resulted in unexpected amount
+    TokenTransferMismatch = 18,
+    /// #84: Recovery amount exceeds safe limit (would dip into LP capital)
+    RecoveryExceedsLimit = 19,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
