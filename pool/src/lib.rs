@@ -75,6 +75,8 @@ pub enum DataKey {
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
     LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    AcceptedTokens,           // Vec<Address> of accepted stablecoins (#80)
+    ClaimShortfall(u64),      // policy_id -> i128 shortfall amount (#72)
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -97,6 +99,8 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    TokenNotAccepted = 16, // token not in accepted list (#80)
+    InsufficientPoolBalance = 17, // pool balance < payout (#72)
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -130,6 +134,8 @@ pub struct Policy {
     pub end_time: u64,
     pub status: PolicyStatus,
     pub payout_at: Option<u64>,
+    pub claim_severity_fraction: Option<u32>, // severity as fraction of 10_000 bps (#74)
+    pub payout_amount: Option<i128>, // actual payout after severity/haircut applied (#72, #74)
 }
 
 #[contracttype]
@@ -140,6 +146,7 @@ pub struct PoolConfig {
     pub min_coverage: i128,         // minimum policy size
     pub max_coverage: i128,         // maximum single policy size
     pub lockup_days: u32,           // LP lockup period in days
+    pub total_loss_threshold_bps: i128, // severity bps where payout reaches 100% (#74)
 }
 
 #[contracttype]
