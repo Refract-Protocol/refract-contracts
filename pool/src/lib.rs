@@ -75,6 +75,12 @@ pub enum DataKey {
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
     LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    Guardian,                 // circuit breaker guardian address
+    OracleDeviationThreshold, // max deviation (bps) before circuit breaker trips
+    CircuitBreakerTripped,    // bool: is the circuit breaker currently tripped?
+    PreviousOracleData(CoverageType), // previous oracle reading for deviation calc
+    CoverageTypeCapital(CoverageType), // capital segmented by coverage type
+    ShareToken,               // SEP-41 token contract address for LP shares
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -97,6 +103,10 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    CircuitBreakerTripped = 16, // oracle deviation detected, circuit breaker active
+    OracleDeviationExceeded = 17, // oracle reading deviated beyond threshold
+    CoverageTypeCapacityExceeded = 18, // per-coverage-type capacity limit exceeded
+    InvalidShareToken = 19, // share token contract invalid or missing
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -208,6 +218,8 @@ impl RefractPool {
         };
         env.storage().instance().set(&DataKey::PoolConfig, &config);
         env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::CircuitBreakerTripped, &false);
+        env.storage().instance().set(&DataKey::OracleDeviationThreshold, &500u32); // 5% default
 
         env.events().publish((symbol_short!("INIT"),), (admin,));
         Ok(())
@@ -284,6 +296,9 @@ impl RefractPool {
             &env.ledger().timestamp(),
         );
 
+        // Mint SEP-41 share tokens if share token is configured
+        Self::_mint_share_tokens(&env, &provider, shares)?;
+
         env.events()
             .publish((symbol_short!("PROVIDE"), provider), (amount, shares));
         Ok(shares)
@@ -356,6 +371,9 @@ impl RefractPool {
             .persistent()
             .set(&DataKey::Shares(provider.clone()), &(user_shares - shares));
 
+        // Burn SEP-41 share tokens if share token is configured
+        Self::_burn_share_tokens(&env, &provider, shares)?;
+
         let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),
@@ -380,7 +398,10 @@ impl RefractPool {
         Self::assert_initialized(&env)?;
         let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
         Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
-        Ok(Self::_calc_premium(&config, &params))
+        let base_premium = Self::_calc_premium(&config, &params);
+        let utilization = Self::_current_utilization(&env);
+        let multiplier = Self::_calc_utilization_multiplier(utilization, config.max_utilization_bps);
+        Ok(base_premium * multiplier / BPS)
     }
 
     /// Buy an insurance policy. Caller pays the premium upfront.
@@ -388,10 +409,33 @@ impl RefractPool {
         holder.require_auth();
         Self::assert_initialized(&env)?;
 
+        let breaker_tripped: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTripped)
+            .unwrap_or(false);
+        if breaker_tripped {
+            return Err(PoolError::CircuitBreakerTripped);
+        }
+
         let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
         let new_coverage = Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
 
-        let premium = Self::_calc_premium(&config, &params);
+        let base_premium = Self::_calc_premium(&config, &params);
+        let utilization = Self::_current_utilization(&env);
+        let multiplier = Self::_calc_utilization_multiplier(utilization, config.max_utilization_bps);
+        let premium = base_premium * multiplier / BPS;
+
+        let mut coverage_type_capital: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CoverageTypeCapital(params.coverage_type.clone()))
+            .unwrap_or(0);
+        coverage_type_capital += params.coverage_amount;
+        env.storage().persistent().set(
+            &DataKey::CoverageTypeCapital(params.coverage_type.clone()),
+            &coverage_type_capital,
+        );
         let now = env.ledger().timestamp();
         let end_time = now + (params.duration_days as u64) * 86_400;
         let registry_coverage_type = Self::_to_registry_coverage_type(&params.coverage_type);
@@ -523,6 +567,15 @@ impl RefractPool {
             return Err(PoolError::AlreadyClaimed);
         }
 
+        let breaker_tripped: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTripped)
+            .unwrap_or(false);
+        if breaker_tripped {
+            return Err(PoolError::CircuitBreakerTripped);
+        }
+
         let now = env.ledger().timestamp();
         if now > policy.end_time {
             return Err(PoolError::PolicyExpired);
@@ -586,6 +639,18 @@ impl RefractPool {
             .instance()
             .set(&DataKey::TotalCoverage, &total_cov);
 
+        // Update per-coverage-type capital tracking
+        let mut coverage_type_capital: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CoverageTypeCapital(policy.coverage_type.clone()))
+            .unwrap_or(0);
+        coverage_type_capital = (coverage_type_capital - payout).max(0);
+        env.storage().persistent().set(
+            &DataKey::CoverageTypeCapital(policy.coverage_type.clone()),
+            &coverage_type_capital,
+        );
+
         // Transfer USDC to holder
         let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc).transfer(
@@ -645,6 +710,18 @@ impl RefractPool {
             .instance()
             .set(&DataKey::TotalCoverage, &total_cov);
 
+        // Update per-coverage-type capital tracking
+        let mut coverage_type_capital: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CoverageTypeCapital(policy.coverage_type.clone()))
+            .unwrap_or(0);
+        coverage_type_capital = (coverage_type_capital - policy.coverage_amount).max(0);
+        env.storage().persistent().set(
+            &DataKey::CoverageTypeCapital(policy.coverage_type.clone()),
+            &coverage_type_capital,
+        );
+
         Self::_deactivate_in_registry(&env, policy_id);
 
         env.events()
@@ -700,6 +777,63 @@ impl RefractPool {
         Ok(())
     }
 
+    // ── Circuit Breaker (Guardian-controlled) ──────────────────────────────────
+
+    /// Set the guardian address authorized to clear the circuit breaker.
+    /// Guardian can be the same as admin or a separate address.
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Guardian, &guardian);
+
+        env.events().publish((symbol_short!("GUARD_SET"),), (guardian,));
+        Ok(())
+    }
+
+    /// Set the oracle deviation threshold (in bps) that triggers the circuit breaker.
+    pub fn set_oracle_deviation_threshold(
+        env: Env,
+        caller: Address,
+        threshold_bps: u32,
+    ) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleDeviationThreshold, &threshold_bps);
+
+        env.events()
+            .publish((symbol_short!("DEV_THR"),), (threshold_bps,));
+        Ok(())
+    }
+
+    /// Clear the circuit breaker. Only callable by guardian.
+    pub fn clear_breaker(env: Env, caller: Address) -> Result<(), PoolError> {
+        let guardian: Option<Address> = env.storage().instance().get(&DataKey::Guardian);
+        if let Some(guard) = guardian {
+            caller.require_auth();
+            if caller != guard {
+                return Err(PoolError::Unauthorized);
+            }
+        } else {
+            Self::require_admin(&env, &caller)?;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTripped, &false);
+
+        env.events().publish((symbol_short!("BREAK_CLR"),), ());
+        Ok(())
+    }
+
+    /// Initialize or update the share token contract.
+    pub fn set_share_token(env: Env, caller: Address, token: Address) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::ShareToken, &token);
+
+        env.events().publish((symbol_short!("SHR_TKN"),), (token,));
+        Ok(())
+    }
+
     // ── Oracle (Admin-controlled, upgradeable to decentralized oracle) ─────────
 
     pub fn update_oracle(
@@ -709,6 +843,40 @@ impl RefractPool {
         value: i128,
     ) -> Result<(), PoolError> {
         Self::require_admin(&env, &caller)?;
+
+        let deviation_threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleDeviationThreshold)
+            .unwrap_or(500);
+
+        let previous: Option<OracleData> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleData(coverage_type.clone()));
+
+        if let Some(prev_data) = previous {
+            let deviation = if prev_data.value == 0 {
+                0
+            } else {
+                ((value - prev_data.value).abs() * BPS / prev_data.value.abs()) as u32
+            };
+
+            if deviation > deviation_threshold {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CircuitBreakerTripped, &true);
+                env.events().publish(
+                    (symbol_short!("BREAK_ON"),),
+                    (coverage_type.clone(), deviation),
+                );
+            }
+
+            env.storage().instance().set(
+                &DataKey::PreviousOracleData(coverage_type.clone()),
+                &prev_data,
+            );
+        }
 
         env.storage().instance().set(
             &DataKey::OracleData(coverage_type.clone()),
@@ -855,6 +1023,40 @@ impl RefractPool {
         env.storage().instance().get(&DataKey::PoolConfig)
     }
 
+    /// The guardian address authorized to clear the circuit breaker.
+    pub fn guardian(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Guardian)
+    }
+
+    /// Whether the circuit breaker is currently tripped.
+    pub fn circuit_breaker_tripped(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTripped)
+            .unwrap_or(false)
+    }
+
+    /// The oracle deviation threshold (in bps) that triggers the circuit breaker.
+    pub fn oracle_deviation_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OracleDeviationThreshold)
+            .unwrap_or(500)
+    }
+
+    /// The SEP-41 share token contract address, if configured.
+    pub fn share_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ShareToken)
+    }
+
+    /// Get per-coverage-type capital segmentation.
+    pub fn coverage_type_capital(env: Env, coverage_type: CoverageType) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CoverageTypeCapital(coverage_type))
+            .unwrap_or(0)
+    }
+
     // ── Internals ─────────────────────────────────────────────────────────────
 
     /// Translate the pool's own `CoverageType` into the wire-compatible
@@ -899,7 +1101,7 @@ impl RefractPool {
     }
 
     fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
-        // Premium = coverage × base_rate × risk_multiplier × (days/365)
+        // Premium = coverage × base_rate × risk_multiplier × (days/365) × utilization_curve
         let base = params.coverage_amount * (config.base_premium_rate_bps as i128) / BPS;
         let duration_factor = params.duration_days as i128 * PRECISION / 365;
         let risk_multiplier = match params.coverage_type {
@@ -910,6 +1112,39 @@ impl RefractPool {
             CoverageType::FlightDelay => 80,        // 0.8× (very low risk)
         };
         base * duration_factor / PRECISION * risk_multiplier / 100
+    }
+
+    /// Get current pool utilization in basis points.
+    fn _current_utilization(env: &Env) -> u32 {
+        let total_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCapital)
+            .unwrap_or(0);
+        let total_coverage: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCoverage)
+            .unwrap_or(0);
+        if total_capital == 0 {
+            0
+        } else {
+            (total_coverage * BPS / total_capital) as u32
+        }
+    }
+
+    /// Compute dynamic premium multiplier based on pool utilization (bps).
+    /// Returns a multiplier in bps: 10_000 bps = 1.0x (100%), monotonically increases with util.
+    /// Formula: multiplier = 1.0 + (utilization_bps / max_utilization_bps)^2 for smooth curve.
+    fn _calc_utilization_multiplier(utilization_bps: u32, max_utilization_bps: u32) -> i128 {
+        if max_utilization_bps == 0 {
+            return BPS; // 1.0x if misconfigured
+        }
+        let util_ratio = (utilization_bps as i128) * PRECISION / (max_utilization_bps as i128);
+        // multiplier = 1.0 + (util_ratio / PRECISION)^2
+        // Scale: multiplier in bps = 10_000 + (util_ratio^2 / PRECISION^2) * 10_000
+        let squared = (util_ratio * util_ratio) / PRECISION;
+        BPS + squared / PRECISION
     }
 
     fn _calc_shares(env: &Env, amount: i128) -> i128 {
@@ -1038,6 +1273,54 @@ impl RefractPool {
             .ok_or(PoolError::NotInitialized)?;
         if caller != &admin {
             return Err(PoolError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Mint share tokens to a provider when they deposit capital.
+    /// Best-effort: if share token is not configured, no minting occurs.
+    fn _mint_share_tokens(
+        env: &Env,
+        provider: &Address,
+        amount: i128,
+    ) -> Result<(), PoolError> {
+        let share_token_opt: Option<Address> = env.storage().instance().get(&DataKey::ShareToken);
+        if let Some(share_token) = share_token_opt {
+            let _ = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                &share_token,
+                &Symbol::new(env, "mint"),
+                Vec::from_array(
+                    env,
+                    [
+                        provider.into_val(env),
+                        amount.into_val(env),
+                    ],
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// Burn share tokens from a provider when they withdraw capital.
+    /// Best-effort: if share token is not configured, no burning occurs.
+    fn _burn_share_tokens(
+        env: &Env,
+        provider: &Address,
+        amount: i128,
+    ) -> Result<(), PoolError> {
+        let share_token_opt: Option<Address> = env.storage().instance().get(&DataKey::ShareToken);
+        if let Some(share_token) = share_token_opt {
+            let _ = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                &share_token,
+                &Symbol::new(env, "burn"),
+                Vec::from_array(
+                    env,
+                    [
+                        provider.into_val(env),
+                        amount.into_val(env),
+                    ],
+                ),
+            );
         }
         Ok(())
     }
