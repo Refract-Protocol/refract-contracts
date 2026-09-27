@@ -8,9 +8,17 @@ Cargo.lock.orig
 .soroban/
 deployments.local.json
 
+# Test snapshots (generated automatically; not tracked in source)
+**/test_snapshots/
+
 # Editor / OS
 .DS_Store
 *.swp
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Misc
+*.orig
+*.bak
+*.tmp

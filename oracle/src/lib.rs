@@ -42,6 +42,29 @@ pub enum OracleError {
     StaleSubmission = 8, // older than the reading already stored for this feed
 }
 
+/// Aggregate health summary for a single oracle feed.
+///
+/// Consumers (e.g. `RefractPool::process_claim`) can call
+/// `get_feed_health` to get a structured, single-call view of whether a
+/// feed is currently trustworthy before acting on it.
+///
+/// Fields:
+/// - `last_updated_at`      — ledger timestamp of the most recent accepted
+///   submission, or 0 if no submission has ever been accepted.
+/// - `active_relayer_count` — total number of currently registered relayers.
+///   A feed with no registered relayers should be treated as unhealthy
+///   regardless of its last update time.
+/// - `recent_rejection_count` — placeholder for deviation-rejection counts
+///   (tracked by a future sibling issue). Currently always 0. Consumers
+///   should treat a non-zero value as a signal that recent data is noisy.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedHealth {
+    pub last_updated_at: u64,
+    pub active_relayer_count: u32,
+    pub recent_rejection_count: u32,
+}
+
 /// Oracle reading stored on-chain.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -59,7 +82,8 @@ pub struct OracleReading {
 pub enum DataKey {
     Admin,
     Relayers,
-    Reading(Symbol), // feed_id → OracleReading
+    Reading(Symbol),          // feed_id → OracleReading
+    RejectionCount(Symbol),   // feed_id → u32 (recent deviation rejections; placeholder for sibling issue)
 }
 
 #[contract]
@@ -253,6 +277,48 @@ impl RefractOracle {
             3 => Ok(reading.value < TVL_THRESHOLD),
             4 => Ok(reading.value > FLIGHT_DELAY_THRESHOLD),
             _ => Err(OracleError::UnknownCoverageType),
+        }
+    }
+
+    /// Return a composite health summary for a given feed.
+    ///
+    /// Always succeeds — a feed with no submissions ever returns a
+    /// zero-valued `FeedHealth` record rather than an error, so callers
+    /// can treat `last_updated_at == 0` as "never seen" and act
+    /// accordingly without having to handle a separate error path.
+    ///
+    /// `active_relayer_count` reflects the number of currently registered
+    /// relayers (anyone in the relayer list).  `recent_rejection_count` is
+    /// a placeholder for the deviation-rejection counter that a sibling
+    /// issue will track; it is always 0 until that work lands.
+    pub fn get_feed_health(env: Env, feed_id: Symbol) -> FeedHealth {
+        let last_updated_at: u64 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
+            .map(|r| r.timestamp)
+            .unwrap_or(0);
+
+        let relayers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Relayers)
+            .unwrap_or_else(|| Vec::new(&env));
+        let active_relayer_count = relayers.len();
+
+        // Placeholder: deviation rejection counts will be tracked here once
+        // the sibling deviation-check issue lands.  Reading returns 0 until
+        // then so the field is forward-compatible without a contract upgrade.
+        let recent_rejection_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RejectionCount(feed_id))
+            .unwrap_or(0);
+
+        FeedHealth {
+            last_updated_at,
+            active_relayer_count,
+            recent_rejection_count,
         }
     }
 
