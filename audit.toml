@@ -1,0 +1,20 @@
+# Accepted RustSec advisories for this workspace.
+#
+# Read by scripts/audit.py, not by cargo-audit itself. cargo-audit's own
+# `.cargo/audit.toml` ignore list has no expiry dates, and this file needs them.
+# The triage process that decides what goes in here is in SECURITY.md,
+# under "Dependency advisories".
+#
+# Every entry needs all four fields:
+#
+#   [[accepted]]
+#   id            = "RUSTSEC-YYYY-NNNN"   # advisory id as printed by cargo audit
+#   crate         = "some-crate"          # affected crate, so the entry is self-describing
+#   justification = "Why this is not exploitable here / why it can't be fixed yet."
+#   expires       = 2026-12-31            # TOML date, at most 90 days out. Once it passes, CI fails.
+#
+# An entry that no longer matches any finding is reported as stale. Delete
+# it in the same PR that removes the vulnerable crate.
+#
+# There are no accepted advisories at the moment.
+accepted = []
