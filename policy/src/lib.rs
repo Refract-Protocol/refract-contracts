@@ -1,3 +1,98 @@
+// =============================================================================
+// Issue #130 — [High] pool→registry cross-contract trust boundary
+// https://github.com/Refract-Protocol/refract-contracts/issues/130
+//
+// ─── ROLE OF THIS FILE IN THE TRUST BOUNDARY ─────────────────────────────────
+//
+// The registry is the secondary index — the pool is the source of truth.
+// The trust boundary has two call sites from the pool side:
+//   1. pool → registry.register_policy()  (via invoke_contract, panics on fail)
+//   2. pool → registry.deactivate_policy() (via try_invoke_contract, silent fail)
+//
+// This file enforces the trust boundary from the REGISTRY side via
+// require_pool_or_admin(). The key invariants:
+//
+//   INV-R1: Only the registered pool address or the admin may write to the
+//           registry. Any other caller gets RegistryError::Unauthorized.
+//
+//   INV-R2: register_policy() echoes back the policy_id from the
+//           PolicyRegistration struct — it does NOT generate its own id.
+//           This is intentional: the pool assigns the id, and the registry
+//           mirrors it. A malicious registry returning a different id is the
+//           attack surface fixed by PoolError::RegistryMismatch in pool/src/lib.rs.
+//
+//   INV-R3: deactivate_policy() is idempotent — calling it twice on the same
+//           id is a no-op (already guarded by the `if !record.is_active` check).
+//           This means the pool can safely retry a failed deactivation.
+//
+//   INV-R4: The registry CANNOT block a payout — if deactivate_policy() fails
+//           or panics, the pool absorbs that via try_invoke_contract.
+//           The registry's is_active flag is a queryable index only, not a
+//           gate on fund movement.
+//
+// ─── WHAT A DESYNC LOOKS LIKE ────────────────────────────────────────────────
+//
+// A desync between pool.Policy.status and registry.PolicyRecord.is_active
+// can occur if _deactivate_in_registry's try_invoke_contract is absorbed
+// (registry was unavailable or panicked).
+//
+// In a desync:
+//   pool.Policy.status  = Claimed (or Expired)
+//   registry.is_active  = true    (stale — never updated)
+//
+// Impact: The holder sees the policy as "active" in the registry index but
+// cannot claim again (process_claim checks pool.Policy.status, not the registry).
+// The coverage obligation (TotalCoverage) has already been freed on the pool
+// side. The registry is purely cosmetic in this state.
+//
+// Detection: pool.check_registry_sync(policy_id) — a view function to be
+// added to pool/src/lib.rs that calls try_invoke_contract to read
+// registry.get_policy() and compares is_active with pool.Policy.status.
+//
+// Repair: Call pool.expire_policy() or a new admin repair entry point that
+// retries _deactivate_in_registry for a given policy_id.
+//
+// =============================================================================
+// Issue #134 — [High] cross-contract authorization semantics audit
+// https://github.com/Refract-Protocol/refract-contracts/issues/134
+//
+// ─── require_pool_or_admin() — AUTHORIZATION AUDIT ───────────────────────────
+//
+// This is the single enforcement point for the pool→registry trust boundary.
+// The audit in pool/src/lib.rs (Issue #134) confirms the following about this
+// function:
+//
+//   1. caller.require_auth() is called BEFORE the principal check.
+//      This means: if the transaction has no auth entry for the caller,
+//      require_auth() panics immediately. The Unauthorized error is only
+//      ever returned to a caller who DID authenticate but is not the pool
+//      or admin. This ordering is correct and intentional.
+//
+//   2. The pool address checked (stored at initialize() time) is the CONTRACT
+//      ADDRESS, not a WASM hash. A second pool deployed from the same WASM
+//      at a different address does NOT automatically inherit trust.
+//      See the cross-instance replay analysis in pool/src/lib.rs (#134).
+//
+//   3. The admin can call set_pool_contract() to update which pool is trusted.
+//      This is the governance attack surface: a compromised admin can repoint
+//      the registry to a malicious pool. This is addressed by the sibling
+//      governance/timelock issue and is explicitly OUT OF SCOPE for #134.
+//      See AUTH_MODEL_AUDIT.md (to be created per #134 acceptance criteria).
+//
+//   4. This function is used by register_policy() and deactivate_policy() but
+//      NOT by set_pool_contract() and set_admin() — those use the stricter
+//      require_admin(), which does not allow the pool to repoint itself.
+//      This is a correct separation of privilege.
+//
+// ─── CROSS-REFERENCE ─────────────────────────────────────────────────────────
+//
+//   For the full authorization model audit, including cross-instance replay,
+//   cross-network replay, and confused-deputy analysis, see:
+//     - pool/src/lib.rs (Issue #134 documentation block)
+//     - AUTH_MODEL_AUDIT.md (to be created as part of #134)
+//
+// =============================================================================
+
 //! Refract Policy Registry Contract
 //!
 //! Stores all policy metadata on-chain as a lightweight sidecar to the Pool

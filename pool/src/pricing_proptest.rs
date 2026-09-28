@@ -1,5 +1,164 @@
 #![cfg(test)]
 
+// =============================================================================
+// Issue #135 — [High] Formally verify _calc_shares/_quote_withdrawal
+// share-price monotonicity and no-value-creation properties
+// https://github.com/Refract-Protocol/refract-contracts/issues/135
+//
+// ─── PURPOSE OF THIS FILE ────────────────────────────────────────────────────
+//
+// This file contains property-based tests (proptest) for the pool's core
+// pricing math: _calc_premium, _calc_shares, and _quote_withdrawal.
+//
+// See pool/src/lib.rs for the full gap analysis. Summary of what IS and IS NOT
+// yet covered, and what needs to be added:
+//
+// EXISTING COVERAGE (already in this file, do not rebuild):
+//   ✅ premium_is_never_negative
+//   ✅ premium_is_zero_when_coverage_or_duration_is_zero
+//   ✅ premium_is_monotonic_in_coverage_amount
+//   ✅ premium_is_monotonic_in_duration
+//   ✅ calc_shares_never_mints_value_out_of_thin_air   (single-LP snapshot)
+//   ✅ calc_shares_is_1to1_when_pool_is_empty
+//   ✅ quote_withdrawal_never_returns_more_than_total_capital (single-LP)
+//
+// GAPS TO CLOSE — add these tests to this file:
+//
+// ─── GAP 1: multi_lp_no_value_extraction ────────────────────────────────────
+//
+// Tests multi-LP interleaved deposit/withdraw sequences. Proves that no
+// combination of actors operating in any order can extract more total value
+// than they contributed in aggregate.
+//
+// Pseudocode for the new test:
+//
+//   #[test]
+//   fn multi_lp_no_value_extraction() {
+//       let env = Env::default();
+//       let pool_id = env.register_contract(None, RefractPool);
+//
+//       // Strategy: sequence of (actor: 0..4, op: deposit|withdraw, amount: 1..1_000_000)
+//       // Run 1024 cases (higher than default 256 for this high-value test)
+//       let mut runner = TestRunner::new(ProptestConfig::with_cases(1024));
+//       let strategy = proptest::collection::vec(
+//           (0usize..4usize, proptest::bool::ANY, 1i128..1_000_000i128),
+//           2..=20usize,
+//       );
+//
+//       runner.run(&strategy, |ops| {
+//           // For each operation:
+//           //   - track deposited[actor] and withdrawn[actor]
+//           //   - track shares[actor]
+//           //   - apply _calc_shares and _quote_withdrawal via env.as_contract
+//           //
+//           // Invariant at the end:
+//           //   sum(withdrawn) <= sum(deposited)    (no value created)
+//           //
+//           // Note: withdrawn[actor] may exceed deposited[actor] for an
+//           // individual actor who joined early and benefited from premium
+//           // accrual — the invariant is aggregate, not per-actor.
+//           Ok(())
+//       }).unwrap();
+//   }
+//
+// ─── GAP 2: premium_accrual_then_withdraw_is_fair ───────────────────────────
+//
+// Tests that when premium accrues to TotalCapital between an LP's deposit
+// and withdrawal, the LP receives a fair proportional share of the premium
+// and does not receive MORE than their entitlement.
+//
+// Pseudocode for the new test:
+//
+//   #[test]
+//   fn premium_accrual_then_withdraw_is_fair() {
+//       let env = Env::default();
+//       let pool_id = env.register_contract(None, RefractPool);
+//
+//       let cases = (
+//           1i128..1_000_000i128, // deposit_amount
+//           0i128..100_000i128,   // premium_accrued (simulates buy_policy adding to TotalCapital)
+//       );
+//
+//       TestRunner::default().run(&cases, |(deposit, premium)| {
+//           let (shares, withdrawn) = env.as_contract(&pool_id, || {
+//               // Pool starts empty
+//               env.storage().instance().set(&DataKey::TotalCapital, &0i128);
+//               env.storage().instance().set(&DataKey::TotalShares, &0i128);
+//               // LP deposits
+//               let shares = RefractPool::_calc_shares(&env, deposit);
+//               env.storage().instance().set(&DataKey::TotalCapital, &deposit);
+//               env.storage().instance().set(&DataKey::TotalShares, &shares);
+//               // Premium accrues (as buy_policy does: adds to TotalCapital)
+//               let capital_after = deposit + premium;
+//               env.storage().instance().set(&DataKey::TotalCapital, &capital_after);
+//               env.storage().instance().set(&DataKey::TotalCoverage, &0i128);
+//               env.storage().instance().set(&DataKey::PoolConfig, &config());
+//               // LP withdraws all shares
+//               let withdrawn = RefractPool::_quote_withdrawal(&env, shares).unwrap_or(0);
+//               (shares, withdrawn)
+//           });
+//           // LP must not receive more than deposit + premium (all premium is theirs,
+//           // they are the only LP; rounding down by 1 is acceptable)
+//           prop_assert!(withdrawn <= deposit + premium);
+//           // LP must receive at least their deposit back (no loss when they are
+//           // the only LP — premium only adds to capital)
+//           prop_assert!(withdrawn >= deposit);
+//           Ok(())
+//       }).unwrap();
+//   }
+//
+// ─── GAP 3: calc_shares_monotonic_under_price_drift ─────────────────────────
+//
+// Tests that _calc_shares remains monotonic (more capital → more shares)
+// even when TotalShares > TotalCapital (the post-premium-accrual scenario
+// where share price is BELOW 1.0 in PRECISION units).
+//
+// Pseudocode for the new test:
+//
+//   #[test]
+//   fn calc_shares_monotonic_under_price_drift() {
+//       let env = Env::default();
+//       let pool_id = env.register_contract(None, RefractPool);
+//
+//       // total_shares > total_capital simulates post-premium state
+//       let cases = (
+//           1i128..1_000_000i128,       // total_capital
+//           1i128..10_000_000i128,      // total_shares (may exceed total_capital)
+//           0i128..1_000_000i128,       // amount_low
+//           0i128..1_000_000i128,       // delta (amount_high = amount_low + delta)
+//       );
+//
+//       TestRunner::default().run(&cases, |(total_capital, total_shares, low, delta)| {
+//           let high = low + delta;
+//           let (shares_low, shares_high) = env.as_contract(&pool_id, || {
+//               env.storage().instance().set(&DataKey::TotalCapital, &total_capital);
+//               env.storage().instance().set(&DataKey::TotalShares, &total_shares);
+//               let sl = RefractPool::_calc_shares(&env, low);
+//               let sh = RefractPool::_calc_shares(&env, high);
+//               (sl, sh)
+//           });
+//           // Monotonicity: more capital in → more-or-equal shares out
+//           prop_assert!(shares_high >= shares_low);
+//           Ok(())
+//       }).unwrap();
+//   }
+//
+// ─── HOW TO RUN ──────────────────────────────────────────────────────────────
+//
+//   cargo test --package refract-pool pricing_proptest -- --nocapture
+//
+// For the high-value multi-LP test at 1024 cases:
+//   PROPTEST_CASES=1024 cargo test multi_lp_no_value_extraction
+//
+// ─── NOTE ON SNAPSHOT FILES ──────────────────────────────────────────────────
+//
+// Each test function using Env::default() writes a test snapshot to
+// pool/test_snapshots/. The existing pattern of one Env per #[test] function
+// (not per proptest case) must be preserved. All new tests should follow the
+// same TestRunner::default().run(…).unwrap() pattern already used below.
+//
+// =============================================================================
+
 //! Property tests for the pool's premium and share-price math.
 //!
 //! `_calc_premium` is pure and tested directly. `_calc_shares` reads pool
