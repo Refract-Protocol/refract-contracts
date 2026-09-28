@@ -3,6 +3,30 @@
 //! A permissioned price / event oracle that the RefractPool calls to verify
 //! trigger conditions before processing claims.  In production this would be
 //! connected to Band Protocol, Pyth, or a Refract-operated relay.
+//!
+//! # Design decision (issue #97) — oracle as pure raw-value source
+//!
+//! `is_triggered` (with its hardcoded per-coverage-type thresholds) has been
+//! **deprecated** in favour of the pool evaluating trigger conditions directly
+//! against each policy's own `trigger_threshold`.  The reasoning:
+//!
+//! - `trigger_threshold` is a *user-facing purchase-time parameter* — it is
+//!   part of `PolicyParams` and reflects the holder's chosen coverage level.
+//!   Moving that evaluation out of the oracle and into the pool, against the
+//!   stored threshold, is the correct single source of truth.
+//! - Keeping two independent trigger definitions (one hardcoded in the oracle,
+//!   one per-policy in the pool) guarantees eventual disagreement: the oracle
+//!   could say "not triggered" by its own fixed constant while the pool's
+//!   per-policy maths says "pay out", or vice versa.
+//! - **Migration / grandfather story**: all `Active` policies created under the
+//!   old dual-system semantics continue to work unchanged — they store their
+//!   `trigger_threshold` and the pool continues to evaluate against it.  The
+//!   only thing removed is the *oracle's* redundant second evaluation; the
+//!   pool's own evaluation (which was already the final gate on payouts) is
+//!   kept and is now the sole path.
+//!
+//! `is_triggered` is retained as `#[deprecated]` for the transition period
+//! (existing callers still compile; a future cleanup PR can remove it).
 
 #![no_std]
 use soroban_sdk::{
@@ -16,12 +40,45 @@ const MAX_STALENESS_SECS: u64 = 1_800;
 /// stored as `value * 1e7` so the contract never touches floating point.
 const SCALE: i128 = 10_000_000;
 
-// ── Trigger thresholds (in `SCALE` fixed-point unless noted) ────────────────
-const DEPEG_PRICE_THRESHOLD: i128 = 95 * SCALE / 100; // USDC < $0.95
-const CRASH_RETURN_THRESHOLD: i128 = -30 * SCALE / 100; // 24h return < -30%
-const LIQUIDATION_RATIO_THRESHOLD: i128 = 85 * SCALE / 100; // ratio < 85%
-const TVL_THRESHOLD: i128 = 500_000 * SCALE; // protocol TVL < $500k
-const FLIGHT_DELAY_THRESHOLD: i128 = 120; // delay in minutes (not scaled)
+/// Default maximum single-submission deviation (5 000 bps = 50 %).
+///
+/// This is intentionally wide so that a genuine MarketCrash or
+/// StablecoinDepeg event — the exact events this product exists to detect —
+/// is not blocked on first submission. A 50 % single-update cap still rejects
+/// fat-fingered orders-of-magnitude errors (e.g. a MARKET_24H_RETURN
+/// submitted as raw points instead of scaled) while leaving room for real
+/// crashes. Operators can tighten or loosen this per-feed via
+/// `set_max_deviation_bps`.
+const DEFAULT_MAX_DEVIATION_BPS: i128 = 5_000; // 50 %
+
+/// Feed-id naming convention for individual flight feeds.
+///
+/// Pattern: `FLIGHT_<CARRIER><FLIGHT_NUMBER>_<YYYYMMDD>`
+///
+/// Examples:
+/// - `FLIGHT_DL420_20261201` — Delta flight 420 on 2026-12-01
+/// - `FLIGHT_AA100_20261215` — American Airlines flight 100 on 2026-12-15
+///
+/// The date component is required because each flight is a one-off event; the
+/// same flight number repeats daily but has a distinct oracle feed per
+/// operating day so that stale readings from a previous day cannot
+/// accidentally trigger (or suppress) a claim for today's flight.
+///
+/// Value convention: delay in **minutes** (not scaled), e.g. `90` means 90
+/// minutes late.  A value of `i128::MAX` is the canonical sentinel for a
+/// *cancelled* flight (see `register_flight_feed` and
+/// `FLIGHT_CANCELLED_SENTINEL`).
+pub const FLIGHT_ID_PREFIX: &str = "FLIGHT_";
+
+/// Canonical sentinel value for a cancelled flight.
+///
+/// A cancellation is semantically distinct from "infinite delay" but must
+/// map to a single numeric oracle value so that `process_claim`'s existing
+/// `data.value > policy.trigger_threshold` comparison correctly triggers a
+/// FlightDelay claim.  `i128::MAX` is chosen because it is guaranteed to be
+/// greater than any reasonable `trigger_threshold` (which is measured in
+/// minutes).
+pub const FLIGHT_CANCELLED_SENTINEL: i128 = i128::MAX;
 
 /// Errors returned by the oracle. `require_auth()` still panics on a
 /// missing/invalid signature (unrecoverable); every other recoverable
@@ -40,6 +97,11 @@ pub enum OracleError {
     UnknownCoverageType = 6,
     FutureTimestamp = 7,
     StaleSubmission = 8, // older than the reading already stored for this feed
+    /// The new value deviates from the previously stored reading by more
+    /// than the configured `MaxDeviationBps` for this feed.  Use
+    /// `submit_override` (admin-only) to accept a genuinely large but
+    /// legitimate move.
+    ImplausibleDeviation = 9,
 }
 
 /// Oracle reading stored on-chain.
@@ -49,17 +111,30 @@ pub struct OracleReading {
     /// Signed integer value in 1e7 precision.
     /// For prices: USD price * 1e7.
     /// For percentages: percent * 1e7 (e.g. -30% = -3_000_000).
-    /// For durations: minutes.
+    /// For durations: minutes (not scaled; see FlightDelay).
     pub value: i128,
     pub timestamp: u64,
     pub source: Symbol,
+}
+
+/// Metadata stored alongside a flight feed to describe its scheduling window.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlightMeta {
+    /// Unix timestamp of the scheduled departure.  Readings submitted for
+    /// this feed before `scheduled_departure - 3600` (1 h before) are
+    /// considered premature; the relayer should not submit until data is
+    /// available.
+    pub scheduled_departure: u64,
 }
 
 #[contracttype]
 pub enum DataKey {
     Admin,
     Relayers,
-    Reading(Symbol), // feed_id → OracleReading
+    Reading(Symbol),          // feed_id → OracleReading
+    MaxDeviationBps(Symbol),  // feed_id → i128 (bps); admin-configurable per feed
+    FlightMeta(Symbol),       // flight feed_id → FlightMeta
 }
 
 #[contract]
@@ -121,9 +196,7 @@ impl RefractOracle {
         Ok(())
     }
 
-    /// Addresses currently authorized to submit oracle readings. Before
-    /// this, the only way to answer "who can relay right now" was to
-    /// replay add_relayer/remove_relayer events from history.
+    /// Addresses currently authorized to submit oracle readings.
     pub fn list_relayers(env: Env) -> Vec<Address> {
         env.storage()
             .instance()
@@ -131,18 +204,12 @@ impl RefractOracle {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// The address currently authorized to call
-    /// add_relayer()/remove_relayer()/set_admin(). Without this, verifying
-    /// who holds admin control meant replaying event history instead of
-    /// just reading current state.
+    /// The address currently authorized to call admin-gated functions.
     pub fn admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// Rotate the admin key. The only recovery path if the current admin
-    /// key is lost or compromised — without it, add_relayer/remove_relayer
-    /// and this function itself would be permanently stuck on whatever key
-    /// was set at initialize().
+    /// Rotate the admin key.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -151,10 +218,86 @@ impl RefractOracle {
         Ok(())
     }
 
+    // ─── Per-feed deviation cap (issue #96) ─────────────────────────────
+
+    /// Set the maximum single-submission deviation for a feed (in basis
+    /// points, where 10 000 bps = 100 %).  Admin-only.
+    ///
+    /// Use `0` to disable the deviation check for a feed entirely (the
+    /// first-ever submission for any feed is always accepted regardless).
+    pub fn set_max_deviation_bps(
+        env: Env,
+        feed_id: Symbol,
+        max_deviation_bps: i128,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxDeviationBps(feed_id), &max_deviation_bps);
+        Ok(())
+    }
+
+    /// Return the configured maximum deviation for `feed_id` (bps), or the
+    /// `DEFAULT_MAX_DEVIATION_BPS` if none has been set.
+    pub fn get_max_deviation_bps(env: Env, feed_id: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxDeviationBps(feed_id))
+            .unwrap_or(DEFAULT_MAX_DEVIATION_BPS)
+    }
+
+    // ─── Flight feed registration (issue #98) ───────────────────────────
+
+    /// Register metadata for a flight-specific oracle feed.
+    ///
+    /// `feed_id` must follow the `FLIGHT_<CARRIER><NUM>_<YYYYMMDD>`
+    /// convention (see [`FLIGHT_ID_PREFIX`]).  `scheduled_departure` is the
+    /// Unix timestamp of the flight's planned departure time, used by
+    /// monitoring tooling to know when to expect the first reading.
+    ///
+    /// This is an admin-only helper; the relayer bot reads the metadata via
+    /// `get_flight_meta` to decide whether to start submitting yet.
+    pub fn register_flight_feed(
+        env: Env,
+        feed_id: Symbol,
+        scheduled_departure: u64,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+        let meta = FlightMeta {
+            scheduled_departure,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::FlightMeta(feed_id.clone()), &meta);
+        env.events()
+            .publish((Symbol::new(&env, "flight_feed_registered"),), (feed_id,));
+        Ok(())
+    }
+
+    /// Return the metadata for a flight feed, if it has been registered.
+    pub fn get_flight_meta(env: Env, feed_id: Symbol) -> Option<FlightMeta> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FlightMeta(feed_id))
+    }
+
     // ─── Data submission ─────────────────────────────────────────────────
 
     /// Submit a reading for a given feed.
-    /// feed_id examples: USDC_PRICE, MARKET_24H_RETURN, XLM_TVL, FLIGHT_DL420
+    ///
+    /// Validates:
+    /// 1. Caller is a registered relayer (or admin).
+    /// 2. Timestamp is not in the future.
+    /// 3. Reading is not stale (older than `MAX_STALENESS_SECS`).
+    /// 4. Timestamp is not older than the currently stored reading for this
+    ///    feed (prevents time-regression attacks).
+    /// 5. **Deviation check (issue #96)**: if a prior reading exists and the
+    ///    new value deviates by more than `MaxDeviationBps` for this feed,
+    ///    the submission is rejected with `OracleError::ImplausibleDeviation`.
+    ///    Use `submit_override` to bypass this for genuinely large moves.
+    ///
+    /// Feed-id examples: `USDC_PRICE`, `MARKET_24H_RETURN`, `XLM_TVL`,
+    /// `FLIGHT_DL420_20261201`.
     pub fn submit(
         env: Env,
         relayer: Address,
@@ -165,57 +308,24 @@ impl RefractOracle {
     ) -> Result<(), OracleError> {
         relayer.require_auth();
         Self::require_relayer(&env, &relayer)?;
+        Self::_submit_inner(&env, feed_id, value, timestamp, source, false)
+    }
 
-        let ledger_time = env.ledger().timestamp();
-
-        // saturating_sub means a future-dated timestamp would otherwise
-        // compute age=0 and sail through the staleness check below as if
-        // it were perfectly fresh — and, once stored, get_reading()'s own
-        // staleness check has the same blind spot, so a bad reading like
-        // this wouldn't naturally expire until real time caught up to it.
-        // Reject it outright instead.
-        if timestamp > ledger_time {
-            return Err(OracleError::FutureTimestamp);
-        }
-
-        // Reject readings older than MAX_STALENESS_SECS
-        let age = ledger_time - timestamp;
-        if age > MAX_STALENESS_SECS {
-            return Err(OracleError::StaleReading);
-        }
-
-        // Multiple relayers can be registered at once (add_relayer supports
-        // a list), and nothing orders their submissions relative to each
-        // other. Without this check, a submission that's individually
-        // "fresh enough" (within MAX_STALENESS_SECS of now) could still be
-        // older than the reading already on file — e.g. two relayers racing,
-        // or one submitting out of order — silently regressing the feed
-        // backward in time and potentially un-triggering (or reviving) a
-        // claim based on stale data replacing a more current reading.
-        if let Some(existing) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
-        {
-            if timestamp < existing.timestamp {
-                return Err(OracleError::StaleSubmission);
-            }
-        }
-
-        let reading = OracleReading {
-            value,
-            timestamp,
-            source,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Reading(feed_id.clone()), &reading);
-
-        env.events().publish(
-            (Symbol::new(&env, "oracle_updated"), feed_id),
-            (value, timestamp),
-        );
-        Ok(())
+    /// Admin-only override that bypasses the deviation check.
+    ///
+    /// Use this when a genuinely large but legitimate price move (e.g. a real
+    /// stablecoin depeg or market crash at the extreme end of the configured
+    /// range) is being rejected by `submit`.  Requires an explicit admin
+    /// sign-off rather than being silently permissive.
+    pub fn submit_override(
+        env: Env,
+        feed_id: Symbol,
+        value: i128,
+        timestamp: u64,
+        source: Symbol,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+        Self::_submit_inner(&env, feed_id, value, timestamp, source, true)
     }
 
     // ─── Queries ─────────────────────────────────────────────────────────
@@ -237,15 +347,42 @@ impl RefractOracle {
         Ok(reading)
     }
 
-    /// Returns true if the trigger condition for a given coverage type is met.
-    /// coverage_type: 0=Depeg, 1=Crash, 2=Liquidation, 3=SmartContract, 4=Flight
+    /// **Deprecated** — the oracle is now a pure raw-value source.
+    ///
+    /// Trigger evaluation has moved exclusively to the pool, which evaluates
+    /// each policy's own `trigger_threshold` against the oracle's raw value.
+    /// This avoids the split-brain where two independent threshold systems
+    /// could disagree about whether the same real-world event should trigger
+    /// a payout.
+    ///
+    /// This function is retained for the transition period; new callers
+    /// should use `get_reading` and perform their own threshold comparison.
+    ///
+    /// Coverage type mapping: 0=Depeg, 1=Crash, 2=Liquidation,
+    /// 3=SmartContract, 4=Flight.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use get_reading and evaluate trigger_threshold in the pool instead. \
+                See issue #97 and the module-level design-decision comment."
+    )]
     pub fn is_triggered(
         env: Env,
         coverage_type: u32,
         feed_id: Symbol,
     ) -> Result<bool, OracleError> {
+        // Validate coverage_type range before reading storage (fast fail).
+        if coverage_type > 4 {
+            return Err(OracleError::UnknownCoverageType);
+        }
         let reading = Self::get_reading(env, feed_id)?;
-
+        // These thresholds are left in place only to keep the deprecated
+        // function self-consistent for the transition period.  They are NOT
+        // the source of truth for pool payouts.
+        const DEPEG_PRICE_THRESHOLD: i128 = 95 * SCALE / 100;
+        const CRASH_RETURN_THRESHOLD: i128 = -30 * SCALE / 100;
+        const LIQUIDATION_RATIO_THRESHOLD: i128 = 85 * SCALE / 100;
+        const TVL_THRESHOLD: i128 = 500_000 * SCALE;
+        const FLIGHT_DELAY_THRESHOLD: i128 = 120;
         match coverage_type {
             0 => Ok(reading.value < DEPEG_PRICE_THRESHOLD),
             1 => Ok(reading.value < CRASH_RETURN_THRESHOLD),
@@ -272,6 +409,85 @@ impl RefractOracle {
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────
+
+    /// Shared submission logic used by both `submit` and `submit_override`.
+    ///
+    /// When `skip_deviation_check` is `true` (admin override path), step 5
+    /// (ImplausibleDeviation) is skipped.
+    fn _submit_inner(
+        env: &Env,
+        feed_id: Symbol,
+        value: i128,
+        timestamp: u64,
+        source: Symbol,
+        skip_deviation_check: bool,
+    ) -> Result<(), OracleError> {
+        let ledger_time = env.ledger().timestamp();
+
+        // Guard: future-dated timestamp would compute age=0 and sail through
+        // the staleness check.  Reject outright instead.
+        if timestamp > ledger_time {
+            return Err(OracleError::FutureTimestamp);
+        }
+
+        // Reject readings older than MAX_STALENESS_SECS.
+        let age = ledger_time - timestamp;
+        if age > MAX_STALENESS_SECS {
+            return Err(OracleError::StaleReading);
+        }
+
+        // Check existing reading for time-ordering and deviation.
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
+        {
+            // Prevent time-regression: a fresh-but-older submission cannot
+            // silently overwrite a newer reading.
+            if timestamp < existing.timestamp {
+                return Err(OracleError::StaleSubmission);
+            }
+
+            // Deviation check (issue #96).
+            // Skip for the first-ever submission (no prior value) and when
+            // the admin has explicitly overridden.
+            if !skip_deviation_check {
+                let max_bps: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::MaxDeviationBps(feed_id.clone()))
+                    .unwrap_or(DEFAULT_MAX_DEVIATION_BPS);
+
+                // A max_bps of 0 means "no limit" (admin has disabled check).
+                if max_bps > 0 && existing.value != 0 {
+                    // deviation_bps = |new - old| * 10_000 / |old|
+                    let abs_old = existing.value.abs();
+                    let abs_diff = (value - existing.value).abs();
+                    // Use i128 arithmetic; scale by BPS (10_000) not SCALE.
+                    let deviation_bps = abs_diff * 10_000 / abs_old;
+                    if deviation_bps > max_bps {
+                        return Err(OracleError::ImplausibleDeviation);
+                    }
+                }
+            }
+        }
+        // (No prior reading → first submission always passes through.)
+
+        let reading = OracleReading {
+            value,
+            timestamp,
+            source,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reading(feed_id.clone()), &reading);
+
+        env.events().publish(
+            (Symbol::new(env, "oracle_updated"), feed_id),
+            (value, timestamp),
+        );
+        Ok(())
+    }
 
     fn require_admin(env: &Env) -> Result<(), OracleError> {
         let admin: Address = env

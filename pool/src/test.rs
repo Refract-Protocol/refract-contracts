@@ -28,9 +28,6 @@ fn setup<'a>() -> Fixture<'a> {
     let usdc = TokenClient::new(&env, &sac.address());
     let usdc_admin = StellarAssetClient::new(&env, &sac.address());
 
-    // Contract addresses are known as soon as they're registered, so both
-    // the pool and the registry can be wired to each other before either is
-    // initialized — mirrors how they'd be deployed and wired on testnet.
     let pool_id = env.register_contract(None, RefractPool);
     let pool = RefractPoolClient::new(&env, &pool_id);
 
@@ -57,9 +54,7 @@ fn funded(f: &Fixture, amount: i128) -> Address {
     a
 }
 
-/// Helper: advance the ledger past the default 7-day LP lockup (see
-/// initialize_sets_defaults) so a test can withdraw_capital() without the
-/// lockup itself being what's under test.
+/// Helper: advance the ledger past the default 7-day LP lockup.
 fn past_lockup(f: &Fixture) {
     f.env.ledger().with_mut(|li| {
         li.timestamp += 7 * 86_400;
@@ -93,7 +88,6 @@ fn initialize_sets_defaults() {
     let stats = f.pool.pool_stats();
     assert_eq!(stats.total_capital, 0);
     assert_eq!(stats.total_shares, 0);
-    // Share price defaults to 1.0 when the pool is empty.
     assert_eq!(stats.share_price, ONE_USDC);
 }
 
@@ -103,12 +97,11 @@ fn provide_capital_mints_shares_one_to_one_initially() {
     let lp = funded(&f, 10_000 * ONE_USDC);
 
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
-    assert_eq!(shares, 10_000 * ONE_USDC); // 1:1 on first deposit
+    assert_eq!(shares, 10_000 * ONE_USDC);
     assert_eq!(f.pool.shares_of(&lp), shares);
 
     let stats = f.pool.pool_stats();
     assert_eq!(stats.total_capital, 10_000 * ONE_USDC);
-    // Funds actually moved into the pool contract.
     assert_eq!(f.usdc.balance(&f.pool.address), 10_000 * ONE_USDC);
 }
 
@@ -117,15 +110,13 @@ fn quote_shares_matches_what_provide_capital_actually_mints() {
     let f = setup();
     let lp = funded(&f, 20_000 * ONE_USDC);
 
-    // Quoting must not require auth or move funds — it's a pure preview.
     let quoted_first = f.pool.quote_shares(&(10_000 * ONE_USDC));
-    assert_eq!(quoted_first, 10_000 * ONE_USDC); // 1:1 on an empty pool
-    assert_eq!(f.usdc.balance(&lp), 20_000 * ONE_USDC); // untouched
+    assert_eq!(quoted_first, 10_000 * ONE_USDC);
+    assert_eq!(f.usdc.balance(&lp), 20_000 * ONE_USDC);
 
     let minted_first = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
     assert_eq!(quoted_first, minted_first);
 
-    // Once the pool isn't empty / 1:1, the quote must still match reality.
     let quoted_second = f.pool.quote_shares(&(5_000 * ONE_USDC));
     let minted_second = f.pool.provide_capital(&lp, &(5_000 * ONE_USDC));
     assert_eq!(quoted_second, minted_second);
@@ -161,7 +152,6 @@ fn pool_stats_available_capacity_tracks_max_utilization_and_shrinks_as_policies_
     let lp = funded(&f, 100_000 * ONE_USDC);
     f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
 
-    // Default max_utilization_bps is 8000 (80%) of total_capital.
     assert_eq!(f.pool.pool_stats().available_capacity, 80_000 * ONE_USDC);
 
     let holder = funded(&f, 1_000 * ONE_USDC);
@@ -174,10 +164,6 @@ fn pool_stats_available_capacity_tracks_max_utilization_and_shrinks_as_policies_
     let premium = f.pool.quote_premium(&params);
     f.pool.buy_policy(&holder, &params);
 
-    // The premium accrues into total_capital (LPs earn it), which nudges
-    // max_coverage_capacity up slightly even as total_coverage grows by
-    // the full coverage_amount — so capacity doesn't drop by exactly
-    // coverage_amount, only by coverage_amount minus 80% of the premium.
     let expected = 80_000 * ONE_USDC - 1_000 * ONE_USDC + (premium * 8_000 / 10_000);
     assert_eq!(f.pool.pool_stats().available_capacity, expected);
 }
@@ -193,7 +179,7 @@ fn buy_policy_charges_quoted_premium() {
         coverage_amount: 1_000 * ONE_USDC,
         coverage_type: CoverageType::StablecoinDepeg,
         duration_days: 30,
-        trigger_threshold: 500, // 5% depeg
+        trigger_threshold: 500,
     };
 
     let quote = f.pool.quote_premium(&params);
@@ -202,7 +188,7 @@ fn buy_policy_charges_quoted_premium() {
     let after = f.usdc.balance(&holder);
 
     assert_eq!(id, 0);
-    assert_eq!(before - after, quote); // holder paid exactly the quote
+    assert_eq!(before - after, quote);
     let policy = f.pool.get_policy(&id).unwrap();
     assert_eq!(policy.status, PolicyStatus::Active);
     assert_eq!(policy.coverage_amount, 1_000 * ONE_USDC);
@@ -287,10 +273,6 @@ fn buy_policy_registers_in_the_policy_registry() {
     let quote = f.pool.quote_premium(&params);
     let id = f.pool.buy_policy(&holder, &params);
 
-    // The pool's own record and the registry's mirrored record must agree —
-    // same id, same holder, same terms — proving buy_policy actually
-    // performed the cross-contract call rather than just writing local
-    // state.
     let record = f.registry.get_policy(&id);
     assert_eq!(record.policy_id, id);
     assert_eq!(record.holder, holder);
@@ -366,12 +348,10 @@ fn set_admin_rotates_who_can_call_admin_gated_functions() {
 
     f.pool.set_admin(&f.admin, &new_admin);
 
-    // The old admin has lost access...
     let new_registry_id = f.env.register_contract(None, RefractPolicyRegistry);
     let res = f.pool.try_set_policy_registry(&f.admin, &new_registry_id);
     assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
 
-    // ...and the new admin has it.
     f.pool.set_policy_registry(&new_admin, &new_registry_id);
     assert_eq!(f.pool.policy_registry(), Some(new_registry_id));
 }
@@ -406,13 +386,11 @@ fn set_pool_config_replaces_the_operational_parameters() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
+        dual_confirmation_threshold: 0,
     };
 
     f.pool.set_pool_config(&f.admin, &new_config);
 
-    // Exercise the new bounds end to end: a coverage amount that would
-    // have been rejected under the old 5,000 USDC max_coverage (from
-    // initialize_sets_defaults) now succeeds under the new 10,000 cap.
     let lp = funded(&f, 100_000 * ONE_USDC);
     f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
     let holder = funded(&f, 10_000 * ONE_USDC);
@@ -435,6 +413,7 @@ fn set_pool_config_rejects_non_admin() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
+        dual_confirmation_threshold: 0,
     };
     let res = f.pool.try_set_pool_config(&stranger, &new_config);
     assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
@@ -449,6 +428,7 @@ fn set_pool_config_emits_an_event() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
+        dual_confirmation_threshold: 0,
     };
 
     let before = f.env.events().all().len();
@@ -484,6 +464,8 @@ fn pool_config_reflects_defaults_and_tracks_updates() {
     assert_eq!(defaults.base_premium_rate_bps, 300);
     assert_eq!(defaults.max_utilization_bps, 8_000);
     assert_eq!(defaults.lockup_days, 7);
+    // New field: dual_confirmation_threshold defaults to 0 (disabled).
+    assert_eq!(defaults.dual_confirmation_threshold, 0);
 
     let new_config = PoolConfig {
         base_premium_rate_bps: 500,
@@ -491,6 +473,7 @@ fn pool_config_reflects_defaults_and_tracks_updates() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
+        dual_confirmation_threshold: 1_000 * ONE_USDC,
     };
     f.pool.set_pool_config(&f.admin, &new_config);
     assert_eq!(f.pool.pool_config(), Some(new_config));
@@ -511,7 +494,6 @@ fn buy_policy_rejected_below_min_coverage() {
     let lp = funded(&f, 100_000 * ONE_USDC);
     f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
 
-    // Default config's min_coverage is 10 USDC; ask for 1 USDC.
     let holder = funded(&f, 1_000 * ONE_USDC);
     let params = PolicyParams {
         coverage_amount: ONE_USDC,
@@ -529,7 +511,6 @@ fn buy_policy_rejected_above_max_coverage() {
     let lp = funded(&f, 1_000_000 * ONE_USDC);
     f.pool.provide_capital(&lp, &(1_000_000 * ONE_USDC));
 
-    // Default config's max_coverage is 5,000 USDC; ask for 5,001.
     let holder = funded(&f, 10_000 * ONE_USDC);
     let params = PolicyParams {
         coverage_amount: 5_001 * ONE_USDC,
@@ -547,7 +528,6 @@ fn buy_policy_rejected_when_over_utilization() {
     let lp = funded(&f, 1_000 * ONE_USDC);
     f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
 
-    // 80% cap on 1_000 capital => max 800 coverage; ask for 900.
     let holder = funded(&f, 1_000 * ONE_USDC);
     let params = PolicyParams {
         coverage_amount: 900 * ONE_USDC,
@@ -565,7 +545,6 @@ fn quote_premium_rejects_the_same_cases_buy_policy_would_reject() {
     let lp = funded(&f, 1_000 * ONE_USDC);
     f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
 
-    // Below min_coverage (10 USDC).
     let below_min = PolicyParams {
         coverage_amount: ONE_USDC,
         coverage_type: CoverageType::StablecoinDepeg,
@@ -577,7 +556,6 @@ fn quote_premium_rejects_the_same_cases_buy_policy_would_reject() {
         Err(Ok(PoolError::InsufficientCapacity))
     );
 
-    // Above max_coverage (5,000 USDC).
     let above_max = PolicyParams {
         coverage_amount: 5_001 * ONE_USDC,
         coverage_type: CoverageType::StablecoinDepeg,
@@ -589,7 +567,6 @@ fn quote_premium_rejects_the_same_cases_buy_policy_would_reject() {
         Err(Ok(PoolError::InsufficientCapacity))
     );
 
-    // Within per-policy bounds but over the pool's 80%-of-1,000 utilization cap.
     let over_utilization = PolicyParams {
         coverage_amount: 900 * ONE_USDC,
         coverage_type: CoverageType::StablecoinDepeg,
@@ -696,8 +673,6 @@ fn process_claim_deactivates_the_registry_record() {
     );
     f.pool.process_claim(&id);
 
-    // The pool's own record and the registry's mirrored record must both
-    // reflect the settled claim.
     assert_eq!(
         f.pool.get_policy(&id).unwrap().status,
         PolicyStatus::Claimed
@@ -720,7 +695,6 @@ fn process_claim_rejected_when_not_triggered() {
     };
     let id = f.pool.buy_policy(&holder, &params);
 
-    // USDC steady at $0.999 — no trigger.
     f.pool.update_oracle(
         &f.admin,
         &CoverageType::StablecoinDepeg,
@@ -753,7 +727,6 @@ fn process_claim_rejects_after_end_time() {
     };
     let id = f.pool.buy_policy(&holder, &params);
 
-    // USDC depegged, but the coverage window has already lapsed.
     f.pool.update_oracle(
         &f.admin,
         &CoverageType::StablecoinDepeg,
@@ -809,7 +782,6 @@ fn expire_policy_frees_coverage_and_deactivates_registry_record() {
     assert_eq!(f.pool.pool_stats().total_coverage, 500 * ONE_USDC);
     assert!(f.registry.get_policy(&id).is_active);
 
-    // Fast-forward well past the 30-day coverage window.
     f.env.ledger().with_mut(|li| {
         li.timestamp += 31 * 86_400;
     });
@@ -890,7 +862,6 @@ fn withdraw_capital_rejects_before_the_lockup_expires() {
     let lp = funded(&f, 10_000 * ONE_USDC);
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
 
-    // Still within the default 7-day lockup (initialize_sets_defaults).
     f.env.ledger().with_mut(|li| {
         li.timestamp += 6 * 86_400;
     });
@@ -904,7 +875,7 @@ fn withdraw_capital_succeeds_exactly_at_the_lockup_boundary() {
     let f = setup();
     let lp = funded(&f, 10_000 * ONE_USDC);
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
-    past_lockup(&f); // lands exactly at last_deposit + lockup_days, not past it
+    past_lockup(&f);
 
     let res = f.pool.try_withdraw_capital(&lp, &shares);
     assert!(res.is_ok());
@@ -917,8 +888,6 @@ fn provide_capital_resets_the_lockup_clock_on_a_top_up() {
     f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
     past_lockup(&f);
 
-    // Topping up re-locks the provider's entire position, not just the
-    // newly-added shares — see the comment in provide_capital().
     let more_shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
     let total_shares = f.pool.shares_of(&lp);
 
@@ -976,8 +945,6 @@ fn withdraw_capital_rejects_negative_shares() {
     let lp = funded(&f, 10_000 * ONE_USDC);
     f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
 
-    // A negative share count must never be able to mint capital out of the
-    // pool via the `total_capital - usdc_out` accounting below this guard.
     let res = f.pool.try_withdraw_capital(&lp, &-1);
     assert_eq!(res, Err(Ok(PoolError::ZeroAmount)));
 }
@@ -999,7 +966,6 @@ fn quote_withdrawal_matches_what_withdraw_capital_actually_returns() {
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
     past_lockup(&f);
 
-    // Quoting must not require auth or check/touch the caller's balance.
     let quoted = f.pool.quote_withdrawal(&shares);
     let out = f.pool.withdraw_capital(&lp, &shares);
     assert_eq!(quoted, out);
@@ -1030,8 +996,6 @@ fn quote_withdrawal_and_withdraw_capital_agree_when_utilization_would_be_exceede
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
     past_lockup(&f);
 
-    // 4,500 USDC stays under the pool's per-policy max_coverage (5,000 USDC
-    // in this crate's default PoolConfig).
     let holder = funded(&f, 1_000 * ONE_USDC);
     let params = PolicyParams {
         coverage_amount: 4_500 * ONE_USDC,
@@ -1041,17 +1005,10 @@ fn quote_withdrawal_and_withdraw_capital_agree_when_utilization_would_be_exceede
     };
     f.pool.buy_policy(&holder, &params);
 
-    // Withdrawing 6,000 of the LP's 10,000 shares drops capital to ~4,000,
-    // pushing the already-sold 4,500 USDC of coverage past the 80% max
-    // utilization (4,500 / 4,000 = 112.5%).
     let six_thousand_shares = shares * 6 / 10;
     let quoted = f.pool.try_quote_withdrawal(&six_thousand_shares);
     assert_eq!(quoted, Err(Ok(PoolError::CapitalLocked)));
 
-    // withdraw_capital() must reject identically — the preview and the
-    // real path share the same check (_quote_withdrawal), so they can't
-    // silently diverge. This CapitalLocked path had no test coverage
-    // before this change.
     let withdrawn = f.pool.try_withdraw_capital(&lp, &six_thousand_shares);
     assert_eq!(withdrawn, Err(Ok(PoolError::CapitalLocked)));
 }
@@ -1062,9 +1019,418 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     let lp = funded(&f, 10_000 * ONE_USDC);
     let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
 
-    // No caller can ever hold more shares than total_shares, so quoting
-    // more than that must error rather than silently returning a payout
-    // larger than the entire pool holds (see _quote_withdrawal).
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}
+
+// ── Issue #97: unified trigger evaluation (regression suite) ─────────────────
+
+/// Regression: the pool's trigger evaluation (policy.trigger_threshold)
+/// produces the same accept/reject outcome as the previous pool-side-only
+/// evaluation for StablecoinDepeg.
+#[test]
+fn trigger_eval_regression_stablecoin_depeg_triggered() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    // trigger_threshold = 500 bps → trigger when price < $0.95
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // $0.94 < $0.95 → triggered.
+    f.pool
+        .update_oracle(&f.admin, &CoverageType::StablecoinDepeg, &(940 * ONE_USDC / 100));
+    assert!(f.pool.try_process_claim(&id).is_ok());
+}
+
+/// Regression: StablecoinDepeg not triggered when above threshold.
+#[test]
+fn trigger_eval_regression_stablecoin_depeg_not_triggered() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // $0.96 > $0.95 → not triggered.
+    f.pool
+        .update_oracle(&f.admin, &CoverageType::StablecoinDepeg, &(960 * ONE_USDC / 100));
+    assert_eq!(
+        f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::PolicyNotTriggered))
+    );
+}
+
+/// Regression: MarketCrash triggered at -35% (below -30% threshold).
+#[test]
+fn trigger_eval_regression_market_crash_triggered() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    // trigger_threshold = 3_000 bps → trigger when return < -30_000_000
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::MarketCrash,
+        duration_days: 30,
+        trigger_threshold: 3_000_000, // -30% in 1e7 units
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // -35% return → triggered.
+    f.pool
+        .update_oracle(&f.admin, &CoverageType::MarketCrash, &(-35_000_000i128));
+    assert!(f.pool.try_process_claim(&id).is_ok());
+}
+
+// ── Issue #98: FlightDelay end-to-end ────────────────────────────────────────
+
+/// End-to-end: buy a FlightDelay policy, relayer submits delay via
+/// update_oracle (legacy path), process_claim settles correctly.
+#[test]
+fn flight_delay_end_to_end_claim() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    // trigger_threshold = 120 minutes.
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::FlightDelay,
+        duration_days: 1,
+        trigger_threshold: 120,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // Relayer submits 180-minute delay (> 120 min threshold → triggered).
+    f.pool
+        .update_oracle(&f.admin, &CoverageType::FlightDelay, &180i128);
+
+    let holder_before = f.usdc.balance(&holder);
+    let payout = f.pool.process_claim(&id);
+    let holder_after = f.usdc.balance(&holder);
+
+    assert_eq!(payout, 500 * ONE_USDC);
+    assert_eq!(holder_after - holder_before, 500 * ONE_USDC);
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Claimed
+    );
+}
+
+/// FlightDelay not triggered when delay is below the threshold.
+#[test]
+fn flight_delay_not_triggered_when_below_threshold() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::FlightDelay,
+        duration_days: 1,
+        trigger_threshold: 120,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // Relayer submits 60-minute delay (< 120 min → not triggered).
+    f.pool
+        .update_oracle(&f.admin, &CoverageType::FlightDelay, &60i128);
+
+    assert_eq!(
+        f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::PolicyNotTriggered))
+    );
+}
+
+/// Cancellation: a flight cancelled is submitted with a large value
+/// (simulating the sentinel) which triggers any reasonable threshold.
+#[test]
+fn cancelled_flight_triggers_claim_via_large_delay_value() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::FlightDelay,
+        duration_days: 1,
+        trigger_threshold: 120,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // Cancelled flight — use a large sentinel value (much larger than any
+    // trigger_threshold measured in minutes).
+    f.pool
+        .update_oracle(&f.admin, &CoverageType::FlightDelay, &1_000_000i128);
+
+    let payout = f.pool.process_claim(&id);
+    assert_eq!(payout, 500 * ONE_USDC);
+}
+
+// ── Issue #99: dual-oracle confirmation ──────────────────────────────────────
+
+// Helper: build a minimal PoolConfig with the given dual_confirmation_threshold.
+fn config_with_dual_threshold(threshold: i128) -> PoolConfig {
+    PoolConfig {
+        base_premium_rate_bps: 300,
+        max_utilization_bps: 8_000,
+        min_coverage: 100_000_000i128,
+        max_coverage: 50_000_000_000i128,
+        lockup_days: 7,
+        dual_confirmation_threshold: threshold,
+    }
+}
+
+/// Below-threshold single-source path is unaffected (regression).
+#[test]
+fn dual_confirmation_below_threshold_uses_single_oracle() {
+    let f = setup();
+    // Set threshold at 2_000 USDC; claim is only 1_000 USDC.
+    f.pool
+        .set_pool_config(&f.admin, &config_with_dual_threshold(2_000 * ONE_USDC));
+
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // Single oracle confirms — must succeed without any fallback.
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    let payout = f.pool.process_claim(&id);
+    assert_eq!(payout, 1_000 * ONE_USDC);
+}
+
+/// Above threshold with no fallback configured → DualConfirmationUnavailable.
+#[test]
+fn dual_confirmation_above_threshold_no_fallback_fails_closed() {
+    let f = setup();
+    // Threshold = 500 USDC; claim is 1_000 USDC (above threshold).
+    f.pool
+        .set_pool_config(&f.admin, &config_with_dual_threshold(500 * ONE_USDC));
+
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC, // >= 500 USDC threshold
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+
+    // No fallback set → fails closed.
+    assert_eq!(
+        f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::DualConfirmationUnavailable))
+    );
+}
+
+/// Exactly at the threshold boundary requires dual confirmation (>= semantics).
+#[test]
+fn dual_confirmation_exactly_at_threshold_requires_dual() {
+    let f = setup();
+    let threshold = 1_000 * ONE_USDC;
+    f.pool
+        .set_pool_config(&f.admin, &config_with_dual_threshold(threshold));
+
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: threshold, // exactly at the boundary
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+
+    // No fallback → DualConfirmationUnavailable (proves >= not >).
+    assert_eq!(
+        f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::DualConfirmationUnavailable))
+    );
+}
+
+/// Above threshold, both oracles agree → claim succeeds.
+///
+/// We use the legacy `update_oracle` path for both primary and fallback
+/// to keep the test self-contained.  The fallback oracle is a second pool
+/// instance (its `OracleData` storage is independent), and the pool calls
+/// `get_reading` on it after seeing the `FallbackOracleContract` key.
+/// Because the fallback address here is just a registered contract address
+/// (a second pool) that does NOT implement `get_reading` as a RefractOracle
+/// would, the `try_invoke_contract` in `_eval_trigger_from_oracle` returns
+/// Err (InvokeError) and `_eval_trigger_from_oracle` returns `false`.
+///
+/// This test therefore verifies the *framework*: when the fallback oracle
+/// address IS a real RefractOracle and returns a fresh triggered reading,
+/// both agree and the claim succeeds.  Since registering and wiring two
+/// full RefractOracle contracts in a unit test is the correct way to test
+/// this (and the oracle contract is compiled into the test binary via
+/// dev-dependencies), we do exactly that.
+#[test]
+fn dual_confirmation_both_agree_claim_succeeds() {
+    use refract_oracle::{RefractOracle as OracleContract, RefractOracleClient};
+
+    let f = setup();
+    let threshold = 500 * ONE_USDC;
+    f.pool
+        .set_pool_config(&f.admin, &config_with_dual_threshold(threshold));
+
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    // Register primary oracle.
+    let primary_id = f.env.register_contract(None, OracleContract);
+    let primary = RefractOracleClient::new(&f.env, &primary_id);
+    primary.initialize(&f.admin);
+    let relayer_a = Address::generate(&f.env);
+    primary.add_relayer(&relayer_a);
+
+    // Register fallback oracle.
+    let fallback_id = f.env.register_contract(None, OracleContract);
+    let fallback = RefractOracleClient::new(&f.env, &fallback_id);
+    fallback.initialize(&f.admin);
+    let relayer_b = Address::generate(&f.env);
+    fallback.add_relayer(&relayer_b);
+
+    // Wire pool to both oracles.
+    f.pool.set_oracle(&f.admin, &primary_id);
+    f.pool.set_fallback_oracle(&f.admin, &fallback_id);
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC, // above 500 USDC threshold
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500, // depeg below $0.95
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    let now = f.env.ledger().timestamp();
+
+    // Both oracles submit a depeg reading ($0.90 < $0.95).
+    primary.submit(
+        &relayer_a,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &(9 * ONE_USDC / 10),
+        &now,
+        &Symbol::new(&f.env, "src_a"),
+    );
+    fallback.submit(
+        &relayer_b,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &(9 * ONE_USDC / 10),
+        &now,
+        &Symbol::new(&f.env, "src_b"),
+    );
+
+    let payout = f.pool.process_claim(&id);
+    assert_eq!(payout, 1_000 * ONE_USDC);
+}
+
+/// Above threshold, oracles disagree → claim fails.
+#[test]
+fn dual_confirmation_disagreement_claim_fails() {
+    use refract_oracle::{RefractOracle as OracleContract, RefractOracleClient};
+
+    let f = setup();
+    let threshold = 500 * ONE_USDC;
+    f.pool
+        .set_pool_config(&f.admin, &config_with_dual_threshold(threshold));
+
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let primary_id = f.env.register_contract(None, OracleContract);
+    let primary = RefractOracleClient::new(&f.env, &primary_id);
+    primary.initialize(&f.admin);
+    let relayer_a = Address::generate(&f.env);
+    primary.add_relayer(&relayer_a);
+
+    let fallback_id = f.env.register_contract(None, OracleContract);
+    let fallback = RefractOracleClient::new(&f.env, &fallback_id);
+    fallback.initialize(&f.admin);
+    let relayer_b = Address::generate(&f.env);
+    fallback.add_relayer(&relayer_b);
+
+    f.pool.set_oracle(&f.admin, &primary_id);
+    f.pool.set_fallback_oracle(&f.admin, &fallback_id);
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    let now = f.env.ledger().timestamp();
+
+    // Primary says depeg ($0.90), fallback says healthy ($0.99) — disagreement.
+    primary.submit(
+        &relayer_a,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &(9 * ONE_USDC / 10),
+        &now,
+        &Symbol::new(&f.env, "src_a"),
+    );
+    fallback.submit(
+        &relayer_b,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &(99 * ONE_USDC / 100),
+        &now,
+        &Symbol::new(&f.env, "src_b"),
+    );
+
+    assert_eq!(
+        f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::PolicyNotTriggered))
+    );
 }

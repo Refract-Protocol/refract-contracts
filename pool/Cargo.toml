@@ -17,4 +17,7 @@ soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
 # into the pool's wasm. Tests still want the real registry contract deployed
 # in-process to exercise the call end-to-end, hence dev-dependencies only.
 refract-policy = { path = "../policy" }
+# Dev-only: dual-oracle confirmation tests (issue #99) deploy two real
+# RefractOracle contracts in-process to exercise the full call chain.
+refract-oracle = { path = "../oracle" }
 proptest = "1.5.0"
