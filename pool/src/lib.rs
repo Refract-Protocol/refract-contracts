@@ -2,11 +2,50 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
-    IntoVal, Symbol, Vec,
+    IntoVal, InvokeError, Symbol, Val, Vec,
 };
 
 const PRECISION: i128 = 10_000_000i128;
 const BPS: i128 = 10_000i128;
+
+// ── Resource limits ───────────────────────────────────────────────────────────
+//
+// Derived from the live mainnet Soroban settings (`stellar network
+// settings`, fetched 2026-09-27): 400 footprint entries, 200 write entries,
+// 132,096 write bytes and 16,384 event bytes per transaction. `bench.rs`
+// measures the per-item costs quoted here and asserts a batch at each cap
+// fits under these limits.
+
+/// Most ids per `expire_policies` call. Each swept policy writes up to 3
+/// entries (its pool `Policy`, the registry's `PolicyRecord`, the holder's
+/// registry active index) and emits 2 events (EXPIRE here,
+/// policy_deactivated in the registry) of ~240 bytes together. The batch
+/// adds both contracts' code and instances. Writes: 2 + 3n <= 200 → n <= 66;
+/// events: 240n <= 16,384 → n <= 68; footprint: 4 + 4n <= 400 → n <= 99.
+/// 48 is ~75% of the binding 66, leaving headroom for Wasm CPU, which the
+/// native test host doesn't meter. Must stay <= the registry's
+/// `MAX_DEACTIVATE_BATCH` so the batched registry call is never rejected.
+pub const MAX_EXPIRE_BATCH: u32 = 48;
+
+/// Ids per chunk of a holder's `user_policies` index. Mirrors the
+/// registry's `INDEX_CHUNK_SIZE`; see its derivation there.
+pub const INDEX_CHUNK_SIZE: u32 = 128;
+
+/// Most chunk entries one full `user_policies` read may touch (2,048 ids).
+/// Mirrors the registry's `MAX_READ_CHUNKS`.
+pub const MAX_READ_CHUNKS: u32 = 16;
+
+/// Most legacy ids `migrate_user_policies` moves per call. Mirrors the
+/// registry's `MAX_MIGRATION_BATCH`.
+pub const MAX_MIGRATION_BATCH: u32 = 4 * INDEX_CHUNK_SIZE;
+
+/// Ledgers per day at the 5 s target close time.
+const DAY_IN_LEDGERS: u32 = 17_280;
+/// Index entries are re-extended once their TTL falls below this...
+const INDEX_TTL_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
+/// ...back up to this (the host clamps persistent entries to the network's
+/// max TTL).
+const INDEX_TTL_EXTEND_TO: u32 = 180 * DAY_IN_LEDGERS;
 
 // ── Coverage categories ───────────────────────────────────────────────────────
 #[contracttype]
@@ -56,6 +95,23 @@ pub struct PolicyRegistration {
     pub expires_at: u64,
 }
 
+/// Header of a holder's chunked `user_policies` index. The holder's ids, in
+/// purchase order, are `UserPolicyChunk(h, 0) ++ … ++ UserPolicyChunk(h,
+/// chunk_count - 1)`, followed — only while a migration is in progress — by
+/// `UserPolicies(h)[legacy_cursor..]`. Every chunk but the last holds exactly
+/// `INDEX_CHUNK_SIZE` ids; the last holds `tail_len`. Structurally identical
+/// to the registry's `IndexHeader`, so reconciliation tooling can treat both
+/// contracts' indexes the same way.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexHeader {
+    pub chunk_count: u32,
+    pub tail_len: u32,
+    /// `Some(n)` while the legacy `UserPolicies` vector is being migrated and
+    /// its first `n` ids have already been copied into chunks.
+    pub legacy_cursor: Option<u32>,
+}
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 #[contracttype]
 #[derive(Clone)]
@@ -69,12 +125,16 @@ pub enum DataKey {
     Shares(Address),
     TotalShares,
     Policy(u64),
+    /// Pre-chunking holder index (address → Vec<u64>). No longer written for
+    /// new holders; kept so `migrate_user_policies` can convert it.
     UserPolicies(Address),
     NextPolicyId,
     PoolConfig,
     Initialized,
-    OracleData(CoverageType), // latest oracle reading per type
-    LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    OracleData(CoverageType),      // latest oracle reading per type
+    LastDeposit(Address),          // provider → timestamp of their most recent provide_capital()
+    UserPolicyIndex(Address),      // holder → IndexHeader
+    UserPolicyChunk(Address, u32), // (holder, chunk no.) → Vec<u64>
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -97,6 +157,8 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    BatchTooLarge = 16, // more ids than MAX_EXPIRE_BATCH
+    IndexTooLarge = 17, // full read would span more than MAX_READ_CHUNKS chunks
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -454,15 +516,7 @@ impl RefractPool {
             .instance()
             .set(&DataKey::NextPolicyId, &(id + 1));
 
-        let mut user_policies: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserPolicies(holder.clone()))
-            .unwrap_or(Vec::new(&env));
-        user_policies.push_back(id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserPolicies(holder.clone()), &user_policies);
+        Self::_append_user_policy(&env, &holder, id);
 
         // Mirror the policy into RefractPolicyRegistry so it's indexed for
         // per-holder lookups. The pool is the source of truth for the id;
@@ -615,25 +669,8 @@ impl RefractPool {
     /// was bought; only the *coverage* obligation (and the utilization it
     /// consumes) ends, freeing room for new policies.
     pub fn expire_policy(env: Env, policy_id: u64) -> Result<(), PoolError> {
-        let mut policy: Policy = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Policy(policy_id))
-            .ok_or(PoolError::PolicyNotFound)?;
-
-        if policy.status != PolicyStatus::Active {
-            return Err(PoolError::AlreadyClaimed);
-        }
-
         let now = env.ledger().timestamp();
-        if now <= policy.end_time {
-            return Err(PoolError::PolicyNotYetExpired);
-        }
-
-        policy.status = PolicyStatus::Expired;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Policy(policy_id), &policy);
+        let policy = Self::_expire_one(&env, policy_id, now)?;
 
         let mut total_cov: i128 = env
             .storage()
@@ -651,6 +688,96 @@ impl RefractPool {
             .publish((symbol_short!("EXPIRE"), policy.holder), (policy_id, now));
 
         Ok(())
+    }
+
+    /// Batched `expire_policy` for keepers: sweeps every lapsed policy in
+    /// `policy_ids` in one invocation and returns the ids actually swept.
+    /// Permissionless, like expire_policy. Ids that are unknown, not yet
+    /// past `end_time`, or no longer `Active` (including a repeat of an id
+    /// already swept earlier in the same batch) are skipped rather than
+    /// failing the batch, matching get_policies(). `TotalCoverage` is read
+    /// and written once for the whole batch, and the registry is updated
+    /// with a single deactivate_policies call. Emits one EXPIRE event per
+    /// swept policy, identical to expire_policy's. Fails with BatchTooLarge
+    /// above MAX_EXPIRE_BATCH ids.
+    pub fn expire_policies(env: Env, policy_ids: Vec<u64>) -> Result<Vec<u64>, PoolError> {
+        if policy_ids.len() > MAX_EXPIRE_BATCH {
+            return Err(PoolError::BatchTooLarge);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut swept: Vec<u64> = Vec::new(&env);
+        let mut expired: Vec<Policy> = Vec::new(&env);
+        for id in policy_ids.iter() {
+            if let Ok(policy) = Self::_expire_one(&env, id, now) {
+                swept.push_back(id);
+                expired.push_back(policy);
+            }
+        }
+        if swept.is_empty() {
+            return Ok(swept);
+        }
+
+        let mut total_cov: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCoverage)
+            .unwrap_or(0);
+        // Clamp per policy, not once on the sum, so the result is exactly
+        // what the equivalent run of single expire_policy calls produces.
+        for policy in expired.iter() {
+            total_cov = (total_cov - policy.coverage_amount).max(0);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalCoverage, &total_cov);
+
+        Self::_deactivate_many_in_registry(&env, &swept);
+
+        for policy in expired.iter() {
+            env.events()
+                .publish((symbol_short!("EXPIRE"), policy.holder), (policy.id, now));
+        }
+
+        Ok(swept)
+    }
+
+    /// Move up to `max_ids` (capped at MAX_MIGRATION_BATCH) ids from a
+    /// holder's pre-chunking `UserPolicies` vector into chunks, and return
+    /// how many are still left (0 once done). Call repeatedly until it
+    /// returns 0. Permissionless: it only changes how the holder's index is
+    /// laid out, never what it contains or its order, and purchases made
+    /// mid-migration keep landing in the legacy vector until it's drained so
+    /// ordering is preserved.
+    pub fn migrate_user_policies(env: Env, user: Address, max_ids: u32) -> u32 {
+        let legacy_key = DataKey::UserPolicies(user.clone());
+        let Some(legacy) = env.storage().persistent().get::<_, Vec<u64>>(&legacy_key) else {
+            return 0;
+        };
+        let header_key = DataKey::UserPolicyIndex(user.clone());
+        let mut header: IndexHeader =
+            env.storage()
+                .persistent()
+                .get(&header_key)
+                .unwrap_or(IndexHeader {
+                    chunk_count: 0,
+                    tail_len: 0,
+                    legacy_cursor: Some(0),
+                });
+
+        let cursor = header.legacy_cursor.unwrap_or(0);
+        let n = max_ids.min(MAX_MIGRATION_BATCH).min(legacy.len() - cursor);
+        Self::_push_chunked(&env, &user, &mut header, &legacy.slice(cursor..cursor + n));
+
+        let cursor = cursor + n;
+        if cursor == legacy.len() {
+            env.storage().persistent().remove(&legacy_key);
+            header.legacy_cursor = None;
+        } else {
+            header.legacy_cursor = Some(cursor);
+        }
+        Self::_set_index_entry(&env, &header_key, &header);
+        legacy.len() - cursor
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -803,11 +930,64 @@ impl RefractPool {
         out
     }
 
-    pub fn user_policies(env: Env, user: Address) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UserPolicies(user))
-            .unwrap_or(Vec::new(&env))
+    /// Every policy id `user` has bought, in purchase order. Fails with
+    /// IndexTooLarge once the index spans more than MAX_READ_CHUNKS chunks
+    /// (MAX_READ_CHUNKS * INDEX_CHUNK_SIZE ids); read such a history
+    /// piecewise with user_policy_count() and user_policy_chunk().
+    pub fn user_policies(env: Env, user: Address) -> Result<Vec<u64>, PoolError> {
+        let legacy = || {
+            env.storage()
+                .persistent()
+                .get::<_, Vec<u64>>(&DataKey::UserPolicies(user.clone()))
+                .unwrap_or_else(|| Vec::new(&env))
+        };
+        let Some(header) = Self::_get_index_header(&env, &user) else {
+            return Ok(legacy());
+        };
+        if header.chunk_count > MAX_READ_CHUNKS {
+            return Err(PoolError::IndexTooLarge);
+        }
+
+        let mut ids = Vec::new(&env);
+        for chunk_no in 0..header.chunk_count {
+            // Reads also re-extend sealed chunks, which appends never touch
+            // again, so an actively-read index stays live as one unit.
+            let key = DataKey::UserPolicyChunk(user.clone(), chunk_no);
+            if let Some(chunk) = env.storage().persistent().get::<_, Vec<u64>>(&key) {
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    INDEX_TTL_THRESHOLD,
+                    INDEX_TTL_EXTEND_TO,
+                );
+                ids.append(&chunk);
+            }
+        }
+        if let Some(cursor) = header.legacy_cursor {
+            ids.append(&legacy().slice(cursor..));
+        }
+        Ok(ids)
+    }
+
+    /// Number of policies `user` has bought.
+    pub fn user_policy_count(env: Env, user: Address) -> u32 {
+        let legacy_len = |from: u32| {
+            env.storage()
+                .persistent()
+                .get::<_, Vec<u64>>(&DataKey::UserPolicies(user.clone()))
+                .map_or(0, |v| v.len() - from)
+        };
+        match Self::_get_index_header(&env, &user) {
+            None => legacy_len(0),
+            Some(h) => Self::_chunked_len(&h) + h.legacy_cursor.map_or(0, legacy_len),
+        }
+    }
+
+    /// Chunk `chunk` of `user`'s index: ids `[chunk * INDEX_CHUNK_SIZE,
+    /// (chunk + 1) * INDEX_CHUNK_SIZE)`, empty past the end. Only covers the
+    /// chunked part — a holder whose migration hasn't finished still has its
+    /// newest ids in the legacy vector, which only user_policies() returns.
+    pub fn user_policy_chunk(env: Env, user: Address, chunk: u32) -> Vec<u64> {
+        Self::_get_chunk(&env, &user, chunk)
     }
 
     pub fn shares_of(env: Env, user: Address) -> i128 {
@@ -896,6 +1076,161 @@ impl RefractPool {
                 ],
             ),
         );
+    }
+
+    /// Batched `_deactivate_in_registry`, with the same best-effort,
+    /// non-reverting semantics. Tries the registry's deactivate_policies in
+    /// one call; if that fails with a host-level error — as it does against
+    /// a registry deployed before the batch entrypoint existed — falls back
+    /// to one deactivate_policy call per id. A typed contract error means an
+    /// upgraded registry rejected the call (e.g. this pool isn't authorized)
+    /// and the per-id calls would be rejected the same way, so there's no
+    /// fallback then.
+    fn _deactivate_many_in_registry(env: &Env, policy_ids: &Vec<u64>) {
+        let registry_addr: Option<Address> = env.storage().instance().get(&DataKey::PolicyRegistry);
+        let Some(registry_addr) = registry_addr else {
+            return;
+        };
+        let res = env.try_invoke_contract::<Vec<u64>, InvokeError>(
+            &registry_addr,
+            &Symbol::new(env, "deactivate_policies"),
+            Vec::from_array(
+                env,
+                [
+                    env.current_contract_address().into_val(env),
+                    policy_ids.into_val(env),
+                ],
+            ),
+        );
+        match res {
+            Ok(_) | Err(Ok(InvokeError::Contract(_))) => {}
+            Err(_) => {
+                for id in policy_ids.iter() {
+                    Self::_deactivate_in_registry(env, id);
+                }
+            }
+        }
+    }
+
+    /// Flip one lapsed policy to Expired and persist it. Shared by
+    /// expire_policy and expire_policies so the two paths can't diverge;
+    /// the caller owns the TotalCoverage update, the registry call and the
+    /// EXPIRE event. Returns the updated policy (for its coverage_amount and
+    /// holder).
+    fn _expire_one(env: &Env, policy_id: u64, now: u64) -> Result<Policy, PoolError> {
+        let mut policy: Policy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Policy(policy_id))
+            .ok_or(PoolError::PolicyNotFound)?;
+
+        if policy.status != PolicyStatus::Active {
+            return Err(PoolError::AlreadyClaimed);
+        }
+        if now <= policy.end_time {
+            return Err(PoolError::PolicyNotYetExpired);
+        }
+
+        policy.status = PolicyStatus::Expired;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Policy(policy_id), &policy);
+        Ok(policy)
+    }
+
+    /// Append `id` to `holder`'s index, touching only the header and the
+    /// tail chunk. A holder whose legacy `UserPolicies` vector hasn't been
+    /// fully migrated keeps appending to that vector — the pre-chunking
+    /// cost — so the migration can't reorder ids.
+    fn _append_user_policy(env: &Env, holder: &Address, id: u64) {
+        let legacy_key = DataKey::UserPolicies(holder.clone());
+        let header = match Self::_get_index_header(env, holder) {
+            Some(h) if h.legacy_cursor.is_none() => Some(h),
+            Some(_) => None,
+            None if env.storage().persistent().has(&legacy_key) => None,
+            None => Some(IndexHeader {
+                chunk_count: 0,
+                tail_len: 0,
+                legacy_cursor: None,
+            }),
+        };
+        let Some(mut header) = header else {
+            let mut legacy: Vec<u64> = env.storage().persistent().get(&legacy_key).unwrap();
+            legacy.push_back(id);
+            env.storage().persistent().set(&legacy_key, &legacy);
+            return;
+        };
+
+        Self::_push_chunked(env, holder, &mut header, &Vec::from_array(env, [id]));
+        Self::_set_index_entry(env, &DataKey::UserPolicyIndex(holder.clone()), &header);
+    }
+
+    /// Append `ids` after the last chunk, filling the tail chunk first and
+    /// writing each touched chunk exactly once. Updates `header` in place;
+    /// the caller writes it.
+    fn _push_chunked(env: &Env, holder: &Address, header: &mut IndexHeader, ids: &Vec<u64>) {
+        if ids.is_empty() {
+            return;
+        }
+        let (mut chunk_no, mut chunk) =
+            if header.chunk_count == 0 || header.tail_len == INDEX_CHUNK_SIZE {
+                header.chunk_count += 1;
+                header.tail_len = 0;
+                (header.chunk_count - 1, Vec::new(env))
+            } else {
+                let tail = header.chunk_count - 1;
+                (tail, Self::_get_chunk(env, holder, tail))
+            };
+        for id in ids.iter() {
+            if header.tail_len == INDEX_CHUNK_SIZE {
+                Self::_set_index_entry(
+                    env,
+                    &DataKey::UserPolicyChunk(holder.clone(), chunk_no),
+                    &chunk,
+                );
+                header.chunk_count += 1;
+                header.tail_len = 0;
+                chunk_no += 1;
+                chunk = Vec::new(env);
+            }
+            chunk.push_back(id);
+            header.tail_len += 1;
+        }
+        Self::_set_index_entry(
+            env,
+            &DataKey::UserPolicyChunk(holder.clone(), chunk_no),
+            &chunk,
+        );
+    }
+
+    fn _get_index_header(env: &Env, holder: &Address) -> Option<IndexHeader> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserPolicyIndex(holder.clone()))
+    }
+
+    fn _get_chunk(env: &Env, holder: &Address, chunk_no: u32) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserPolicyChunk(holder.clone(), chunk_no))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn _chunked_len(header: &IndexHeader) -> u32 {
+        match header.chunk_count {
+            0 => 0,
+            n => (n - 1) * INDEX_CHUNK_SIZE + header.tail_len,
+        }
+    }
+
+    /// Write an index entry and extend its TTL. Every append extends the
+    /// header and the tail chunk it rewrites, so the entries a holder is
+    /// actively adding to never lapse; full reads extend the sealed chunks.
+    fn _set_index_entry<V: IntoVal<Env, Val>>(env: &Env, key: &DataKey, value: &V) {
+        env.storage().persistent().set(key, value);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, INDEX_TTL_THRESHOLD, INDEX_TTL_EXTEND_TO);
     }
 
     fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
@@ -1048,3 +1383,6 @@ mod test;
 
 #[cfg(test)]
 mod pricing_proptest;
+
+#[cfg(test)]
+mod bench;

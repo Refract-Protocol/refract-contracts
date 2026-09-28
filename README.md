@@ -61,9 +61,18 @@ Then `initialize` each contract (admin, USDC token address, and pool↔registry 
 
 ## Authorization model
 
-- **RefractPool** — `provide_capital`, `withdraw_capital`, and `buy_policy` require the caller's auth. `update_oracle` is admin-only.
+- **RefractPool** — `provide_capital`, `withdraw_capital`, and `buy_policy` require the caller's auth. `update_oracle` is admin-only. `expire_policy` / `expire_policies` (keeper sweeps of lapsed policies) and `migrate_user_policies` (converts a pre-chunking holder index) are permissionless.
 - **RefractOracle** — only registered relayers (or the admin) may `submit`; readings older than 30 minutes are rejected.
-- **RefractPolicyRegistry** — only the registered pool contract or the admin may `register_policy` / `deactivate_policy`.
+- **RefractPolicyRegistry** — only the registered pool contract or the admin may `register_policy` / `deactivate_policy` / `deactivate_policies`. `rebuild_active_index` is admin-only; `migrate_holder_index` is permissionless.
+
+### Upgrading an existing deployment
+
+Per-holder indexes are now chunked, and the registry keeps a per-holder active-policy index. Holders indexed before the upgrade keep working unchanged: reads fall back to the old layout, and new purchases keep appending to it until migrated. To move them onto the constant-cost layout, for each such holder:
+
+1. Call `migrate_user_policies(holder, max_ids)` on the pool and `migrate_holder_index(holder, max_ids)` on the registry until each returns `0`.
+2. Then call `rebuild_active_index(admin, holder)` on the registry until it returns `0`.
+
+Every step is bounded and resumable.
 
 ## Status
 

@@ -1,11 +1,14 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _},
+    contract, contractimpl,
+    testutils::{Address as _, EnvTestConfig, Events as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, Env, TryFromVal,
 };
 
 const ONE_USDC: i128 = 10_000_000; // 1e7 fixed-point
@@ -20,8 +23,21 @@ struct Fixture<'a> {
 }
 
 fn setup<'a>() -> Fixture<'a> {
-    let env = Env::default();
+    setup_with(Env::default())
+}
+
+/// For tests that buy dozens of policies: skips the test snapshot, which
+/// for these would be megabytes of JSON and most of the runtime.
+fn setup_heavy<'a>() -> Fixture<'a> {
+    setup_with(Env::new_with_config(EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    }))
+}
+
+fn setup_with<'a>(env: Env) -> Fixture<'a> {
     env.mock_all_auths();
+    // Tests that buy many policies would exhaust the default per-Env budget.
+    env.budget().reset_unlimited();
 
     let admin = Address::generate(&env);
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
@@ -1067,4 +1083,479 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     // larger than the entire pool holds (see _quote_withdrawal).
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}
+
+// ── Batched expiry (expire_policies) ──────────────────────────────────────────
+
+fn ids(env: &Env, ids: &[u64]) -> Vec<u64> {
+    let mut v = Vec::new(env);
+    for id in ids {
+        v.push_back(*id);
+    }
+    v
+}
+
+/// Fund the pool generously and buy `n` 30-day policies for `holders`
+/// (round-robin), with distinct coverage amounts so a wrong subtraction
+/// can't cancel out.
+fn buy_n(f: &Fixture, holders: &[Address], n: u64) -> std::vec::Vec<u64> {
+    let mut out = std::vec::Vec::new();
+    for i in 0..n {
+        let holder = &holders[i as usize % holders.len()];
+        let params = PolicyParams {
+            coverage_amount: (100 + i as i128) * ONE_USDC,
+            coverage_type: CoverageType::StablecoinDepeg,
+            duration_days: 30,
+            trigger_threshold: 500,
+        };
+        out.push(f.pool.buy_policy(holder, &params));
+    }
+    out
+}
+
+fn big_pool(f: &Fixture, holders: usize) -> std::vec::Vec<Address> {
+    let lp = funded(f, 10_000_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(10_000_000 * ONE_USDC));
+    (0..holders)
+        .map(|_| funded(f, 1_000_000 * ONE_USDC))
+        .collect()
+}
+
+fn lapse(f: &Fixture) {
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 31 * 86_400;
+    });
+}
+
+/// The pool's EXPIRE events emitted since event index `from`, as (holder,
+/// policy id, timestamp).
+fn expire_events(f: &Fixture, from: u32) -> std::vec::Vec<(Address, u64, u64)> {
+    let all = f.env.events().all();
+    let mut out = std::vec::Vec::new();
+    for i in from..all.len() {
+        let (contract, topics, data) = all.get(i).unwrap();
+        if contract != f.pool.address {
+            continue;
+        }
+        let name = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+        if name == symbol_short!("EXPIRE") {
+            let holder = Address::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+            let (id, at) = <(u64, u64)>::try_from_val(&f.env, &data).unwrap();
+            out.push((holder, id, at));
+        }
+    }
+    out
+}
+
+#[test]
+fn expire_policies_sweeps_every_lapsed_policy() {
+    let f = setup();
+    let holders = big_pool(&f, 2);
+    let bought = buy_n(&f, &holders, 3);
+    lapse(&f);
+
+    let swept = f.pool.expire_policies(&ids(&f.env, &bought));
+    assert_eq!(swept, ids(&f.env, &bought));
+    for id in &bought {
+        assert_eq!(f.pool.get_policy(id).unwrap().status, PolicyStatus::Expired);
+        assert!(!f.registry.get_policy(id).is_active);
+    }
+    assert_eq!(f.pool.pool_stats().total_coverage, 0);
+}
+
+#[test]
+fn expire_policies_skips_unknown_unexpired_and_claimed_ids() {
+    let f = setup_heavy();
+    let holders = big_pool(&f, 1);
+    let bought = buy_n(&f, &holders, 3);
+
+    // 0 gets claimed, then time passes; 3 is bought afterwards so it's
+    // still inside its window.
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&bought[0]);
+    lapse(&f);
+    let fresh = buy_n(&f, &holders, 1)[0];
+
+    let swept = f
+        .pool
+        .expire_policies(&ids(&f.env, &[bought[0], 404, fresh, bought[1], bought[2]]));
+    assert_eq!(swept, ids(&f.env, &[bought[1], bought[2]]));
+    assert_eq!(
+        f.pool.get_policy(&bought[0]).unwrap().status,
+        PolicyStatus::Claimed
+    );
+    assert_eq!(
+        f.pool.get_policy(&fresh).unwrap().status,
+        PolicyStatus::Active
+    );
+    assert_eq!(f.pool.pool_stats().total_coverage, 100 * ONE_USDC); // `fresh` only
+    assert!(f.registry.get_policy(&fresh).is_active);
+}
+
+#[test]
+fn expire_policies_sweeps_a_duplicate_id_once() {
+    let f = setup();
+    let holders = big_pool(&f, 1);
+    let bought = buy_n(&f, &holders, 2);
+    lapse(&f);
+
+    let from = f.env.events().all().len();
+    let swept = f
+        .pool
+        .expire_policies(&ids(&f.env, &[bought[0], bought[0], bought[1]]));
+    assert_eq!(swept, ids(&f.env, &bought));
+    assert_eq!(expire_events(&f, from).len(), 2);
+    assert_eq!(f.pool.pool_stats().total_coverage, 0);
+}
+
+#[test]
+fn expire_policies_matches_the_equivalent_run_of_single_calls() {
+    let f = setup_heavy();
+    let holders = big_pool(&f, 3);
+    let n = 6u64;
+    // Two identical sets: ids 0..n swept one by one, n..2n in one batch.
+    buy_n(&f, &holders, n);
+    buy_n(&f, &holders, n);
+    // Claim the 2nd policy of each set so both runs meet a non-Active id.
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&1);
+    f.pool.process_claim(&(n + 1));
+    lapse(&f);
+
+    let order = [3u64, 1, 0, 404, 3, 5, 2, 4];
+
+    let cov0 = f.pool.pool_stats().total_coverage;
+    let from = f.env.events().all().len();
+    for id in order {
+        let _ = f.pool.try_expire_policy(&id);
+    }
+    let single_events = expire_events(&f, from);
+    let cov1 = f.pool.pool_stats().total_coverage;
+
+    let from = f.env.events().all().len();
+    let mut batch = Vec::new(&f.env);
+    for id in order {
+        batch.push_back(if id == 404 { id } else { id + n });
+    }
+    let swept = f.pool.expire_policies(&batch);
+    let batch_events = expire_events(&f, from);
+    let cov2 = f.pool.pool_stats().total_coverage;
+
+    assert_eq!(cov0 - cov1, cov1 - cov2);
+    assert_eq!(cov2, 0);
+    assert_eq!(swept.len() as usize, single_events.len());
+    assert_eq!(single_events.len(), batch_events.len());
+    for ((h1, id1, t1), (h2, id2, t2)) in single_events.iter().zip(batch_events.iter()) {
+        assert_eq!(h1, h2);
+        assert_eq!(id1 + n, *id2);
+        assert_eq!(t1, t2);
+    }
+    for id in 0..2 * n {
+        assert!(!f.registry.get_policy(&id).is_active);
+    }
+}
+
+#[test]
+fn expire_policies_accepts_exactly_the_cap_and_rejects_one_more() {
+    let f = setup_heavy();
+    let holders = big_pool(&f, 4);
+    let bought = buy_n(&f, &holders, MAX_EXPIRE_BATCH as u64 + 1);
+    lapse(&f);
+
+    let mut over = Vec::new(&f.env);
+    for id in &bought {
+        over.push_back(*id);
+    }
+    let res = f.pool.try_expire_policies(&over);
+    assert_eq!(res, Err(Ok(PoolError::BatchTooLarge)));
+
+    let swept = f.pool.expire_policies(&over.slice(0..MAX_EXPIRE_BATCH));
+    assert_eq!(swept.len(), MAX_EXPIRE_BATCH);
+    // Every mirrored registry record was deactivated by the one batch call.
+    for id in &bought[..MAX_EXPIRE_BATCH as usize] {
+        assert!(!f.registry.get_policy(id).is_active);
+    }
+    assert!(
+        f.registry
+            .get_policy(&bought[MAX_EXPIRE_BATCH as usize])
+            .is_active
+    );
+}
+
+#[test]
+fn expire_batch_cap_never_exceeds_the_registry_batch_cap() {
+    // Otherwise a full pool batch would be rejected by the registry with
+    // BatchTooLarge and its records left active.
+    const { assert!(MAX_EXPIRE_BATCH <= refract_policy::MAX_DEACTIVATE_BATCH) };
+}
+
+#[test]
+fn expire_policies_of_nothing_touches_nothing() {
+    let f = setup();
+    let from = f.env.events().all().len();
+    assert_eq!(f.pool.expire_policies(&Vec::new(&f.env)).len(), 0);
+    assert_eq!(f.env.events().all().len(), from);
+}
+
+// ── Registry fallback for a registry without deactivate_policies ──────────────
+
+/// A registry as deployed before `deactivate_policies` existed: only the
+/// single-policy entrypoints. Records deactivations so tests can check the
+/// pool fell back to them.
+#[contract]
+pub struct LegacyRegistry;
+
+#[contractimpl]
+impl LegacyRegistry {
+    pub fn register_policy(_env: Env, _caller: Address, reg: PolicyRegistration) -> u64 {
+        reg.policy_id
+    }
+
+    pub fn deactivate_policy(env: Env, _caller: Address, policy_id: u64) {
+        let mut seen: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("seen"))
+            .unwrap_or(Vec::new(&env));
+        seen.push_back(policy_id);
+        env.storage().instance().set(&symbol_short!("seen"), &seen);
+    }
+
+    pub fn seen(env: Env) -> Vec<u64> {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("seen"))
+            .unwrap_or(Vec::new(&env))
+    }
+}
+
+#[test]
+fn expire_policies_falls_back_to_single_calls_on_a_legacy_registry() {
+    let f = setup();
+    let legacy_id = f.env.register_contract(None, LegacyRegistry);
+    let legacy = LegacyRegistryClient::new(&f.env, &legacy_id);
+    f.pool.set_policy_registry(&f.admin, &legacy_id);
+
+    let holders = big_pool(&f, 1);
+    let bought = buy_n(&f, &holders, 3);
+    lapse(&f);
+
+    let swept = f.pool.expire_policies(&ids(&f.env, &bought));
+    assert_eq!(swept.len(), 3);
+    assert_eq!(legacy.seen(), ids(&f.env, &bought));
+}
+
+#[test]
+fn expire_policies_never_reverts_on_a_registry_error() {
+    let f = setup();
+    let holders = big_pool(&f, 1);
+    let bought = buy_n(&f, &holders, 2);
+    // The registry stops trusting this pool: its batch call now fails with
+    // a typed Unauthorized error, which must not block the sweep.
+    let other_pool = Address::generate(&f.env);
+    f.registry.set_pool_contract(&f.admin, &other_pool);
+    lapse(&f);
+
+    let swept = f.pool.expire_policies(&ids(&f.env, &bought));
+    assert_eq!(swept, ids(&f.env, &bought));
+    assert_eq!(f.pool.pool_stats().total_coverage, 0);
+    assert!(f.registry.get_policy(&bought[0]).is_active);
+}
+
+// ── Chunked user_policies index ───────────────────────────────────────────────
+
+/// Append ids straight into `holder`'s index (bypassing buy_policy, which
+/// would need a funded purchase per id).
+fn append_raw(f: &Fixture, holder: &Address, ids: impl IntoIterator<Item = u64>) {
+    f.env.as_contract(&f.pool.address, || {
+        for id in ids {
+            RefractPool::_append_user_policy(&f.env, holder, id);
+        }
+    });
+}
+
+fn seed_legacy(f: &Fixture, holder: &Address, len: u64) {
+    f.env.as_contract(&f.pool.address, || {
+        let mut legacy = Vec::new(&f.env);
+        for id in 0..len {
+            legacy.push_back(id);
+        }
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::UserPolicies(holder.clone()), &legacy);
+    });
+}
+
+fn range(env: &Env, r: core::ops::Range<u64>) -> Vec<u64> {
+    let mut v = Vec::new(env);
+    for id in r {
+        v.push_back(id);
+    }
+    v
+}
+
+#[test]
+fn user_policies_are_returned_in_purchase_order_below_the_first_chunk() {
+    let f = setup();
+    let holders = big_pool(&f, 1);
+    let bought = buy_n(&f, &holders, 3);
+    assert_eq!(f.pool.user_policies(&holders[0]), ids(&f.env, &bought));
+    assert_eq!(f.pool.user_policy_count(&holders[0]), 3);
+    assert_eq!(
+        f.pool.user_policy_chunk(&holders[0], &0),
+        ids(&f.env, &bought)
+    );
+}
+
+#[test]
+fn user_policies_append_across_a_chunk_boundary_in_order() {
+    let f = setup_heavy();
+    let holder = Address::generate(&f.env);
+    let n = INDEX_CHUNK_SIZE as u64 + 3;
+    append_raw(&f, &holder, 0..n);
+
+    let expected = range(&f.env, 0..n);
+    assert_eq!(f.pool.user_policies(&holder), expected);
+    assert_eq!(f.pool.user_policy_count(&holder), n as u32);
+    assert_eq!(
+        f.pool.user_policy_chunk(&holder, &0),
+        expected.slice(0..INDEX_CHUNK_SIZE)
+    );
+    assert_eq!(
+        f.pool.user_policy_chunk(&holder, &1),
+        expected.slice(INDEX_CHUNK_SIZE..)
+    );
+}
+
+#[test]
+fn user_policies_past_max_read_chunks_is_a_typed_error() {
+    let f = setup();
+    let holder = Address::generate(&f.env);
+    f.env.as_contract(&f.pool.address, || {
+        f.env.storage().persistent().set(
+            &DataKey::UserPolicyIndex(holder.clone()),
+            &IndexHeader {
+                chunk_count: MAX_READ_CHUNKS + 1,
+                tail_len: 1,
+                legacy_cursor: None,
+            },
+        );
+    });
+    let res = f.pool.try_user_policies(&holder);
+    assert_eq!(res, Err(Ok(PoolError::IndexTooLarge)));
+}
+
+fn check_migration(len: u64, step: u32) {
+    let f = setup_heavy();
+    let holder = Address::generate(&f.env);
+    seed_legacy(&f, &holder, len);
+    let expected = range(&f.env, 0..len);
+    assert_eq!(f.pool.user_policies(&holder), expected);
+
+    while f.pool.migrate_user_policies(&holder, &step) > 0 {
+        assert_eq!(f.pool.user_policies(&holder), expected);
+        assert_eq!(f.pool.user_policy_count(&holder), len as u32);
+    }
+    assert_eq!(f.pool.user_policies(&holder), expected);
+    f.env.as_contract(&f.pool.address, || {
+        assert!(!f
+            .env
+            .storage()
+            .persistent()
+            .has(&DataKey::UserPolicies(holder.clone())));
+    });
+    assert_eq!(f.pool.migrate_user_policies(&holder, &step), 0);
+}
+
+#[test]
+fn migration_converts_legacy_vectors_of_every_boundary_length() {
+    let c = INDEX_CHUNK_SIZE as u64;
+    for len in [0, 1, c, c + 5] {
+        check_migration(len, u32::MAX);
+        check_migration(len, 50);
+    }
+}
+
+#[test]
+fn purchases_mid_migration_keep_their_order() {
+    let f = setup_heavy();
+    let holder = Address::generate(&f.env);
+    seed_legacy(&f, &holder, 300);
+
+    assert!(f.pool.migrate_user_policies(&holder, &100) > 0);
+    append_raw(&f, &holder, [300]);
+    while f.pool.migrate_user_policies(&holder, &100) > 0 {}
+    append_raw(&f, &holder, [301]);
+
+    assert_eq!(f.pool.user_policies(&holder), range(&f.env, 0..302));
+}
+
+#[test]
+fn buy_policy_append_cost_does_not_grow_with_history() {
+    let f = setup_heavy();
+    let holders = big_pool(&f, 1);
+    // Give the holder a long history first, so the purchase below appends
+    // after 2 full chunks in both contracts' indexes.
+    let prior = 2 * INDEX_CHUNK_SIZE as u64;
+    append_raw(&f, &holders[0], 1_000..1_000 + prior);
+    let params = PolicyParams {
+        coverage_amount: 100 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let (_, first) = crate::bench::measure(&f.env, || {
+        f.pool.buy_policy(&funded(&f, 1_000 * ONE_USDC), &params)
+    });
+    let (_, late) = crate::bench::measure(&f.env, || f.pool.buy_policy(&holders[0], &params));
+    // The late append opens a fresh chunk instead of rewriting 256 ids.
+    assert!(
+        late.write_bytes <= first.write_bytes + 200,
+        "{first:?} {late:?}"
+    );
+}
+
+mod properties {
+    use super::*;
+    use ::proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        /// Appending a random number of ids — some before a partial
+        /// migration of a random legacy prefix — reconstructs exactly the
+        /// plain reference vector.
+        #[test]
+        fn chunked_user_policies_match_a_reference_vector(
+            legacy in 0u64..200,
+            migrate_step in 1u32..300,
+            appended in 0u64..300,
+        ) {
+            let f = setup_heavy();
+            let holder = Address::generate(&f.env);
+            seed_legacy(&f, &holder, legacy);
+            f.pool.migrate_user_policies(&holder, &migrate_step);
+            append_raw(&f, &holder, legacy..legacy + appended);
+            prop_assert_eq!(
+                f.pool.user_policies(&holder),
+                range(&f.env, 0..legacy + appended)
+            );
+            while f.pool.migrate_user_policies(&holder, &migrate_step) > 0 {}
+            append_raw(&f, &holder, [legacy + appended]);
+            prop_assert_eq!(
+                f.pool.user_policies(&holder),
+                range(&f.env, 0..legacy + appended + 1)
+            );
+            prop_assert_eq!(f.pool.user_policy_count(&holder) as u64, legacy + appended + 1);
+        }
+    }
 }
