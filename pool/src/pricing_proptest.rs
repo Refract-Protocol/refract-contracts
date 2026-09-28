@@ -19,6 +19,7 @@ fn config() -> PoolConfig {
         min_coverage: 0,
         max_coverage: i128::MAX / (PRECISION * 400), // headroom for _calc_premium's math
         lockup_days: 7,
+        dual_confirmation_threshold: 0, // disabled for property tests
     }
 }
 
