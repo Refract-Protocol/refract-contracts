@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
-    IntoVal, Symbol, Vec,
+    IntoVal, Symbol, Val, Vec,
 };
 
 const PRECISION: i128 = 10_000_000i128;
@@ -75,6 +75,7 @@ pub enum DataKey {
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
     LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    Settled(u64),             // claimed/expired policy id → SettledPolicy (replaces Policy(id))
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -118,7 +119,7 @@ pub enum PolicyStatus {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Policy {
     pub id: u64,
     pub holder: Address,
@@ -131,6 +132,27 @@ pub struct Policy {
     pub status: PolicyStatus,
     pub payout_at: Option<u64>,
 }
+
+/// What a policy is stored as once it's claimed or expired. Nothing about a
+/// settled policy can change again, so there's no reason to keep paying
+/// rent on the full map-shaped `Policy` forever: this is a plain tuple
+/// (no field-name symbols), the id lives in the `DataKey::Settled(id)` key
+/// rather than being repeated in the value, `status` is implied by
+/// `payout_at` (only a claim sets it), and the coverage type uses the
+/// registry's u32 encoding instead of a symbol. `_load_policy` turns it
+/// back into the exact `Policy` it was compacted from.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+struct SettledPolicy(
+    Address,              // holder
+    RegistryCoverageType, // coverage_type
+    i128,                 // coverage_amount
+    i128,                 // premium_paid
+    i128,                 // trigger_threshold
+    u64,                  // start_time
+    u64,                  // end_time
+    Option<u64>,          // payout_at: Some => Claimed, None => Expired
+);
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -254,11 +276,11 @@ impl RefractPool {
             .instance()
             .get(&DataKey::TotalShares)
             .unwrap_or(0);
-        let mut user_shares: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Shares(provider.clone()))
-            .unwrap_or(0);
+        // Storage calls serialise a DataKey into a host key every time
+        // they're handed one, so convert once and reuse the Val for the
+        // paired read and write below.
+        let shares_key: Val = DataKey::Shares(provider.clone()).into_val(&env);
+        let mut user_shares: i128 = env.storage().persistent().get(&shares_key).unwrap_or(0);
 
         total_capital += amount;
         total_shares += shares;
@@ -270,9 +292,7 @@ impl RefractPool {
         env.storage()
             .instance()
             .set(&DataKey::TotalShares, &total_shares);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Shares(provider.clone()), &user_shares);
+        env.storage().persistent().set(&shares_key, &user_shares);
 
         // Resets the lockup clock on every deposit, including top-ups —
         // simpler than tracking per-deposit tranches, at the cost of a
@@ -313,11 +333,10 @@ impl RefractPool {
             return Err(PoolError::ZeroAmount);
         }
 
-        let user_shares: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Shares(provider.clone()))
-            .unwrap_or(0);
+        // Built once for the read here and the write further down (see
+        // provide_capital).
+        let shares_key: Val = DataKey::Shares(provider.clone()).into_val(&env);
+        let user_shares: i128 = env.storage().persistent().get(&shares_key).unwrap_or(0);
         if user_shares < shares {
             return Err(PoolError::InsufficientShares);
         }
@@ -354,7 +373,7 @@ impl RefractPool {
             .set(&DataKey::TotalShares, &(total_shares - shares));
         env.storage()
             .persistent()
-            .set(&DataKey::Shares(provider.clone()), &(user_shares - shares));
+            .set(&shares_key, &(user_shares - shares));
 
         let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc).transfer(
@@ -513,15 +532,7 @@ impl RefractPool {
     /// Process a payout when the trigger condition is verified by oracle.
     /// Anyone can call this once the oracle confirms the trigger.
     pub fn process_claim(env: Env, policy_id: u64) -> Result<i128, PoolError> {
-        let mut policy: Policy = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Policy(policy_id))
-            .ok_or(PoolError::PolicyNotFound)?;
-
-        if policy.status != PolicyStatus::Active {
-            return Err(PoolError::AlreadyClaimed);
-        }
+        let mut policy = Self::_load_active_policy(&env, policy_id)?;
 
         let now = env.ledger().timestamp();
         if now > policy.end_time {
@@ -560,9 +571,7 @@ impl RefractPool {
         let payout = policy.coverage_amount;
         policy.status = PolicyStatus::Claimed;
         policy.payout_at = Some(now);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Policy(policy_id), &policy);
+        Self::_settle(&env, &policy);
 
         // Reduce pool capital
         let mut total_cap: i128 = env
@@ -615,15 +624,7 @@ impl RefractPool {
     /// was bought; only the *coverage* obligation (and the utilization it
     /// consumes) ends, freeing room for new policies.
     pub fn expire_policy(env: Env, policy_id: u64) -> Result<(), PoolError> {
-        let mut policy: Policy = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Policy(policy_id))
-            .ok_or(PoolError::PolicyNotFound)?;
-
-        if policy.status != PolicyStatus::Active {
-            return Err(PoolError::AlreadyClaimed);
-        }
+        let mut policy = Self::_load_active_policy(&env, policy_id)?;
 
         let now = env.ledger().timestamp();
         if now <= policy.end_time {
@@ -631,9 +632,7 @@ impl RefractPool {
         }
 
         policy.status = PolicyStatus::Expired;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Policy(policy_id), &policy);
+        Self::_settle(&env, &policy);
 
         let mut total_cov: i128 = env
             .storage()
@@ -779,8 +778,11 @@ impl RefractPool {
         }
     }
 
+    /// Active and settled policies alike — a settled one is rebuilt from
+    /// its compact record (see `SettledPolicy`), so callers can't tell the
+    /// difference.
     pub fn get_policy(env: Env, id: u64) -> Option<Policy> {
-        env.storage().persistent().get(&DataKey::Policy(id))
+        Self::_load_policy(&env, id)
     }
 
     /// Batch-fetch multiple policies by id in one call — e.g. every id from
@@ -792,11 +794,7 @@ impl RefractPool {
     pub fn get_policies(env: Env, ids: Vec<u64>) -> Vec<Policy> {
         let mut out = Vec::new(&env);
         for id in ids.iter() {
-            if let Some(policy) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, Policy>(&DataKey::Policy(id))
-            {
+            if let Some(policy) = Self::_load_policy(&env, id) {
                 out.push_back(policy);
             }
         }
@@ -880,6 +878,88 @@ impl RefractPool {
     /// `try_invoke_contract` (rather than `invoke_contract`, which panics on
     /// any callee failure) specifically so registry issues can't roll back
     /// funds that already moved.
+    fn _from_registry_coverage_type(t: RegistryCoverageType) -> CoverageType {
+        match t {
+            RegistryCoverageType::StablecoinDepeg => CoverageType::StablecoinDepeg,
+            RegistryCoverageType::MarketCrash => CoverageType::MarketCrash,
+            RegistryCoverageType::LiquidationShield => CoverageType::LiquidationShield,
+            RegistryCoverageType::SmartContractRisk => CoverageType::SmartContractRisk,
+            RegistryCoverageType::FlightDelay => CoverageType::FlightDelay,
+        }
+    }
+
+    /// Replace a just-settled (Claimed/Expired) policy's full record with
+    /// its compact `SettledPolicy` form. One-way: nothing ever writes
+    /// `DataKey::Policy` again for this id (buy_policy only takes fresh ids
+    /// from NextPolicyId), and `_load_active_policy` refuses settled ids,
+    /// so a settled policy can't come back as Active.
+    fn _settle(env: &Env, policy: &Policy) {
+        debug_assert!(policy.status != PolicyStatus::Active);
+        let settled = SettledPolicy(
+            policy.holder.clone(),
+            Self::_to_registry_coverage_type(&policy.coverage_type),
+            policy.coverage_amount,
+            policy.premium_paid,
+            policy.trigger_threshold,
+            policy.start_time,
+            policy.end_time,
+            policy.payout_at,
+        );
+        let storage = env.storage().persistent();
+        storage.set(&DataKey::Settled(policy.id), &settled);
+        storage.remove(&DataKey::Policy(policy.id));
+    }
+
+    /// The one place both read entrypoints (get_policy/get_policies) resolve
+    /// an id, so the active and settled key spaces can't be consulted
+    /// differently by each. Active policies are checked first — that's
+    /// also the only lookup the claim/expire paths need on success.
+    fn _load_policy(env: &Env, id: u64) -> Option<Policy> {
+        let storage = env.storage().persistent();
+        if let Some(policy) = storage.get(&DataKey::Policy(id)) {
+            return Some(policy);
+        }
+        let SettledPolicy(
+            holder,
+            coverage_type,
+            coverage_amount,
+            premium_paid,
+            trigger_threshold,
+            start_time,
+            end_time,
+            payout_at,
+        ) = storage.get(&DataKey::Settled(id))?;
+        Some(Policy {
+            id,
+            holder,
+            coverage_type: Self::_from_registry_coverage_type(coverage_type),
+            coverage_amount,
+            premium_paid,
+            trigger_threshold,
+            start_time,
+            end_time,
+            status: if payout_at.is_some() {
+                PolicyStatus::Claimed
+            } else {
+                PolicyStatus::Expired
+            },
+            payout_at,
+        })
+    }
+
+    /// Shared by process_claim() and expire_policy(): the policy if it's
+    /// still Active, AlreadyClaimed if it has been settled (claimed or
+    /// expired), PolicyNotFound if the id was never issued.
+    fn _load_active_policy(env: &Env, id: u64) -> Result<Policy, PoolError> {
+        let storage = env.storage().persistent();
+        match storage.get::<DataKey, Policy>(&DataKey::Policy(id)) {
+            Some(policy) if policy.status == PolicyStatus::Active => Ok(policy),
+            Some(_) => Err(PoolError::AlreadyClaimed),
+            None if storage.has(&DataKey::Settled(id)) => Err(PoolError::AlreadyClaimed),
+            None => Err(PoolError::PolicyNotFound),
+        }
+    }
+
     fn _deactivate_in_registry(env: &Env, policy_id: u64) {
         let registry_addr: Option<Address> = env.storage().instance().get(&DataKey::PolicyRegistry);
         let Some(registry_addr) = registry_addr else {

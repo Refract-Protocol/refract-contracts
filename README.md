@@ -39,6 +39,21 @@ cargo build --target wasm32-unknown-unknown --release   # optimized wasm
 
 The release `.wasm` artifacts land in `target/wasm32-unknown-unknown/release/`.
 
+### Wasm size budgets
+
+CI fails a build if any contract's release wasm grows past its byte budget in [`wasm-budgets.json`](./wasm-budgets.json). Wasm size sets the deploy fee and adds to the cost of every invocation, since the VM parses the module each time. The job posts a per-contract table (size, budget, headroom, change vs. the base branch) to the workflow run's summary.
+
+Sizes vary between compiler versions, so budgets only apply to builds from the toolchain pinned in that file. To check locally:
+
+```bash
+rustup toolchain install "$(jq -r .toolchain wasm-budgets.json)" --target wasm32-unknown-unknown
+RUSTUP_TOOLCHAIN="$(jq -r .toolchain wasm-budgets.json)" \
+  python3 scripts/wasm_size.py measure --target-dir target/size --out sizes.json
+python3 scripts/wasm_size.py check --sizes sizes.json
+```
+
+If a change grows a binary on purpose, raise that contract's budget in the same PR. The CI summary flags any budget that differs from the base branch, so reviewers see the increase.
+
 ## Deploy (testnet)
 
 Deploy in dependency order — the oracle first, then the pool, then the registry:

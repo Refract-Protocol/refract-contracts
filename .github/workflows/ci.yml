@@ -36,3 +36,54 @@ jobs:
 
       - name: Build optimized wasm
         run: cargo build --target wasm32-unknown-unknown --release
+
+  wasm-size:
+    name: wasm size budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sizes shift between compiler versions, so budgets are recorded
+      # against one pinned toolchain (see wasm-budgets.json) rather than
+      # whatever `stable` resolves to on the day.
+      - name: Read pinned toolchain
+        id: pin
+        run: echo "toolchain=$(jq -r .toolchain wasm-budgets.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.toolchain }}
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Measure wasm sizes
+        run: python3 scripts/wasm_size.py measure --out "$RUNNER_TEMP/sizes.json"
+
+      # Built with this PR's script and the same pinned toolchain, so the
+      # delta compares like with like even if the base branch predates the
+      # script. Separate target dir: cargo's freshness check for workspace
+      # members ignores their path, so a shared one could hand back this
+      # PR's artifacts as the base's.
+      - name: Measure base branch
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+          git worktree add "$RUNNER_TEMP/base" "${{ github.event.pull_request.base.sha }}"
+          python3 scripts/wasm_size.py measure \
+            --manifest-path "$RUNNER_TEMP/base/Cargo.toml" \
+            --target-dir target/base \
+            --out "$RUNNER_TEMP/base-sizes.json"
+          if [ -f "$RUNNER_TEMP/base/wasm-budgets.json" ]; then
+            cp "$RUNNER_TEMP/base/wasm-budgets.json" "$RUNNER_TEMP/base-budgets.json"
+          fi
+
+      - name: Check budgets
+        run: |
+          args=(--sizes "$RUNNER_TEMP/sizes.json")
+          [ -f "$RUNNER_TEMP/base-sizes.json" ] && args+=(--base-sizes "$RUNNER_TEMP/base-sizes.json")
+          [ -f "$RUNNER_TEMP/base-budgets.json" ] && args+=(--base-budgets "$RUNNER_TEMP/base-budgets.json")
+          python3 scripts/wasm_size.py check "${args[@]}"

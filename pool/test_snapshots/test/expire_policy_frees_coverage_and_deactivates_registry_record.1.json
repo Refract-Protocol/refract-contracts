@@ -421,7 +421,52 @@
             "key": {
               "vec": [
                 {
-                  "symbol": "Policy"
+                  "symbol": "LastDeposit"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "LastDeposit"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "u64": 0
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          4095
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "Settled"
                 },
                 {
                   "u64": 0
@@ -441,7 +486,7 @@
                 "key": {
                   "vec": [
                     {
-                      "symbol": "Policy"
+                      "symbol": "Settled"
                     },
                     {
                       "u64": 0
@@ -450,102 +495,38 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "map": [
+                  "vec": [
                     {
-                      "key": {
-                        "symbol": "coverage_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 5000000000
-                        }
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                    },
+                    {
+                      "u32": 0
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 5000000000
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "coverage_type"
-                      },
-                      "val": {
-                        "vec": [
-                          {
-                            "symbol": "StablecoinDepeg"
-                          }
-                        ]
+                      "i128": {
+                        "hi": 0,
+                        "lo": 12328755
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "end_time"
-                      },
-                      "val": {
-                        "u64": 2592000
+                      "i128": {
+                        "hi": 0,
+                        "lo": 500
                       }
                     },
                     {
-                      "key": {
-                        "symbol": "holder"
-                      },
-                      "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                      }
+                      "u64": 0
                     },
                     {
-                      "key": {
-                        "symbol": "id"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
+                      "u64": 2592000
                     },
-                    {
-                      "key": {
-                        "symbol": "payout_at"
-                      },
-                      "val": "void"
-                    },
-                    {
-                      "key": {
-                        "symbol": "premium_paid"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 12328755
-                        }
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "start_time"
-                      },
-                      "val": {
-                        "u64": 0
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "status"
-                      },
-                      "val": {
-                        "vec": [
-                          {
-                            "symbol": "Expired"
-                          }
-                        ]
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "trigger_threshold"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 500
-                        }
-                      }
-                    }
+                    "void"
                   ]
                 }
               }
@@ -1052,6 +1033,18 @@
                       "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                     },
                     "storage": [
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "ActivePolicies"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": 0
+                        }
+                      },
                       {
                         "key": {
                           "vec": [
@@ -2585,6 +2578,17 @@
                 },
                 {
                   "key": {
+                    "symbol": "available_capacity"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 3009863004
+                    }
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "share_price"
                   },
                   "val": {
@@ -3106,6 +3110,17 @@
                   },
                   "val": {
                     "u32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "available_capacity"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 8009863004
+                    }
                   }
                 },
                 {

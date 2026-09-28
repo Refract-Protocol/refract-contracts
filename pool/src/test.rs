@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
@@ -1067,4 +1069,328 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     // larger than the entire pool holds (see _quote_withdrawal).
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}
+
+/// CPU instructions for one call, measured from an empty ledger footprint.
+/// The test host otherwise accumulates a single footprint over the whole
+/// env and copies it on every insert, which would make the number depend
+/// on how much setup ran first rather than on the call itself.
+fn cpu_cost_of<R>(env: &Env, call: impl FnOnce() -> R) -> u64 {
+    env.host()
+        .with_mut_storage(|s| {
+            s.footprint = Default::default();
+            Ok(())
+        })
+        .unwrap();
+    env.budget().reset_default();
+    call();
+    let cost = env.budget().cpu_instruction_cost();
+    env.budget().reset_unlimited();
+    cost
+}
+
+/// (first deposit, top-up deposit, withdrawal) CPU instruction counts for
+/// one provider.
+fn capital_path_costs() -> (u64, u64, u64) {
+    let f = setup();
+    f.env.budget().reset_unlimited();
+    let lp = funded(&f, 20_000 * ONE_USDC);
+    let first = cpu_cost_of(&f.env, || f.pool.provide_capital(&lp, &(10_000 * ONE_USDC)));
+    let top_up = cpu_cost_of(&f.env, || f.pool.provide_capital(&lp, &(10_000 * ONE_USDC)));
+    past_lockup(&f);
+    let withdraw = cpu_cost_of(&f.env, || f.pool.withdraw_capital(&lp, &(5_000 * ONE_USDC)));
+    (first, top_up, withdraw)
+}
+
+// Recorded with the Shares key built once per call (host-side
+// instructions; the contract's own Rust runs natively in these tests and
+// isn't metered). Deterministic for the soroban-env-host version pinned in
+// Cargo.lock, so any growth is a real regression on these paths. If a
+// change legitimately costs more, re-record these in the same PR.
+const PROVIDE_CAPITAL_FIRST_CPU: u64 = 362_822;
+const PROVIDE_CAPITAL_TOP_UP_CPU: u64 = 371_318;
+const WITHDRAW_CAPITAL_CPU: u64 = 394_222;
+
+#[test]
+fn capital_paths_stay_within_their_recorded_cpu_baselines() {
+    let (first, top_up, withdraw) = capital_path_costs();
+    assert!(
+        first <= PROVIDE_CAPITAL_FIRST_CPU,
+        "provide_capital (first deposit) cost {first} insns, baseline {PROVIDE_CAPITAL_FIRST_CPU}"
+    );
+    assert!(
+        top_up <= PROVIDE_CAPITAL_TOP_UP_CPU,
+        "provide_capital (top-up) cost {top_up} insns, baseline {PROVIDE_CAPITAL_TOP_UP_CPU}"
+    );
+    assert!(
+        withdraw <= WITHDRAW_CAPITAL_CPU,
+        "withdraw_capital cost {withdraw} insns, baseline {WITHDRAW_CAPITAL_CPU}"
+    );
+}
+
+#[test]
+fn deposit_then_withdraw_emits_exactly_the_expected_pool_events() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+    past_lockup(&f);
+    let out = f.pool.withdraw_capital(&lp, &shares);
+
+    // The token transfers emit their own events from the USDC contract;
+    // only the pool's stream is under test here.
+    let mut pool_events = Vec::new(&f.env);
+    for e in f.env.events().all().iter() {
+        if e.0 == f.pool.address {
+            pool_events.push_back(e);
+        }
+    }
+
+    let expected = Vec::from_array(
+        &f.env,
+        [
+            (
+                f.pool.address.clone(),
+                (symbol_short!("INIT"),).into_val(&f.env),
+                (f.admin.clone(),).into_val(&f.env),
+            ),
+            (
+                f.pool.address.clone(),
+                (symbol_short!("PROVIDE"), lp.clone()).into_val(&f.env),
+                (10_000 * ONE_USDC, shares).into_val(&f.env),
+            ),
+            (
+                f.pool.address.clone(),
+                (symbol_short!("WITHDRAW"), lp.clone()).into_val(&f.env),
+                (shares, out).into_val(&f.env),
+            ),
+        ],
+    );
+    assert_eq!(pool_events, expected);
+}
+
+// ── Settled-policy compaction ────────────────────────────────────────────────
+
+fn depeg_params(coverage_amount: i128) -> PolicyParams {
+    PolicyParams {
+        coverage_amount,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    }
+}
+
+fn is_stored_in_full(f: &Fixture, id: u64) -> bool {
+    f.env.as_contract(&f.pool.address, || {
+        f.env.storage().persistent().has(&DataKey::Policy(id))
+    })
+}
+
+fn is_stored_compacted(f: &Fixture, id: u64) -> bool {
+    f.env.as_contract(&f.pool.address, || {
+        f.env.storage().persistent().has(&DataKey::Settled(id))
+    })
+}
+
+#[test]
+fn a_claimed_policy_reads_back_identically_after_compaction() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let id = f.pool.buy_policy(&holder, &depeg_params(1_000 * ONE_USDC));
+    let active = f.pool.get_policy(&id).unwrap();
+
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&id);
+
+    assert!(!is_stored_in_full(&f, id));
+    assert!(is_stored_compacted(&f, id));
+    // Exactly what the full record would have held after the claim.
+    let expected = Policy {
+        status: PolicyStatus::Claimed,
+        payout_at: Some(f.env.ledger().timestamp()),
+        ..active
+    };
+    assert_eq!(f.pool.get_policy(&id), Some(expected));
+}
+
+#[test]
+fn an_expired_policy_reads_back_identically_after_compaction() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let id = f.pool.buy_policy(&holder, &depeg_params(500 * ONE_USDC));
+    let active = f.pool.get_policy(&id).unwrap();
+
+    f.env.ledger().with_mut(|li| li.timestamp += 31 * 86_400);
+    f.pool.expire_policy(&id);
+
+    assert!(!is_stored_in_full(&f, id));
+    assert!(is_stored_compacted(&f, id));
+    let expected = Policy {
+        status: PolicyStatus::Expired,
+        ..active
+    };
+    assert_eq!(f.pool.get_policy(&id), Some(expected));
+}
+
+#[test]
+fn compaction_round_trips_every_coverage_type_and_settled_status() {
+    let f = setup();
+    let holder = Address::generate(&f.env);
+    let types = [
+        CoverageType::StablecoinDepeg,
+        CoverageType::MarketCrash,
+        CoverageType::LiquidationShield,
+        CoverageType::SmartContractRisk,
+        CoverageType::FlightDelay,
+    ];
+    let mut id = 1_000u64;
+    for coverage_type in types {
+        for payout_at in [Some(1_234_567u64), None] {
+            let policy = Policy {
+                id,
+                holder: holder.clone(),
+                coverage_type: coverage_type.clone(),
+                coverage_amount: 4_321 * ONE_USDC,
+                premium_paid: 12 * ONE_USDC + 3,
+                trigger_threshold: 2_500,
+                start_time: 1_000,
+                end_time: 2_000,
+                status: if payout_at.is_some() {
+                    PolicyStatus::Claimed
+                } else {
+                    PolicyStatus::Expired
+                },
+                payout_at,
+            };
+            let loaded = f.env.as_contract(&f.pool.address, || {
+                RefractPool::_settle(&f.env, &policy);
+                RefractPool::_load_policy(&f.env, id)
+            });
+            assert_eq!(loaded, Some(policy));
+            id += 1;
+        }
+    }
+}
+
+#[test]
+fn claiming_an_already_claimed_policy_still_returns_already_claimed() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let id = f.pool.buy_policy(&holder, &depeg_params(1_000 * ONE_USDC));
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&id);
+    assert!(is_stored_compacted(&f, id));
+
+    // Not PolicyNotFound: the id exists, it's just settled.
+    assert_eq!(
+        f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::AlreadyClaimed))
+    );
+    f.env.ledger().with_mut(|li| li.timestamp += 31 * 86_400);
+    assert_eq!(
+        f.pool.try_expire_policy(&id),
+        Err(Ok(PoolError::AlreadyClaimed))
+    );
+}
+
+#[test]
+fn an_expired_policy_can_be_neither_claimed_nor_expired_again() {
+    let f = setup();
+    let lp = funded(&f, 1_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let id = f.pool.buy_policy(&holder, &depeg_params(500 * ONE_USDC));
+    f.env.ledger().with_mut(|li| li.timestamp += 31 * 86_400);
+    f.pool.expire_policy(&id);
+
+    // A fresh depeg reading must not revive the settled policy.
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    assert_eq!(
+        f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::AlreadyClaimed))
+    );
+    assert_eq!(
+        f.pool.try_expire_policy(&id),
+        Err(Ok(PoolError::AlreadyClaimed))
+    );
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Expired
+    );
+}
+
+#[test]
+fn get_policies_returns_active_and_settled_policies_together() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let claimed = f.pool.buy_policy(&holder, &depeg_params(1_000 * ONE_USDC));
+    let active = f.pool.buy_policy(&holder, &depeg_params(2_000 * ONE_USDC));
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&claimed);
+
+    let policies = f.pool.get_policies(&f.pool.user_policies(&holder));
+    assert_eq!(policies.len(), 2);
+    assert_eq!(policies.get(0), f.pool.get_policy(&claimed));
+    assert_eq!(policies.get(1), f.pool.get_policy(&active));
+    assert_eq!(policies.get(0).unwrap().status, PolicyStatus::Claimed);
+    assert_eq!(policies.get(1).unwrap().status, PolicyStatus::Active);
+}
+
+#[test]
+fn a_settled_policy_takes_less_than_half_the_storage_of_the_full_record() {
+    use soroban_sdk::xdr::ToXdr;
+
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let id = f.pool.buy_policy(&holder, &depeg_params(1_000 * ONE_USDC));
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+    f.pool.process_claim(&id);
+
+    // What the old code kept for this policy vs what's stored now. The keys
+    // (Policy(id) / Settled(id)) serialise to the same size, so rent — which
+    // scales with entry size — drops by the difference in the values.
+    let full = f.pool.get_policy(&id).unwrap().to_xdr(&f.env).len();
+    let compact: SettledPolicy = f.env.as_contract(&f.pool.address, || {
+        f.env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settled(id))
+            .unwrap()
+    });
+    let compact = compact.to_xdr(&f.env).len();
+    std::println!("settled policy value: {full} bytes in full, {compact} bytes compacted");
+    assert!(
+        compact * 2 < full,
+        "{compact} bytes compacted vs {full} in full"
+    );
 }

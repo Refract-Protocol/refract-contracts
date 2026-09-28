@@ -12,6 +12,12 @@ use soroban_sdk::{
 /// Maximum oracle staleness in seconds (30 minutes).
 const MAX_STALENESS_SECS: u64 = 1_800;
 
+/// Upper bound on how many feeds one `list_feeds` call will look up. Each
+/// feed is its own persistent ledger entry, so an unbounded input would let
+/// a single call blow through the transaction's read-entry limit instead of
+/// failing fast with a typed error.
+pub const MAX_LIST_FEEDS: u32 = 25;
+
 /// Fixed-point scale for value readings (1e7). All prices/percentages are
 /// stored as `value * 1e7` so the contract never touches floating point.
 const SCALE: i128 = 10_000_000;
@@ -40,6 +46,7 @@ pub enum OracleError {
     UnknownCoverageType = 6,
     FutureTimestamp = 7,
     StaleSubmission = 8, // older than the reading already stored for this feed
+    TooManyFeeds = 9,    // list_feeds called with more than MAX_LIST_FEEDS ids
 }
 
 /// Oracle reading stored on-chain.
@@ -55,11 +62,29 @@ pub struct OracleReading {
     pub source: Symbol,
 }
 
+/// What's actually stored under `DataKey::Reading`. `OracleReading` is the
+/// public shape `get_reading` returns, but as a `#[contracttype]` struct it
+/// serialises as a map keyed by field-name symbols; this tuple form carries
+/// the same three values as a plain vector, so the entry every `submit`
+/// reads and rewrites is smaller and cheaper to decode. The timestamp sits
+/// first because it's the one field `submit` and `list_feeds` actually use.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+struct StoredReading(u64, i128, Symbol); // (timestamp, value, source)
+
 #[contracttype]
 pub enum DataKey {
     Admin,
+    /// Persistent `Vec<Address>` of registered relayers, kept purely so
+    /// `list_relayers` can enumerate them. Authorisation never reads it —
+    /// see `Relayer`.
     Relayers,
-    Reading(Symbol), // feed_id → OracleReading
+    /// Persistent membership marker: present iff the address is in
+    /// `Relayers`. `add_relayer`/`remove_relayer` write both in the same
+    /// invocation so they can never disagree, and `submit` checks this one
+    /// entry instead of scanning the list.
+    Relayer(Address),
+    Reading(Symbol), // feed_id → StoredReading
 }
 
 #[contract]
@@ -74,9 +99,6 @@ impl RefractOracle {
             return Err(OracleError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::Relayers, &Vec::<Address>::new(&env));
         Ok(())
     }
 
@@ -84,40 +106,40 @@ impl RefractOracle {
 
     pub fn add_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
-        let mut relayers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Relayers)
-            .unwrap_or_else(|| Vec::new(&env));
-        if !relayers.iter().any(|r| r == relayer) {
-            relayers.push_back(relayer.clone());
-            env.storage().instance().set(&DataKey::Relayers, &relayers);
-            env.events()
-                .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
+        let marker = DataKey::Relayer(relayer.clone());
+        if env.storage().persistent().has(&marker) {
+            return Ok(());
         }
+        env.storage().persistent().set(&marker, &());
+        let mut relayers = Self::list_relayers(env.clone());
+        relayers.push_back(relayer.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Relayers, &relayers);
+        env.events()
+            .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         Ok(())
     }
 
     pub fn remove_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
-        let relayers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Relayers)
-            .unwrap_or_else(|| Vec::new(&env));
+        let marker = DataKey::Relayer(relayer.clone());
+        if !env.storage().persistent().has(&marker) {
+            return Ok(());
+        }
+        env.storage().persistent().remove(&marker);
         // soroban_sdk::Vec does not implement FromIterator, so rebuild manually.
         let mut filtered: Vec<Address> = Vec::new(&env);
-        for r in relayers.iter() {
+        for r in Self::list_relayers(env.clone()).iter() {
             if r != relayer {
                 filtered.push_back(r);
             }
         }
-        let removed = filtered.len() != relayers.len();
-        env.storage().instance().set(&DataKey::Relayers, &filtered);
-        if removed {
-            env.events()
-                .publish((Symbol::new(&env, "relayer_removed"),), (relayer,));
-        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Relayers, &filtered);
+        env.events()
+            .publish((Symbol::new(&env, "relayer_removed"),), (relayer,));
         Ok(())
     }
 
@@ -126,7 +148,7 @@ impl RefractOracle {
     /// replay add_relayer/remove_relayer events from history.
     pub fn list_relayers(env: Env) -> Vec<Address> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Relayers)
             .unwrap_or_else(|| Vec::new(&env))
     }
@@ -192,24 +214,20 @@ impl RefractOracle {
         // or one submitting out of order — silently regressing the feed
         // backward in time and potentially un-triggering (or reviving) a
         // claim based on stale data replacing a more current reading.
+        let key = DataKey::Reading(feed_id.clone());
         if let Some(existing) = env
             .storage()
             .persistent()
-            .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
+            .get::<DataKey, StoredReading>(&key)
         {
-            if timestamp < existing.timestamp {
+            if timestamp < existing.0 {
                 return Err(OracleError::StaleSubmission);
             }
         }
 
-        let reading = OracleReading {
-            value,
-            timestamp,
-            source,
-        };
         env.storage()
             .persistent()
-            .set(&DataKey::Reading(feed_id.clone()), &reading);
+            .set(&key, &StoredReading(timestamp, value, source));
 
         env.events().publish(
             (Symbol::new(&env, "oracle_updated"), feed_id),
@@ -222,19 +240,23 @@ impl RefractOracle {
 
     /// Get the latest reading for a feed. Errors if not found or stale.
     pub fn get_reading(env: Env, feed_id: Symbol) -> Result<OracleReading, OracleError> {
-        let reading: OracleReading = env
+        let StoredReading(timestamp, value, source) = env
             .storage()
             .persistent()
             .get(&DataKey::Reading(feed_id))
             .ok_or(OracleError::FeedNotFound)?;
 
         let ledger_time = env.ledger().timestamp();
-        let age = ledger_time.saturating_sub(reading.timestamp);
+        let age = ledger_time.saturating_sub(timestamp);
         if age > MAX_STALENESS_SECS {
             return Err(OracleError::StaleReading);
         }
 
-        Ok(reading)
+        Ok(OracleReading {
+            value,
+            timestamp,
+            source,
+        })
     }
 
     /// Returns true if the trigger condition for a given coverage type is met.
@@ -257,18 +279,22 @@ impl RefractOracle {
     }
 
     /// Get all feeds and their timestamps as a map (for monitoring UI).
-    pub fn list_feeds(env: Env, feed_ids: Vec<Symbol>) -> Map<Symbol, i64> {
+    /// Unknown feeds are skipped. At most `MAX_LIST_FEEDS` ids per call.
+    pub fn list_feeds(env: Env, feed_ids: Vec<Symbol>) -> Result<Map<Symbol, i64>, OracleError> {
+        if feed_ids.len() > MAX_LIST_FEEDS {
+            return Err(OracleError::TooManyFeeds);
+        }
         let mut out: Map<Symbol, i64> = Map::new(&env);
         for feed_id in feed_ids.iter() {
-            if let Some(r) = env
+            if let Some(StoredReading(timestamp, ..)) = env
                 .storage()
                 .persistent()
-                .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
+                .get::<DataKey, StoredReading>(&DataKey::Reading(feed_id.clone()))
             {
-                out.set(feed_id, r.timestamp as i64);
+                out.set(feed_id, timestamp as i64);
             }
         }
-        out
+        Ok(out)
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────
@@ -283,20 +309,23 @@ impl RefractOracle {
         Ok(())
     }
 
+    /// O(1) regardless of how many relayers are registered: one marker
+    /// lookup, plus an admin read only when the caller isn't a relayer.
     fn require_relayer(env: &Env, caller: &Address) -> Result<(), OracleError> {
-        let relayers: Vec<Address> = env
+        if env
             .storage()
-            .instance()
-            .get(&DataKey::Relayers)
-            .unwrap_or_else(|| Vec::new(env));
-        let is_relayer = relayers.iter().any(|r| &r == caller);
+            .persistent()
+            .has(&DataKey::Relayer(caller.clone()))
+        {
+            return Ok(());
+        }
         // Admin can also submit
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(OracleError::NotInitialized)?;
-        if !is_relayer && caller != &admin {
+        if caller != &admin {
             return Err(OracleError::Unauthorized);
         }
         Ok(())
