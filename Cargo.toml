@@ -14,3 +14,17 @@ debug-assertions = false
 panic = "abort"
 codegen-units = 1
 lto = true
+
+# Optimise the Soroban host in dev/test builds. It runs every test
+# invocation; unoptimised it made the index and batch tests, which drive
+# hundreds of calls, take minutes. Only the host crates are listed (not
+# "*") to keep cold-cache build time down. Workspace crates stay at
+# opt-level 0, so their overflow checks and debug assertions still run.
+[profile.dev.package.soroban-env-host]
+opt-level = 2
+
+[profile.dev.package.soroban-env-common]
+opt-level = 2
+
+[profile.dev.package.stellar-xdr]
+opt-level = 2

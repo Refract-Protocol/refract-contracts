@@ -18,3 +18,5 @@ soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
 # in-process to exercise the call end-to-end, hence dev-dependencies only.
 refract-policy = { path = "../policy" }
 proptest = "1.5.0"
+# See policy/Cargo.toml: bench.rs reads the test host's recorded footprint.
+soroban-env-host = "=21.2.1"

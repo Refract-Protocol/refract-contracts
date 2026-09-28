@@ -1060,6 +1060,8 @@ dependencies = [
 name = "refract-policy"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "soroban-env-host",
  "soroban-sdk",
 ]
 
@@ -1069,6 +1071,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "refract-policy",
+ "soroban-env-host",
  "soroban-sdk",
 ]
 

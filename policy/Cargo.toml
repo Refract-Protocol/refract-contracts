@@ -11,3 +11,8 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
+proptest = "1.5.0"
+# Dev-only: bench.rs reads the test host's recorded footprint to report real
+# per-call read/write entries and bytes. Already in the lockfile via
+# soroban-sdk; pinned to the version soroban-sdk resolves.
+soroban-env-host = "=21.2.1"
