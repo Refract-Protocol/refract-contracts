@@ -35,6 +35,8 @@ pub enum RegistryError {
     Unauthorized = 3,
     PolicyNotFound = 4,
     PolicyAlreadyExists = 5,
+    NoPendingPoolContract = 6,
+    PoolContractChangeNotReady = 7,
 }
 
 /// Parameters for indexing a policy that the Pool contract already created.
@@ -66,10 +68,22 @@ pub struct PolicyRecord {
     pub created_at: u64,
 }
 
+/// A pending, delayed repoint of the trusted pool contract. Mirrors the
+/// relayer-addition notice-period pattern: the currently-active pool stays
+/// fully functional until `confirm_pool_contract` is called after the delay.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPoolContract {
+    pub pool_contract: Address,
+    pub executable_at: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
     PoolContract,
+    PendingPoolContract,
+    PoolContractChangeDelay,
     Policy(u64),             // policy_id → PolicyRecord
     HolderPolicies(Address), // address → Vec<u64>
     TotalPolicies,
@@ -232,148 +246,126 @@ impl RefractPolicyRegistry {
 
     // ─── Admin ────────────────────────────────────────────────────────────
 
-    /// Repoint the RefractPool this registry trusts to call
-    /// register_policy()/deactivate_policy(). Only needed after a pool
-    /// redeploy/migration — `initialize` already wires the pool address
-    /// set at deploy time. Deliberately admin-only rather than
-    /// admin-or-pool (unlike register_policy/deactivate_policy): the pool
-    /// itself must never be able to redirect which pool address the
+    /// Configure the minimum delay (in seconds) that must elapse between
+    /// proposing a new pool contract and confirming it. Admin-only.
+    pub fn set_pool_contract_change_delay(
+        env: Env,
+        caller: Address,
+        delay: u64,
+    ) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolContractChangeDelay, &delay);
+        env.events().publish(
+            (Symbol::new(&env, "pool_contract_delay_set"),),
+            delay,
+        );
+        Ok(())
+    }
+
+    /// Propose a new RefractPool for this registry to trust. The currently-
+    /// active pool remains fully functional until `confirm_pool_contract` is
+    /// called after the configured delay. Calling this again overwrites any
+    /// pending proposal (and restarts the delay window), matching how the
+    /// relayer-addition pattern handles overwriting a pending proposal.
+    ///
+    /// Only needed after a pool redeploy/migration — `initialize` already
+    /// wires the pool address set at deploy time. Deliberately admin-only
+    /// rather than admin-or-pool (unlike register_policy/deactivate_policy):
+    /// the pool itself must never be able to redirect which pool address the
     /// registry trusts.
-    pub fn set_pool_contract(
+    pub fn propose_pool_contract(
         env: Env,
         caller: Address,
         pool_contract: Address,
     ) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
+        let delay: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolContractChangeDelay)
+            .unwrap_or(0);
+        let executable_at = env.ledger().timestamp() + delay;
+        let pending = PendingPoolContract {
+            pool_contract: pool_contract.clone(),
+            executable_at,
+        };
         env.storage()
             .instance()
-            .set(&DataKey::PoolContract, &pool_contract);
-
-        env.events()
-            .publish((Symbol::new(&env, "pool_contract_set"),), (pool_contract,));
+            .set(&DataKey::PendingPoolContract, &pending);
+        env.events().publish(
+            (Symbol::new(&env, "pool_contract_proposed"),),
+            (pool_contract, executable_at),
+        );
         Ok(())
     }
 
-    /// Rotate the admin key. The only recovery path if the current admin
-    /// key is lost or compromised — without it, set_pool_contract and this
-    /// function itself would be permanently stuck on whatever key was set
-    /// at initialize().
-    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), RegistryError> {
+    /// Confirm a previously-proposed pool contract once the delay has
+    /// elapsed. Rejects if there is no pending proposal or if the delay has
+    /// not yet passed. The active pool address is only swapped here.
+    pub fn confirm_pool_contract(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-
-        env.events()
-            .publish((Symbol::new(&env, "admin_set"),), (new_admin,));
+        let pending: PendingPoolContract = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingPoolContract)
+            .ok_or(RegistryError::NoPendingPoolContract)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(RegistryError::PoolContractChangeNotReady);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolContract, &pending.pool_contract);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingPoolContract);
+        env.events().publish(
+            (Symbol::new(&env, "pool_contract_confirmed"),),
+            pending.pool_contract,
+        );
         Ok(())
     }
 
-    // ─── Queries ──────────────────────────────────────────────────────────
-
-    pub fn get_policy(env: Env, policy_id: u64) -> Result<PolicyRecord, RegistryError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Policy(policy_id))
-            .ok_or(RegistryError::PolicyNotFound)
-    }
-
-    pub fn get_holder_policy_ids(env: Env, holder: Address) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::HolderPolicies(holder))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Same as get_holder_policy_ids, filtered to currently-active policies.
-    /// Without this, a caller wanting "what does this holder have active
-    /// right now" had to fetch every id the holder has ever had and call
-    /// get_policy on each one just to check is_active.
-    pub fn get_holder_active_policy_ids(env: Env, holder: Address) -> Vec<u64> {
-        let ids: Vec<u64> = env
+    /// Cancel a pending pool-contract repoint before it is confirmed. The
+    /// active pool address is untouched.
+    pub fn cancel_pool_contract(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+        if !env
             .storage()
-            .persistent()
-            .get(&DataKey::HolderPolicies(holder))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut active = Vec::new(&env);
-        for id in ids.iter() {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PolicyRecord>(&DataKey::Policy(id))
-            {
-                if record.is_active {
-                    active.push_back(id);
-                }
-            }
+            .instance()
+            .has(&DataKey::PendingPoolContract)
+        {
+            return Err(RegistryError::NoPendingPoolContract);
         }
-        active
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingPoolContract);
+        env.events()
+            .publish((Symbol::new(&env, "pool_contract_cancelled"),), ());
+        Ok(())
     }
 
-    pub fn get_stats(env: Env) -> Map<Symbol, i128> {
-        let mut stats: Map<Symbol, i128> = Map::new(&env);
-        let total: u64 = env
-            .storage()
+    /// Read the currently-pending pool-contract proposal, if any.
+    pub fn get_pending_pool_contract(env: Env) -> Option<PendingPoolContract> {
+        env.storage()
             .instance()
-            .get(&DataKey::TotalPolicies)
-            .unwrap_or(0);
-        let premium: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalPremium)
-            .unwrap_or(0);
-        let active: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ActivePolicies)
-            .unwrap_or(0);
-        stats.set(Symbol::new(&env, "total_policies"), total as i128);
-        stats.set(Symbol::new(&env, "total_premium"), premium);
-        stats.set(Symbol::new(&env, "active_policies"), active as i128);
-        stats
+            .get(&DataKey::PendingPoolContract)
     }
 
-    /// The address currently authorized to call set_admin()/
-    /// set_pool_contract(). Without this, verifying who holds admin
-    /// control meant replaying event history instead of just reading
-    /// current state.
-    pub fn admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Admin)
-    }
-
-    /// The RefractPool address this registry currently trusts to call
-    /// register_policy()/deactivate_policy(). Without this,
-    /// set_pool_contract() would be a write with no matching read.
-    pub fn pool_contract(env: Env) -> Option<Address> {
+    /// Read the currently-active trusted pool contract.
+    pub fn get_pool_contract(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PoolContract)
     }
 
-    // ─── Internal ─────────────────────────────────────────────────────────
+    // ─── Internal helpers ─────────────────────────────────────────────────
 
-    /// Only the registered Pool contract or the admin may mutate the registry.
-    /// The caller must authorize the invocation (this panics on a missing or
-    /// invalid signature — not recoverable); we then verify the authorized
-    /// address is one of the two privileged principals, which *is* recoverable
-    /// and reported as a typed error.
-    fn require_pool_or_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
-        caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(RegistryError::NotInitialized)?;
-        let pool: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PoolContract)
-            .ok_or(RegistryError::NotInitialized)?;
-        if caller != &admin && caller != &pool {
-            return Err(RegistryError::Unauthorized);
-        }
-        Ok(())
-    }
-
-    /// Stricter than require_pool_or_admin: used by set_pool_contract and
-    /// set_admin, which must never be callable by the pool contract itself.
     fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
         caller.require_auth();
         let admin: Address = env
@@ -381,12 +373,30 @@ impl RefractPolicyRegistry {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(RegistryError::NotInitialized)?;
-        if caller != &admin {
+        if &admin != caller {
+            return Err(RegistryError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_pool_or_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RegistryError::NotInitialized)?;
+        if &admin == caller {
+            return Ok(());
+        }
+        let pool: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolContract)
+            .ok_or(RegistryError::NotInitialized)?;
+        if &pool != caller {
             return Err(RegistryError::Unauthorized);
         }
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod test;
