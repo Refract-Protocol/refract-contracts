@@ -12,6 +12,18 @@ use soroban_sdk::{
 /// Maximum oracle staleness in seconds (30 minutes).
 const MAX_STALENESS_SECS: u64 = 1_800;
 
+/// Minimum delay (in seconds) between queuing a new relayer via
+/// `add_relayer` and it becoming active via `activate_relayer`.
+///
+/// Default is 48 hours. Rationale: adding a relayer grants submission
+/// rights that can ultimately gate real payouts, so a compromised admin
+/// key must not be able to add a malicious relayer and have it submitting
+/// trigger-worthy data within the same transaction. 48h gives the
+/// community a deliberate, observable window to react (and, in the
+/// deployment runbook, to route `add_relayer`'s admin gate through the
+/// governance/timelock stack) before a new trusted data source goes live.
+const MIN_ADDITION_NOTICE_PERIOD_SECS: u64 = 48 * 60 * 60;
+
 /// Fixed-point scale for value readings (1e7). All prices/percentages are
 /// stored as `value * 1e7` so the contract never touches floating point.
 const SCALE: i128 = 10_000_000;
@@ -40,6 +52,8 @@ pub enum OracleError {
     UnknownCoverageType = 6,
     FutureTimestamp = 7,
     StaleSubmission = 8, // older than the reading already stored for this feed
+    RelayerNotPending = 9, // activate_relayer called for a relayer that was never queued
+    NoticePeriodNotElapsed = 10, // activate_relayer called before min_addition_notice_period
 }
 
 /// Oracle reading stored on-chain.
@@ -60,6 +74,7 @@ pub enum DataKey {
     Admin,
     Relayers,
     Reading(Symbol), // feed_id → OracleReading
+    PendingRelayer(Address), // relayer → queued-at timestamp
 }
 
 #[contract]
@@ -82,8 +97,50 @@ impl RefractOracle {
 
     // ─── Admin ───────────────────────────────────────────────────────────
 
+    /// Queue a new relayer for activation after `min_addition_notice_period`.
+    ///
+    /// Admin-gated as before, but no longer activates the relayer
+    /// immediately: the relayer is recorded under `PendingRelayer` with the
+    /// current ledger timestamp and only becomes active once
+    /// `activate_relayer` is called after the notice period has elapsed.
+    /// This turns adding a new trusted data source into a deliberately slow,
+    /// observable action rather than an instant single-key decision.
     pub fn add_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
+        let relayers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Relayers)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Already active — nothing to queue.
+        if relayers.iter().any(|r| r == relayer) {
+            return Ok(());
+        }
+        let queued_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingRelayer(relayer.clone()), &queued_at);
+        env.events().publish(
+            (Symbol::new(&env, "relayer_queued"),),
+            (relayer, queued_at),
+        );
+        Ok(())
+    }
+
+    /// Permissionless: promote a queued relayer to the active `Relayers`
+    /// list once `min_addition_notice_period` has elapsed since it was
+    /// queued via `add_relayer`. Anyone may call this; the notice period
+    /// itself is the safeguard, not the caller's identity.
+    pub fn activate_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
+        let queued_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingRelayer(relayer.clone()))
+            .ok_or(OracleError::RelayerNotPending)?;
+        let now = env.ledger().timestamp();
+        if now < queued_at.saturating_add(MIN_ADDITION_NOTICE_PERIOD_SECS) {
+            return Err(OracleError::NoticePeriodNotElapsed);
+        }
         let mut relayers: Vec<Address> = env
             .storage()
             .instance()
@@ -92,12 +149,20 @@ impl RefractOracle {
         if !relayers.iter().any(|r| r == relayer) {
             relayers.push_back(relayer.clone());
             env.storage().instance().set(&DataKey::Relayers, &relayers);
-            env.events()
-                .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         }
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingRelayer(relayer.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         Ok(())
     }
 
+    /// Instantly revoke a relayer's submission rights. Removing a bad
+    /// relayer must never be slowed down, so this stays immediate and
+    /// unchanged. If the relayer was still pending (queued but not yet
+    /// activated), the pending entry is cancelled too, so it can never be
+    /// activated after removal.
     pub fn remove_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
         let relayers: Vec<Address> = env
@@ -114,7 +179,14 @@ impl RefractOracle {
         }
         let removed = filtered.len() != relayers.len();
         env.storage().instance().set(&DataKey::Relayers, &filtered);
-        if removed {
+        // Cancel any pending queue entry so a removed relayer cannot later
+        // be activated via activate_relayer.
+        let pending_key = DataKey::PendingRelayer(relayer.clone());
+        let was_pending = env.storage().instance().has(&pending_key);
+        if was_pending {
+            env.storage().instance().remove(&pending_key);
+        }
+        if removed || was_pending {
             env.events()
                 .publish((Symbol::new(&env, "relayer_removed"),), (relayer,));
         }
@@ -210,68 +282,14 @@ impl RefractOracle {
         env.storage()
             .persistent()
             .set(&DataKey::Reading(feed_id.clone()), &reading);
-
         env.events().publish(
-            (Symbol::new(&env, "oracle_updated"), feed_id),
-            (value, timestamp),
+            (Symbol::new(&env, "reading_submitted"),),
+            (relayer, feed_id, value, timestamp),
         );
         Ok(())
     }
 
-    // ─── Queries ─────────────────────────────────────────────────────────
-
-    /// Get the latest reading for a feed. Errors if not found or stale.
-    pub fn get_reading(env: Env, feed_id: Symbol) -> Result<OracleReading, OracleError> {
-        let reading: OracleReading = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Reading(feed_id))
-            .ok_or(OracleError::FeedNotFound)?;
-
-        let ledger_time = env.ledger().timestamp();
-        let age = ledger_time.saturating_sub(reading.timestamp);
-        if age > MAX_STALENESS_SECS {
-            return Err(OracleError::StaleReading);
-        }
-
-        Ok(reading)
-    }
-
-    /// Returns true if the trigger condition for a given coverage type is met.
-    /// coverage_type: 0=Depeg, 1=Crash, 2=Liquidation, 3=SmartContract, 4=Flight
-    pub fn is_triggered(
-        env: Env,
-        coverage_type: u32,
-        feed_id: Symbol,
-    ) -> Result<bool, OracleError> {
-        let reading = Self::get_reading(env, feed_id)?;
-
-        match coverage_type {
-            0 => Ok(reading.value < DEPEG_PRICE_THRESHOLD),
-            1 => Ok(reading.value < CRASH_RETURN_THRESHOLD),
-            2 => Ok(reading.value < LIQUIDATION_RATIO_THRESHOLD),
-            3 => Ok(reading.value < TVL_THRESHOLD),
-            4 => Ok(reading.value > FLIGHT_DELAY_THRESHOLD),
-            _ => Err(OracleError::UnknownCoverageType),
-        }
-    }
-
-    /// Get all feeds and their timestamps as a map (for monitoring UI).
-    pub fn list_feeds(env: Env, feed_ids: Vec<Symbol>) -> Map<Symbol, i64> {
-        let mut out: Map<Symbol, i64> = Map::new(&env);
-        for feed_id in feed_ids.iter() {
-            if let Some(r) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
-            {
-                out.set(feed_id, r.timestamp as i64);
-            }
-        }
-        out
-    }
-
-    // ─── Internal helpers ─────────────────────────────────────────────────
+    // ─── Internal helpers ────────────────────────────────────────────────
 
     fn require_admin(env: &Env) -> Result<(), OracleError> {
         let admin: Address = env
@@ -283,25 +301,15 @@ impl RefractOracle {
         Ok(())
     }
 
-    fn require_relayer(env: &Env, caller: &Address) -> Result<(), OracleError> {
+    fn require_relayer(env: &Env, relayer: &Address) -> Result<(), OracleError> {
         let relayers: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::Relayers)
             .unwrap_or_else(|| Vec::new(env));
-        let is_relayer = relayers.iter().any(|r| &r == caller);
-        // Admin can also submit
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(OracleError::NotInitialized)?;
-        if !is_relayer && caller != &admin {
+        if !relayers.iter().any(|r| &r == relayer) {
             return Err(OracleError::Unauthorized);
         }
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod test;

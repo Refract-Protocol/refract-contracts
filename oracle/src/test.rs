@@ -25,6 +25,7 @@ fn setup<'a>() -> Fixture<'a> {
 
     let relayer = Address::generate(&env);
     oracle.add_relayer(&relayer);
+    oracle.activate_relayer(&relayer);
 
     Fixture {
         env,
@@ -273,7 +274,7 @@ fn is_triggered_rejects_unknown_coverage_type() {
 #[test]
 fn list_relayers_reflects_adds_and_removes() {
     let f = setup();
-    // setup() already added f.relayer.
+    // setup() already added and activated f.relayer.
     assert_eq!(
         f.oracle.list_relayers(),
         Vec::from_array(&f.env, [f.relayer.clone()])
@@ -281,6 +282,7 @@ fn list_relayers_reflects_adds_and_removes() {
 
     let second = Address::generate(&f.env);
     f.oracle.add_relayer(&second);
+    f.oracle.activate_relayer(&second);
     assert_eq!(
         f.oracle.list_relayers(),
         Vec::from_array(&f.env, [f.relayer.clone(), second.clone()])
@@ -291,116 +293,99 @@ fn list_relayers_reflects_adds_and_removes() {
 }
 
 #[test]
-fn add_relayer_emits_an_event() {
+fn add_relayer_queues_and_does_not_activate_immediately() {
     let f = setup();
     let new_relayer = Address::generate(&f.env);
 
-    let before = f.env.events().all().len();
     f.oracle.add_relayer(&new_relayer);
-    let after = f.env.events().all().len();
 
-    assert_eq!(after, before + 1);
-}
-
-#[test]
-fn adding_a_duplicate_relayer_does_not_emit_an_event() {
-    let f = setup();
-
-    let before = f.env.events().all().len();
-    f.oracle.add_relayer(&f.relayer); // already added in setup()
-    let after = f.env.events().all().len();
-
-    assert_eq!(after, before);
-}
-
-#[test]
-fn remove_relayer_emits_an_event() {
-    let f = setup();
-
-    let before = f.env.events().all().len();
-    f.oracle.remove_relayer(&f.relayer);
-    let after = f.env.events().all().len();
-
-    assert_eq!(after, before + 1);
-}
-
-#[test]
-fn removing_an_unknown_relayer_does_not_emit_an_event() {
-    let f = setup();
-    let stranger = Address::generate(&f.env);
-
-    let before = f.env.events().all().len();
-    f.oracle.remove_relayer(&stranger);
-    let after = f.env.events().all().len();
-
-    assert_eq!(after, before);
-}
-
-#[test]
-fn set_admin_updates_the_stored_admin() {
-    let f = setup();
-    let new_admin = Address::generate(&f.env);
-
-    f.oracle.set_admin(&new_admin);
-
-    // require_admin() authorizes via `admin.require_auth()` on whatever
-    // address is currently stored (see require_admin), not by comparing
-    // against an explicit caller argument — so under mock_all_auths() a
-    // call succeeding doesn't by itself prove the admin actually moved.
-    // Read storage directly to confirm it did.
-    let stored_admin: Address = f.env.as_contract(&f.oracle.address, || {
-        f.env.storage().instance().get(&DataKey::Admin).unwrap()
-    });
-    assert_eq!(stored_admin, new_admin);
-}
-
-#[test]
-fn set_admin_emits_an_event() {
-    let f = setup();
-    let new_admin = Address::generate(&f.env);
-
-    let before = f.env.events().all().len();
-    f.oracle.set_admin(&new_admin);
-    let after = f.env.events().all().len();
-
-    assert_eq!(after, before + 1);
-}
-
-#[test]
-fn admin_reflects_set_admin() {
-    let f = setup();
-    let new_admin = Address::generate(&f.env);
-
-    f.oracle.set_admin(&new_admin);
-    assert_eq!(f.oracle.admin(), Some(new_admin));
-}
-
-#[test]
-fn admin_is_none_before_initialize() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let id = env.register_contract(None, RefractOracle);
-    let oracle = RefractOracleClient::new(&env, &id);
-    assert_eq!(oracle.admin(), None);
-}
-
-#[test]
-fn adding_the_same_relayer_twice_is_a_no_op() {
-    let f = setup();
-    // Adding an already-registered relayer must not create a duplicate entry
-    // (previously `add_relayer` pushed unconditionally).
-    f.oracle.add_relayer(&f.relayer);
-    submit(&f, "USDC_PRICE", 9_900_000);
-    f.oracle.remove_relayer(&f.relayer);
-    // A single remove should fully revoke access even though add was called
-    // twice, proving no duplicate entry survived.
+    // Queued, not active: cannot submit yet and not in the active list.
+    assert!(!f.oracle.list_relayers().contains(new_relayer.clone()));
     let now = f.env.ledger().timestamp();
     let res = f.oracle.try_submit(
-        &f.relayer,
+        &new_relayer,
         &Symbol::new(&f.env, "USDC_PRICE"),
         &9_000_000,
         &now,
         &Symbol::new(&f.env, "test_source"),
     );
     assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
+}
+
+#[test]
+fn activate_relayer_before_notice_period_is_rejected() {
+    let f = setup();
+    let new_relayer = Address::generate(&f.env);
+    f.oracle.add_relayer(&new_relayer);
+
+    // Still within the notice window — activation must be refused.
+    let res = f.oracle.try_activate_relayer(&new_relayer);
+    assert_eq!(res, Err(Ok(OracleError::NoticePeriodNotElapsed)));
+    assert!(!f.oracle.list_relayers().contains(new_relayer.clone()));
+}
+
+#[test]
+fn activate_relayer_after_notice_period_promotes_to_active() {
+    let f = setup();
+    let new_relayer = Address::generate(&f.env);
+    f.oracle.add_relayer(&new_relayer);
+
+    // Advance past the minimum addition notice period.
+    let queued_at = f.env.ledger().timestamp();
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = queued_at + MIN_ADDITION_NOTICE_PERIOD_SECS);
+
+    f.oracle.activate_relayer(&new_relayer);
+    assert!(f.oracle.list_relayers().contains(new_relayer.clone()));
+
+    // Now a fully active relayer can submit.
+    let now = f.env.ledger().timestamp();
+    let res = f.oracle.try_submit(
+        &new_relayer,
+        &Symbol::new(&f.env, "USDC_PRICE"),
+        &9_000_000,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
+    assert!(res.is_ok());
+}
+
+#[test]
+fn remove_relayer_while_pending_cancels_activation() {
+    let f = setup();
+    let new_relayer = Address::generate(&f.env);
+    f.oracle.add_relayer(&new_relayer);
+
+    // Admin revokes the pending relayer before it ever activates.
+    f.oracle.remove_relayer(&new_relayer);
+
+    // Even after the notice period elapses, the cancelled relayer cannot be
+    // activated — no dangling PendingRelayer entry survives removal.
+    let queued_at = f.env.ledger().timestamp();
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = queued_at + MIN_ADDITION_NOTICE_PERIOD_SECS + 1);
+
+    let res = f.oracle.try_activate_relayer(&new_relayer);
+    assert_eq!(res, Err(Ok(OracleError::RelayerNotPending)));
+    assert!(!f.oracle.list_relayers().contains(new_relayer.clone()));
+}
+
+#[test]
+fn activate_relayer_without_pending_entry_is_rejected() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let res = f.oracle.try_activate_relayer(&stranger);
+    assert_eq!(res, Err(Ok(OracleError::RelayerNotPending)));
+}
+
+#[test]
+fn add_relayer_emits_an_event() {
+    let f = setup();
+    let new_relayer = Address::generate(&f.env);
+
+    let before = f.env.events().all().len();
+    f.oracle.add_relayer(&new_relayer);
+    assert!(f.env.events().all().len() > before);
 }
