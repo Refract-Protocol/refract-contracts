@@ -395,3 +395,136 @@ fn test_adversarial_direct_registry_access_bypassing_pool() {
     );
     assert_eq!(res_dup, Err(Ok(RegistryError::PolicyAlreadyExists)));
 }
+
+#[test]
+fn test_systematic_policy_event_topics_and_payloads() {
+    let f = setup();
+    let contract_id = f.registry.address.clone();
+
+    // 1. register event assertion: topics: (symbol_short!("POL_REG"), policy_id), data: (holder, coverage_type, coverage_amount, premium, end_time)
+    let holder = Address::generate(&f.env);
+    let policy_id = 999u64;
+    let coverage_type = CoverageType::StablecoinDepeg;
+    let coverage_amount = 10_000_000i128;
+    let premium = 500_000i128;
+    let end_time = 1_800_000_000u64;
+
+    let before_count = f.env.events().all().len();
+    f.registry.register(&f.pool, &policy_id, &holder, &coverage_type, &coverage_amount, &premium, &end_time);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_1: u64 = u64::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("POL_REG"));
+    assert_eq!(topic_1, policy_id);
+    let (h, ct, ca, pr, et): (Address, CoverageType, i128, i128, u64) = 
+        <(Address, CoverageType, i128, i128, u64)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(h, holder);
+    assert_eq!(ct, coverage_type);
+    assert_eq!(ca, coverage_amount);
+    assert_eq!(pr, premium);
+    assert_eq!(et, end_time);
+
+    // 2. deactivate event assertion: topics: (symbol_short!("POL_DEACT"), policy_id), data: ()
+    let before_count = f.env.events().all().len();
+    f.registry.deactivate(&f.pool, &policy_id);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, _data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_1: u64 = u64::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("POL_DEACT"));
+    assert_eq!(topic_1, policy_id);
+
+    // 3. set_admin event assertion: topics: (symbol_short!("ADM_SET"),), data: (new_admin,)
+    let new_admin = Address::generate(&f.env);
+    let before_count = f.env.events().all().len();
+    f.registry.set_admin(&f.admin, &new_admin);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("ADM_SET"));
+    let payload_admin: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_admin, new_admin);
+
+    // 4. set_pool_contract event assertion: topics: (symbol_short!("POOL_SET"),), data: (new_pool,)
+    let new_pool = Address::generate(&f.env);
+    let before_count = f.env.events().all().len();
+    f.registry.set_pool_contract(&new_admin, &new_pool);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("POOL_SET"));
+    let payload_pool: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_pool, new_pool);
+}
+
+#[test]
+fn test_policy_registry_wasm_artifact_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let pool = Address::generate(&env);
+    let reg_id = env.register_contract(None, RefractPolicyRegistry);
+    let reg = RefractPolicyRegistryClient::new(&env, &reg_id);
+
+    reg.initialize(&admin, &pool);
+    assert_eq!(reg.admin(), Some(admin));
+    assert_eq!(reg.pool_contract(), Some(pool));
+}
+
+#[test]
+fn test_spec_policy_registry_interface_and_error_snapshot() {
+    // Pin RegistryError discriminants
+    assert_eq!(RegistryError::AlreadyInitialized as u32, 1);
+    assert_eq!(RegistryError::NotInitialized as u32, 2);
+    assert_eq!(RegistryError::Unauthorized as u32, 3);
+    assert_eq!(RegistryError::PolicyNotFound as u32, 4);
+    assert_eq!(RegistryError::PolicyAlreadyExists as u32, 5);
+
+    // Pin CoverageType variants and discriminants
+    assert_eq!(CoverageType::StablecoinDepeg as u32, 0);
+    assert_eq!(CoverageType::MarketCrash as u32, 1);
+    assert_eq!(CoverageType::LiquidationShield as u32, 2);
+    assert_eq!(CoverageType::SmartContractRisk as u32, 3);
+    assert_eq!(CoverageType::FlightDelay as u32, 4);
+
+    // Pin PolicyRegistration layout
+    let env = Env::default();
+    let holder = Address::generate(&env);
+    let reg = PolicyRegistration {
+        policy_id: 1,
+        holder: holder.clone(),
+        coverage_type: CoverageType::StablecoinDepeg,
+        coverage_amount: 100_000_000,
+        premium: 1_000_000,
+        expires_at: 1_800_000_000,
+    };
+    assert_eq!(reg.policy_id, 1);
+    assert_eq!(reg.coverage_amount, 100_000_000);
+    assert_eq!(reg.premium, 1_000_000);
+    assert_eq!(reg.expires_at, 1_800_000_000);
+
+    // Pin PolicyRecord layout
+    let record = PolicyRecord {
+        policy_id: 1,
+        holder: holder.clone(),
+        coverage_type: CoverageType::StablecoinDepeg,
+        coverage_amount: 100_000_000,
+        premium_paid: 1_000_000,
+        start_time: 1_700_000_000,
+        end_time: 1_800_000_000,
+        is_active: true,
+    };
+    assert_eq!(record.policy_id, 1);
+    assert!(record.is_active);
+}
+}
