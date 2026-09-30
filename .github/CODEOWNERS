@@ -1,0 +1,10 @@
+# Core protocol maintainers
+* @Refract-Protocol/maintainers
+
+# Contracts
+/pool/ @Refract-Protocol/pool-maintainers
+/policy/ @Refract-Protocol/policy-maintainers
+/oracle/ @Refract-Protocol/oracle-maintainers
+
+# CI / CD workflows & templates
+/.github/ @Refract-Protocol/devops
