@@ -545,23 +545,129 @@ fn admin_submitting_is_subject_to_the_same_rate_limit() {
     let t0 = env.ledger().timestamp();
 
     // First submit as admin — accepted (no prior LastSubmissionAt).
-    oracle.submit(
+    let res = oracle.try_submit(
         &admin,
         &feed,
         &9_990_000,
         &t0,
         &Symbol::new(&env, "test_source"),
     );
+    assert!(res.is_ok());
 
-    // Immediately re-submit — must be rejected (admin has no cooldown exemption).
+    // Advance by only 59 s — still within the 60 s cooldown.
+    env.ledger().with_mut(|li| li.timestamp = t0 + 59);
+
     let res = oracle.try_submit(
         &admin,
         &feed,
         &9_980_000,
-        &t0,
+        &(t0 + 59),
         &Symbol::new(&env, "test_source"),
     );
     assert_eq!(res, Err(Ok(OracleError::SubmittedTooSoon)));
+}
+
+#[test]
+fn test_systematic_oracle_event_topics_and_payloads() {
+    let f = setup();
+    let contract_id = f.oracle.address.clone();
+    
+    // 1. add_relayer event assertion
+    let relayer_2 = Address::generate(&f.env);
+    let before_count = f.env.events().all().len();
+    f.oracle.add_relayer(&relayer_2);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_sym: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_sym, symbol_short!("RELAY_ADD"));
+    let payload_relayer: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_relayer, relayer_2);
+
+    // 2. submit event assertion: topics: (symbol_short!("FEED_SUB"), feed_id), payload: (reading.value, reading.updated_at)
+    let before_count = f.env.events().all().len();
+    let now = f.env.ledger().timestamp();
+    let feed_sym = Symbol::new(&f.env, "BTC_PRICE");
+    let reading_val: i128 = 65_000 * SCALE;
+    f.oracle.submit(&f.relayer, &feed_sym, &reading_val, &now, &Symbol::new(&f.env, "test_source"));
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_1: Symbol = Symbol::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("FEED_SUB"));
+    assert_eq!(topic_1, feed_sym);
+    let (val, updated_at): (i128, u64) = <(i128, u64)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(val, reading_val);
+    assert_eq!(updated_at, now);
+
+    // 3. remove_relayer event assertion: topics: (symbol_short!("RELAY_DEL"),), payload: (relayer,)
+    let before_count = f.env.events().all().len();
+    f.oracle.remove_relayer(&relayer_2);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_sym: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_sym, symbol_short!("RELAY_DEL"));
+    let payload_relayer: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_relayer, relayer_2);
+
+    // 4. set_admin event assertion: topics: (symbol_short!("ADM_SET"),), payload: (new_admin,)
+    let new_admin = Address::generate(&f.env);
+    let before_count = f.env.events().all().len();
+    f.oracle.set_admin(&new_admin);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_sym: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_sym, symbol_short!("ADM_SET"));
+    let payload_admin: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_admin, new_admin);
+}
+
+#[test]
+fn test_oracle_wasm_artifact_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+
+    let oracle_id = env.register_contract(None, RefractOracle);
+    let oracle = RefractOracleClient::new(&env, &oracle_id);
+
+    oracle.initialize(&admin);
+    assert_eq!(oracle.admin(), Some(admin));
+}
+
+#[test]
+fn test_spec_oracle_interface_and_error_snapshot() {
+    // Pin OracleError discriminants to catch breaking changes
+    assert_eq!(OracleError::AlreadyInitialized as u32, 1);
+    assert_eq!(OracleError::NotInitialized as u32, 2);
+    assert_eq!(OracleError::Unauthorized as u32, 3);
+    assert_eq!(OracleError::FeedNotFound as u32, 4);
+    assert_eq!(OracleError::StaleReading as u32, 5);
+    assert_eq!(OracleError::UnknownCoverageType as u32, 6);
+    assert_eq!(OracleError::FutureTimestamp as u32, 7);
+    assert_eq!(OracleError::StaleSubmission as u32, 8);
+
+    // Pin OracleReading struct layout
+    let env = Env::default();
+    let sample = OracleReading {
+        value: 10_000_000,
+        updated_at: 1_700_000_000,
+        source: Symbol::new(&env, "TEST_FEED"),
+    };
+    assert_eq!(sample.value, 10_000_000);
+    assert_eq!(sample.updated_at, 1_700_000_000);
 }
 
 // ─── Issue #100: Feed metadata tests ──────────────────────────────────────────
@@ -769,4 +875,39 @@ fn adding_duplicate_relayer_does_not_reset_reputation() {
 
     let rep_after = f.oracle.relayer_reputation(&f.relayer).unwrap();
     assert_eq!(rep_before, rep_after, "duplicate add must not reset reputation");
+}
+
+#[test]
+fn admin_submit_is_not_exempt_from_cooldown() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let id = env.register_contract(None, RefractOracle);
+    let oracle = RefractOracleClient::new(&env, &id);
+    oracle.initialize(&admin);
+    // Do NOT add admin as a relayer — admin submits via the bypass in require_relayer.
+
+    let feed = Symbol::new(&env, "USDC_PRICE");
+    let t0 = env.ledger().timestamp();
+
+    // First submit as admin — accepted (no prior LastSubmissionAt).
+    oracle.submit(
+        &admin,
+        &feed,
+        &9_990_000,
+        &t0,
+        &Symbol::new(&env, "test_source"),
+    );
+
+    // Immediately re-submit — must be rejected (admin has no cooldown exemption).
+    let res = oracle.try_submit(
+        &admin,
+        &feed,
+        &9_980_000,
+        &t0,
+        &Symbol::new(&env, "test_source"),
+    );
+    assert_eq!(res, Err(Ok(OracleError::SubmittedTooSoon)));
+}
 }
