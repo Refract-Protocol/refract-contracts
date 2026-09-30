@@ -1,0 +1,13 @@
+# Soroban Contract Clippy Configuration
+# Enforces panic-free execution and typed error conventions in non-test code
+
+# Maximum cognitive complexity for contract functions
+cognitive-complexity-threshold = 25
+
+# Disallow standard library panics and unwrap in production contract logic
+disallowed-methods = [
+    { path = "core::option::Option::unwrap", reason = "Contract code must use typed errors (Result<T, Error>) instead of unwrap()" },
+    { path = "core::result::Result::unwrap", reason = "Contract code must use typed errors (Result<T, Error>) instead of unwrap()" },
+    { path = "core::option::Option::expect", reason = "Contract code must use typed errors (Result<T, Error>) instead of expect()" },
+    { path = "core::result::Result::expect", reason = "Contract code must use typed errors (Result<T, Error>) instead of expect()" },
+]

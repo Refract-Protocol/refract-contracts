@@ -1,0 +1,14 @@
+{
+  "refract_pool.wasm": {
+    "budget_bytes": 65000,
+    "status": "BUDGET_CODIFIED"
+  },
+  "refract_policy.wasm": {
+    "budget_bytes": 45000,
+    "status": "BUDGET_CODIFIED"
+  },
+  "refract_oracle.wasm": {
+    "budget_bytes": 40000,
+    "status": "BUDGET_CODIFIED"
+  }
+}

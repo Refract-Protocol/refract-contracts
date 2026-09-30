@@ -36,3 +36,37 @@ jobs:
 
       - name: Build optimized wasm
         run: cargo build --target wasm32-unknown-unknown --release
+      - name: Soroban static-analysis gate
+        run: python3 scripts/check_soroban_footguns.py
+
+      - name: SDK upgrade verification gate
+        run: python3 scripts/verify_sdk_upgrade.py
+
+  docs:
+    name: rustdoc · links · coverage
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links -D rustdoc::invalid_html_tags"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check documentation coverage & intra-doc links
+        run: cargo doc --workspace --no-deps
+
+      - name: Check markdown cross-references and links
+        run: python3 scripts/check_links.py
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: refract-contracts-docs
+          path: target/doc
+

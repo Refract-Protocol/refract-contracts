@@ -96,124 +96,175 @@
 //! Refract Policy Registry Contract
 //!
 //! Stores all policy metadata on-chain as a lightweight sidecar to the Pool
-//! contract.  The Pool contract is the source of truth for capital; this
+//! contract. The Pool contract is the source of truth for capital; this
 //! contract provides a queryable index of policies per holder.
 //!
-// =============================================================================
-// Issue #126 — [High] Kani-based formal proofs for overflow safety
-// https://github.com/Refract-Protocol/refract-contracts/issues/126
-//
-// ── THIS FILE: policy/src/lib.rs ─────────────────────────────────────────────
-//
-// ARITHMETIC INVENTORY — policy/src/lib.rs
-// ----------------------------------------
-// This contract is an index/registry. It stores policy records and increments
-// counters. The arithmetic is minimal:
-//
-//   1. Policy ID counter increment: next_id = current_id + 1
-//      • next_id is u64 (not i128). At 1 policy per second it would take
-//        ~585 billion years to overflow u64. Safe — no harness needed, but
-//        document explicitly per the issue's requirement to enumerate ALL ops.
-//      • ✓ SAFE (no harness required; document argument is sufficient)
-//
-//   2. Holder policy index: vec.push_back(policy_id)
-//      • Vec length is bounded by the Soroban storage limits (no arithmetic).
-//      • ✓ SAFE (not arithmetic — storage bound, not overflow risk)
-//
-//   3. register_policy() — no i128 arithmetic. All stored fields (coverage_amount,
-//      premium) are i128 values passed in from the pool and stored verbatim.
-//      No computation is performed on them in this contract.
-//      • ✓ SAFE (store-only, no computation)
-//
-// FINDINGS SUMMARY FOR THIS FILE
-// --------------------------------
-//   No overflow-risk arithmetic found in policy/src/lib.rs.
-//   All i128 values are stored verbatim from the pool; the only arithmetic
-//   is a u64 counter increment which cannot practically overflow.
-//   Document this explicitly in OVERFLOW_AUDIT.md so reviewers know it was
-//   audited and not merely omitted.
-//
-// KANI HARNESS (documentation argument only — no harness required)
-// ----------------------------------------------------------------
-//   The issue requires either a proof OR a documented argument for why a
-//   proof is unnecessary. The documented argument:
-//
-//     "policy/src/lib.rs contains no i128 arithmetic operations. The only
-//     counter increment is u64 and practically cannot overflow. All i128
-//     values are received from the pool and stored without modification.
-//     No Kani harness is required for this file."
-//
-// =============================================================================
-//
-// =============================================================================
-// Issue #124 — [High] Build an on-chain proposal-and-vote flow for onboarding
-// a new coverage type end-to-end
-// https://github.com/Refract-Protocol/refract-contracts/issues/124
-//
-// ── RELATION OF THIS FILE TO #124 ────────────────────────────────────────────
-//
-// The policy registry is one of the contracts that must be configured as part
-// of a NewCoverageType onboarding proposal. Specifically, when a new coverage
-// type is added (after the prerequisite WASM upgrade that adds the new enum
-// variant), the governance execution sequence must:
-//
-//   1. Pool:    set per-type exposure cap (pool's exposure_cap setter)
-//   2. Oracle:  bind feed ID + set trigger threshold for the new type
-//   3. Pool:    set risk multiplier for the new type
-//   4. Policy:  (this contract) — no configuration setter needed here today.
-//              The registry is a generic index; it stores PolicyRecord structs
-//              for ANY coverage type without type-specific configuration.
-//              The registry does NOT need to be updated as part of the
-//              NewCoverageType onboarding sequence.
-//
-// This means the governance contract's execution sequence for
-// ProposalType::NewCoverageType does NOT need to call this contract.
-// That is a simplification worth documenting explicitly so the governance
-// implementation does not add an unnecessary call site here.
-//
-// FULL GOVERNANCE DESIGN (for the new governance/src/lib.rs contract)
-// -------------------------------------------------------------------
-// See governance/src/lib.rs for the complete implementation plan for #124.
-// The key points relevant to this file:
-//
-//   • The registry is NOT in the onboarding call sequence.
-//   • If a future version of the registry gains per-type configuration
-//     (e.g., type-specific query limits or fee tiers), the governance
-//     NewCoverageType proposal type can be extended at that time.
-//
-// =============================================================================
+//! # Architecture and Invariants
+//!
+//! - **Source of Truth**: The Pool contract is the source of truth for capital and
+//!   policy IDs. The registry does not mint IDs independently; it mirrors the IDs
+//!   allocated by the Pool contract so both contracts stay in lockstep.
+//! - **Access Control**: Only the authorized Pool contract or the admin may register
+//!   or deactivate policies via [`register_policy`](RefractPolicyRegistry::register_policy)
+//!   and [`deactivate_policy`](RefractPolicyRegistry::deactivate_policy).
+//! - **Idempotent Deactivation**: Deactivating an already inactive policy is a safe no-op,
+//!   preventing event spam and underflow of active policy counters.
+//! - **Cross-contract Type Parity**: [`CoverageType`] matches the enum layout of
+//!   `RegistryCoverageType` in the pool contract crate.
+//!
+//! # Issue #126 — [High] Kani-based formal proofs for overflow safety
+//! https://github.com/Refract-Protocol/refract-contracts/issues/126
+//!
+//! ── THIS FILE: policy/src/lib.rs ─────────────────────────────────────────────
+//!
+//! ARITHMETIC INVENTORY — policy/src/lib.rs
+//! ----------------------------------------
+//! This contract is an index/registry. It stores policy records and increments
+//! counters. The arithmetic is minimal:
+//!
+//!   1. Policy ID counter increment: next_id = current_id + 1
+//!      • next_id is u64 (not i128). At 1 policy per second it would take
+//!        ~585 billion years to overflow u64. Safe — no harness needed, but
+//!        document explicitly per the issue's requirement to enumerate ALL ops.
+//!      • ✓ SAFE (no harness required; document argument is sufficient)
+//!
+//!   2. Holder policy index: vec.push_back(policy_id)
+//!      • Vec length is bounded by the Soroban storage limits (no arithmetic).
+//!      • ✓ SAFE (not arithmetic — storage bound, not overflow risk)
+//!
+//!   3. register_policy() — no i128 arithmetic. All stored fields (coverage_amount,
+//!      premium) are i128 values passed in from the pool and stored verbatim.
+//!      No computation is performed on them in this contract.
+//!      • ✓ SAFE (store-only, no computation)
+//!
+//! FINDINGS SUMMARY FOR THIS FILE
+//! --------------------------------
+//!   No overflow-risk arithmetic found in policy/src/lib.rs.
+//!   All i128 values are stored verbatim from the pool; the only arithmetic
+//!   is a u64 counter increment which cannot practically overflow.
+//!   Document this explicitly in OVERFLOW_AUDIT.md so reviewers know it was
+//!   audited and not merely omitted.
+//!
+//! KANI HARNESS (documentation argument only — no harness required)
+//! ----------------------------------------------------------------
+//!   The issue requires either a proof OR a documented argument for why a
+//!   proof is unnecessary. The documented argument:
+//!
+//!     "policy/src/lib.rs contains no i128 arithmetic operations. The only
+//!     counter increment is u64 and practically cannot overflow. All i128
+//!     values are received from the pool and stored without modification.
+//!     No Kani harness is required for this file."
+//!
+//! =============================================================================
+//!
+//! =============================================================================
+//! Issue #124 — [High] Build an on-chain proposal-and-vote flow for onboarding
+//! a new coverage type end-to-end
+//! https://github.com/Refract-Protocol/refract-contracts/issues/124
+//!
+//! ── RELATION OF THIS FILE TO #124 ────────────────────────────────────────────
+//!
+//! The policy registry is one of the contracts that must be configured as part
+//! of a NewCoverageType onboarding proposal. Specifically, when a new coverage
+//! type is added (after the prerequisite WASM upgrade that adds the new enum
+//! variant), the governance execution sequence must:
+//!
+//!   1. Pool:    set per-type exposure cap (pool's exposure_cap setter)
+//!   2. Oracle:  bind feed ID + set trigger threshold for the new type
+//!   3. Pool:    set risk multiplier for the new type
+//!   4. Policy:  (this contract) — no configuration setter needed here today.
+//!              The registry is a generic index; it stores PolicyRecord structs
+//!              for ANY coverage type without type-specific configuration.
+//!              The registry does NOT need to be updated as part of the
+//!              NewCoverageType onboarding sequence.
+//!
+//! This means the governance contract's execution sequence for
+//! ProposalType::NewCoverageType does NOT need to call this contract.
+//! That is a simplification worth documenting explicitly so the governance
+//! implementation does not add an unnecessary call site here.
+//!
+//! FULL GOVERNANCE DESIGN (for the new governance/src/lib.rs contract)
+//! -------------------------------------------------------------------
+//! See governance/src/lib.rs for the complete implementation plan for #124.
+//! The key points relevant to this file:
+//!
+//!   • The registry is NOT in the onboarding call sequence.
+//!   • If a future version of the registry gains per-type configuration
+//!     (e.g., type-specific query limits or fee tiers), the governance
+//!     NewCoverageType proposal type can be extended at that time.
+//!
+//! =============================================================================
+//!
+//! Refract Policy Registry Contract
+//!
+//! Stores all policy metadata on-chain as a lightweight sidecar to the Pool
+//! contract. The Pool contract is the source of truth for capital; this
+//! contract provides a queryable index of policies per holder.
+//!
 
 #![no_std]
+#![warn(missing_docs)]
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
 };
 
-/// Coverage types (must match RefractPool enum).
+/// Coverage types offered across the protocol (must match RefractPool enum).
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum CoverageType {
+    /// Coverage against stablecoin peg deviation (e.g. USDC < $0.95).
     StablecoinDepeg = 0,
+    /// Coverage against broad market drawdowns (e.g. 24h return < -30%).
+    M
+
+#![no_std]
+#![warn(missing_docs)]
+
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
+};
+
+/// Coverage types offered across the protocol (must match RefractPool enum).
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum CoverageType {
+    /// Coverage against stablecoin peg deviation (e.g. USDC < $0.95).
+    StablecoinDepeg = 0,
+    /// Coverage against broad market drawdowns (e.g. 24h return < -30%).
     MarketCrash = 1,
+    /// Protection against DeFi collateral liquidation events.
     LiquidationShield = 2,
+    /// Coverage against smart contract exploits or protocol TVL collapse.
     SmartContractRisk = 3,
+    /// Parametric flight delay coverage (> 120 minutes).
     FlightDelay = 4,
 }
 
 /// Errors returned by the registry. State-changing entrypoints still call
 /// `require_auth()` directly (which panics on a missing/invalid signature —
 /// that failure mode is not recoverable), but every *recoverable* misuse
-/// (wrong principal, unknown policy, double init) now returns a typed error
+/// (wrong principal, unknown policy, double init) returns a typed error
 /// instead of panicking, matching the convention used by `RefractPool`.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RegistryError {
+    /// Contract has already been initialized.
     AlreadyInitialized = 1,
+    /// Contract has not yet been initialized.
     NotInitialized = 2,
+    /// Caller is not authorized to perform the requested operation.
     Unauthorized = 3,
+    /// Requested policy ID was not found in storage.
     PolicyNotFound = 4,
+    /// A policy with the specified ID already exists in storage.
     PolicyAlreadyExists = 5,
+    NoPendingPoolContract = 6,
+    PoolContractChangeNotReady = 7,
+    NoPendingAdmin = 8,  // Issue #88: no pending admin to accept
 }
 
 /// Parameters for indexing a policy that the Pool contract already created.
@@ -223,39 +274,85 @@ pub enum RegistryError {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PolicyRegistration {
+    /// Unique policy ID assigned by the Pool contract.
     pub policy_id: u64,
+    /// Address of the policyholder.
     pub holder: Address,
+    /// Type of insurance coverage.
     pub coverage_type: CoverageType,
-    pub coverage_amount: i128, // 1e7 USDC
-    pub premium: i128,         // 1e7 USDC
-    pub expires_at: u64,       // unix timestamp
+    /// Covered payout amount in 1e7 USDC units.
+    pub coverage_amount: i128,
+    /// Upfront premium paid in 1e7 USDC units.
+    pub premium: i128,
+    /// Unix timestamp when coverage expires.
+    pub expires_at: u64,
 }
 
-/// On-chain policy record.
+/// On-chain policy record stored in contract persistent storage.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyRecord {
+    /// Unique policy ID assigned by the Pool contract.
     pub policy_id: u64,
+    /// Address of the policyholder.
     pub holder: Address,
+    /// Type of insurance coverage.
     pub coverage_type: CoverageType,
-    pub coverage_amount: i128, // 1e7 USDC
-    pub premium: i128,         // 1e7 USDC
-    pub expires_at: u64,       // unix timestamp
+    /// Covered payout amount in 1e7 USDC units.
+    pub coverage_amount: i128,
+    /// Upfront premium paid in 1e7 USDC units.
+    pub premium: i128,
+    /// Unix timestamp when coverage expires.
+    pub expires_at: u64,
+    /// Whether the policy is currently active.
     pub is_active: bool,
+    /// Unix timestamp when the policy was registered.
     pub created_at: u64,
+}
+
+/// A pending, delayed repoint of the trusted pool contract. Mirrors the
+/// relayer-addition notice-period pattern: the currently-active pool stays
+/// fully functional until `confirm_pool_contract` is called after the delay.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPoolContract {
+    pub pool_contract: Address,
+    pub executable_at: u64,
 }
 
 #[contracttype]
 pub enum DataKey {
+    /// Admin address key (instance storage).
     Admin,
+    /// Authorized Pool contract address key (instance storage).
     PoolContract,
-    Policy(u64),             // policy_id → PolicyRecord
-    HolderPolicies(Address), // address → Vec<u64>
+    /// Policy record mapped by policy ID (persistent storage).
+    Policy(u64),
+    /// List of policy IDs mapped by holder address (persistent storage).
+    HolderPolicies(Address),
+    /// Cumulative count of registered policies (instance storage).
     TotalPolicies,
+    /// Cumulative volume of collected premiums in 1e7 USDC (instance storage).
     TotalPremium,
+    /// Count of currently active policies (instance storage).
     ActivePolicies,
+    /// Issue #88: Pending admin awaiting acceptance
+    PendingAdmin,
+    /// #70: Track contract version for migration purposes
+    ContractVersion,
+}
+    TotalPolicies,
+    /// Cumulative volume of collected premiums in 1e7 USDC (instance storage).
+    TotalPremium,
+    /// Count of currently active policies (instance storage).
+    ActivePolicies,
+    /// Issue #88: Pending admin awaiting acceptance
+    PendingAdmin,
+    /// #70: Track contract version for migration purposes
+    ContractVersion,
 }
 
+/// Refract Policy Registry smart contract.
 #[contract]
 pub struct RefractPolicyRegistry;
 
@@ -263,6 +360,9 @@ pub struct RefractPolicyRegistry;
 impl RefractPolicyRegistry {
     // ─── Initialization ───────────────────────────────────────────────────
 
+    /// Initialize the policy registry contract with an admin and pool contract address.
+    ///
+    /// Returns [`RegistryError::AlreadyInitialized`] if already initialized.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -370,6 +470,10 @@ impl RefractPolicyRegistry {
         Ok(policy_id)
     }
 
+    /// Deactivate an active policy upon claim settlement or expiration.
+    ///
+    /// If the policy is already inactive, this is a no-op to prevent duplicate event
+    /// emission or underflow of active policy counters.
     pub fn deactivate_policy(
         env: Env,
         caller: Address,
@@ -411,43 +515,123 @@ impl RefractPolicyRegistry {
 
     // ─── Admin ────────────────────────────────────────────────────────────
 
-    /// Repoint the RefractPool this registry trusts to call
-    /// register_policy()/deactivate_policy(). Only needed after a pool
-    /// redeploy/migration — `initialize` already wires the pool address
-    /// set at deploy time. Deliberately admin-only rather than
-    /// admin-or-pool (unlike register_policy/deactivate_policy): the pool
-    /// itself must never be able to redirect which pool address the
+    /// Configure the minimum delay (in seconds) that must elapse between
+    /// proposing a new pool contract and confirming it. Admin-only.
+    pub fn set_pool_contract_change_delay(
+        env: Env,
+        caller: Address,
+        delay: u64,
+    ) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolContractChangeDelay, &delay);
+        env.events().publish(
+            (Symbol::new(&env, "pool_contract_delay_set"),),
+            delay,
+        );
+        Ok(())
+    }
+
+    /// Propose a new RefractPool for this registry to trust. The currently-
+    /// active pool remains fully functional until `confirm_pool_contract` is
+    /// called after the configured delay. Calling this again overwrites any
+    /// pending proposal (and restarts the delay window), matching how the
+    /// relayer-addition pattern handles overwriting a pending proposal.
+    ///
+    /// Only needed after a pool redeploy/migration — `initialize` already
+    /// wires the pool address set at deploy time. Deliberately admin-only
+    /// rather than admin-or-pool (unlike register_policy/deactivate_policy):
+    /// the pool itself must never be able to redirect which pool address the
     /// registry trusts.
-    pub fn set_pool_contract(
+    pub fn propose_pool_contract(
         env: Env,
         caller: Address,
         pool_contract: Address,
     ) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
+        let delay: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolContractChangeDelay)
+            .unwrap_or(0);
+        let executable_at = env.ledger().timestamp() + delay;
+        let pending = PendingPoolContract {
+            pool_contract: pool_contract.clone(),
+            executable_at,
+        };
         env.storage()
             .instance()
-            .set(&DataKey::PoolContract, &pool_contract);
+            .set(&DataKey::PendingPoolContract, &pending);
+        env.events().publish(
+            (Symbol::new(&env, "pool_contract_proposed"),),
+            (pool_contract, executable_at),
+        );
+        Ok(())
+    }
 
-        env.events()
-            .publish((Symbol::new(&env, "pool_contract_set"),), (pool_contract,));
+    /// Confirm a previously-proposed pool contract once the delay has
+    /// elapsed. Rejects if there is no pending proposal or if the delay has
+    /// not yet passed. The active pool address is only swapped here.
+    pub fn confirm_pool_contract(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+        let pending: PendingPoolContract = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingPoolContract)
+            .ok_or(RegistryError::NoPendingPoolContract)?;
+        if env.ledger().timestamp() < pending.executable_at {
+            return Err(RegistryError::PoolContractChangeNotReady);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolContract, &pending.pool_contract);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingPoolContract);
+        env.events().publish(
+            (Symbol::new(&env, "pool_contract_confirmed"),),
+            pending.pool_contract,
+        );
         Ok(())
     }
 
     /// Rotate the admin key. The only recovery path if the current admin
-    /// key is lost or compromised — without it, set_pool_contract and this
-    /// function itself would be permanently stuck on whatever key was set
-    /// at initialize().
-    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), RegistryError> {
+    /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
+    pub fn propose_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
 
         env.events()
-            .publish((Symbol::new(&env, "admin_set"),), (new_admin,));
+            .publish((Symbol::new(&env, "admin_proposed"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Issue #88: Accept admin role. Must be called by the proposed admin.
+    pub fn accept_admin(env: Env, caller: Address) -> Result<(), RegistryError> {
+        caller.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(RegistryError::NoPendingAdmin)?;
+        if pending != caller {
+            return Err(RegistryError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_accepted"),), (caller,));
         Ok(())
     }
 
     // ─── Queries ──────────────────────────────────────────────────────────
 
+    /// Retrieve the [`PolicyRecord`] for a given policy ID.
     pub fn get_policy(env: Env, policy_id: u64) -> Result<PolicyRecord, RegistryError> {
         env.storage()
             .persistent()
@@ -455,6 +639,7 @@ impl RefractPolicyRegistry {
             .ok_or(RegistryError::PolicyNotFound)
     }
 
+    /// Retrieve all policy IDs associated with a given holder address.
     pub fn get_holder_policy_ids(env: Env, holder: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -469,90 +654,98 @@ impl RefractPolicyRegistry {
     pub fn get_holder_active_policy_ids(env: Env, holder: Address) -> Vec<u64> {
         let ids: Vec<u64> = env
             .storage()
-            .persistent()
-            .get(&DataKey::HolderPolicies(holder))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut active = Vec::new(&env);
-        for id in ids.iter() {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, PolicyRecord>(&DataKey::Policy(id))
-            {
-                if record.is_active {
-                    active.push_back(id);
-                }
-            }
-        }
-        active
-    }
-
-    pub fn get_stats(env: Env) -> Map<Symbol, i128> {
-        let mut stats: Map<Symbol, i128> = Map::new(&env);
-        let total: u64 = env
-            .storage()
             .instance()
-            .get(&DataKey::TotalPolicies)
-            .unwrap_or(0);
-        let premium: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalPremium)
-            .unwrap_or(0);
-        let active: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ActivePolicies)
-            .unwrap_or(0);
-        stats.set(Symbol::new(&env, "total_policies"), total as i128);
-        stats.set(Symbol::new(&env, "total_premium"), premium);
-        stats.set(Symbol::new(&env, "active_policies"), active as i128);
-        stats
-    }
-
-    /// The address currently authorized to call set_admin()/
-    /// set_pool_contract(). Without this, verifying who holds admin
-    /// control meant replaying event history instead of just reading
-    /// current state.
-    pub fn admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Admin)
-    }
-
-    /// The RefractPool address this registry currently trusts to call
-    /// register_policy()/deactivate_policy(). Without this,
-    /// set_pool_contract() would be a write with no matching read.
-    pub fn pool_contract(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::PoolContract)
-    }
-
-    // ─── Internal ─────────────────────────────────────────────────────────
-
-    /// Only the registered Pool contract or the admin may mutate the registry.
-    /// The caller must authorize the invocation (this panics on a missing or
-    /// invalid signature — not recoverable); we then verify the authorized
-    /// address is one of the two privileged principals, which *is* recoverable
-    /// and reported as a typed error.
-    fn require_pool_or_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
-        caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(RegistryError::NotInitialized)?;
-        let pool: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::PoolContract)
-            .ok_or(RegistryError::NotInitialized)?;
-        if caller != &admin && caller != &pool {
+            .get(&DataKey::PendingAdmin)
+            .ok_or(RegistryError::NoPendingAdmin)?;
+        if pending != caller {
             return Err(RegistryError::Unauthorized);
         }
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_accepted"),), (caller,));
         Ok(())
     }
 
-    /// Stricter than require_pool_or_admin: used by set_pool_contract and
-    /// set_admin, which must never be callable by the pool contract itself.
+    /// #70: Admin-gated contract upgrade.
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+
+        let old_wasm_hash = env.deployer().get_current_contract_wasm().unwrap_or_default();
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Bump contract version for migration tracking
+        let version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &(version + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &(version + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending pool-contract repoint before it is confirmed. The
+    /// active pool address is untouched.
+    pub fn cancel_pool_contract(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::PendingPoolContract)
+        {
+            return Err(RegistryError::NoPendingPoolContract);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingPoolContract);
+        env.events()
+            .publish((Symbol::new(&env, "pool_contract_cancelled"),), ());
+        Ok(())
+    }
+
+    /// Read the currently-pending pool-contract proposal, if any.
+    pub fn get_pending_pool_contract(env: Env) -> Option<PendingPoolContract> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingPoolContract)
+    }
+
+    /// Read the currently-active trusted pool contract.
+    pub fn get_pool_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PoolContract)
+    }
+
+    // ─── Internal helpers ─────────────────────────────────────────────────
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
         caller.require_auth();
         let admin: Address = env
@@ -560,12 +753,35 @@ impl RefractPolicyRegistry {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(RegistryError::NotInitialized)?;
-        if caller != &admin {
+        if &admin != caller {
+            return Err(RegistryError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_pool_or_admin(env: &Env, caller: &Address) -> Result<(), RegistryError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RegistryError::NotInitialized)?;
+        if &admin == caller {
+            return Ok(());
+        }
+        let pool: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolContract)
+            .ok_or(RegistryError::NotInitialized)?;
+        if &pool != caller {
             return Err(RegistryError::Unauthorized);
         }
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod registry_proptest;

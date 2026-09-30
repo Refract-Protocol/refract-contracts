@@ -1,0 +1,44 @@
+version: 2
+updates:
+  # Automated updates for GitHub Actions workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # Automated updates for Cargo ecosystem
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "cargo"
+    groups:
+      # Isolated soroban-sdk group with dedicated breaking-risk handling
+      soroban-sdk:
+        applies-to: "version-updates"
+        patterns:
+          - "soroban-sdk*"
+      # Routine dev-dependencies grouped together
+      routine-dev-dependencies:
+        applies-to: "version-updates"
+        patterns:
+          - "proptest*"
+        exclude-patterns:
+          - "soroban-sdk*"

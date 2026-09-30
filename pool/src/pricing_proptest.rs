@@ -166,6 +166,15 @@
 //! hand-set `TotalCapital`/`TotalShares` values rather than going through
 //! the full `provide_capital` entrypoint — this isolates the pricing math
 //! itself from token transfers and auth.
+//!
+//! # Snapshot Management
+//!
+//! Storage-backed tests reading `TotalCapital`/`TotalShares` need a live `Env`,
+//! and every `Env::default()` writes its own cost/budget snapshot to `test_snapshots/`.
+//! Letting `proptest!` generate a fresh `Env` per case (its default is 256 cases) would
+//! leave hundreds of throwaway snapshot files behind. Therefore, those tests drive cases
+//! manually through `TestRunner` against a single `Env` created once, matching the
+//! "one snapshot per test function" convention across this repository.
 
 use super::*;
 use ::proptest::prelude::*;
@@ -178,6 +187,7 @@ fn config() -> PoolConfig {
         min_coverage: 0,
         max_coverage: i128::MAX / (PRECISION * 400), // headroom for _calc_premium's math
         lockup_days: 7,
+        min_relayers_for_claim: 0,
     }
 }
 
@@ -313,13 +323,13 @@ fn calc_shares_never_mints_value_out_of_thin_air() {
     TestRunner::default()
         .run(&cases, |(total_capital, total_shares, amount)| {
             let shares = env.as_contract(&pool_id, || {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::TotalCapital, &total_capital);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::TotalShares, &total_shares);
-                RefractPool::_calc_shares(&env, amount)
+                let state = PoolState {
+                    config: config(),
+                    total_capital,
+                    total_shares,
+                    total_coverage: 0,
+                };
+                RefractPool::_calc_shares(&state, amount)
             });
 
             prop_assert!(shares >= 0);
@@ -337,9 +347,13 @@ fn calc_shares_is_1to1_when_pool_is_empty() {
     TestRunner::default()
         .run(&(0i128..1_000_000_000 * PRECISION), |amount| {
             let shares = env.as_contract(&pool_id, || {
-                env.storage().instance().set(&DataKey::TotalCapital, &0i128);
-                env.storage().instance().set(&DataKey::TotalShares, &0i128);
-                RefractPool::_calc_shares(&env, amount)
+                let state = PoolState {
+                    config: config(),
+                    total_capital: 0,
+                    total_shares: 0,
+                    total_coverage: 0,
+                };
+                RefractPool::_calc_shares(&state, amount)
             });
 
             prop_assert_eq!(shares, amount);
@@ -371,19 +385,13 @@ fn quote_withdrawal_never_returns_more_than_total_capital() {
             &cases,
             |(total_capital, total_shares, total_coverage, shares)| {
                 let result = env.as_contract(&pool_id, || {
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::TotalCapital, &total_capital);
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::TotalShares, &total_shares);
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::TotalCoverage, &total_coverage);
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::PoolConfig, &config());
-                    RefractPool::_quote_withdrawal(&env, shares)
+                    let state = PoolState {
+                        config: config(),
+                        total_capital,
+                        total_shares,
+                        total_coverage,
+                    };
+                    RefractPool::_quote_withdrawal(&state, shares)
                 });
 
                 if shares > total_shares {

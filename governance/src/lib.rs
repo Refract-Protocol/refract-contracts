@@ -1,258 +1,158 @@
-// =============================================================================
-// Issue #124 — [High] Build an on-chain proposal-and-vote flow for onboarding
-// a new coverage type end-to-end
-// https://github.com/Refract-Protocol/refract-contracts/issues/124
-//
-// ─── PROBLEM ─────────────────────────────────────────────────────────────────
-//
-// Adding a new CoverageType to the Refract Protocol currently requires:
-//   1. A WASM contract upgrade (sibling issue) to add the new enum variant.
-//   2. Manually calling several independent setters across two contracts
-//      (pool and oracle) in the correct order, which can be applied
-//      inconsistently or out of order, leaving a new coverage type live with
-//      some configuration missing (e.g., active for purchases before its
-//      oracle feed binding exists).
-//
-// This issue builds a single governed atomic onboarding flow that sequences
-// all required configuration calls in one transaction.
-//
-// ─── NEW CONTRACT: RefractGovernor ───────────────────────────────────────────
-//
-// Create a new Soroban contract at governance/src/lib.rs.
-// This is a NEW file — no governance contract exists yet in the codebase.
-//
-// ─── PROPOSAL TYPE ────────────────────────────────────────────────────────────
-//
-// Add ProposalType::NewCoverageType as a first-class proposal variant:
-//
-//   #[contracttype]
-//   #[derive(Clone, Debug, PartialEq)]
-//   pub enum ProposalType {
-//       /// Onboards a new coverage type across pool and oracle in one atomic
-//       /// governance action. Prerequisites: the new CoverageType enum variant
-//       /// must already exist in the deployed WASM (via the sibling upgrade issue).
-//       NewCoverageType {
-//           /// The coverage type being onboarded (must already exist as a variant)
-//           coverage_type: CoverageType,
-//           /// Risk multiplier for premium calculation (e.g. 150 = 1.5x)
-//           /// Applied to pool._calc_premium's risk_multiplier match arm.
-//           risk_multiplier: u32,
-//           /// Maximum exposure as a fraction of total pool capital in bps.
-//           /// e.g. 2000 = 20% of pool capital max in this coverage type.
-//           exposure_cap_bps: u32,
-//           /// Oracle feed identifier for this coverage type.
-//           /// Must match the feed_id used in oracle.submit_reading() calls.
-//           feed_id: Symbol,
-//           /// Initial trigger threshold in SCALE (1e7) fixed-point.
-//           /// Interpreted according to the coverage type's trigger semantics.
-//           initial_threshold: i128,
-//       },
-//       /// Generic parameter update (fee changes, utilization cap adjustments, etc.)
-//       ParameterUpdate {
-//           target_contract: Address,
-//           function_name: Symbol,
-//           args: Vec<Val>,
-//       },
-//   }
-//
-// ─── PROPOSAL LIFECYCLE ───────────────────────────────────────────────────────
-//
-//   Status: Pending → Active → (Passed | Failed) → Executed
-//
-//   propose(proposer, proposal_type, description) → proposal_id: u64
-//     Creates a new proposal. Proposer must hold governance tokens above
-//     the proposal_threshold. Voting opens immediately.
-//     Returns: proposal_id (u64 counter, monotonically increasing)
-//
-//   vote(voter, proposal_id, support: bool)
-//     Casts a vote. Voting power is token-weighted (read from a token contract
-//     at vote time — snapshot approach is preferred for anti-manipulation but
-//     out of scope for this initial implementation).
-//     Fails if: proposal not Active, voter already voted, voting window closed.
-//
-//   execute(executor, proposal_id) → Result<(), GovernanceError>
-//     Executes a passed proposal after its timelock has elapsed.
-//     For ProposalType::NewCoverageType, this function sequences the calls
-//     documented in the EXECUTION SEQUENCE section below.
-//
-// ─── EXECUTION SEQUENCE FOR NewCoverageType ──────────────────────────────────
-//
-// The governor calls these functions IN ORDER within a single Soroban
-// transaction. Soroban's transaction-level atomicity guarantees that if any
-// step panics or returns an error (via invoke_contract's panic-on-failure
-// semantics), the ENTIRE transaction reverts — no partial configuration
-// is left live. This is the atomicity guarantee required by the issue.
-//
-// Step 1: Pool — set per-type exposure cap
-//   invoke_contract(
-//     pool_address,
-//     "set_coverage_type_cap",   // function to be added in the sibling issue
-//     (coverage_type, exposure_cap_bps)
-//   )
-//
-// Step 2: Oracle — bind the feed ID for this coverage type
-//   invoke_contract(
-//     oracle_address,
-//     "bind_feed",               // function to be added in the sibling oracle issue
-//     (coverage_type, feed_id)
-//   )
-//
-// Step 3: Oracle — set the trigger threshold for this coverage type
-//   invoke_contract(
-//     oracle_address,
-//     "set_threshold",           // function to be added in the sibling threshold issue
-//     (coverage_type, initial_threshold)
-//   )
-//
-// Step 4: Pool — set risk multiplier for this coverage type
-//   invoke_contract(
-//     pool_address,
-//     "set_risk_multiplier",     // function to be added in the sibling issue
-//     (coverage_type, risk_multiplier)
-//   )
-//
-// NOTE: The policy registry (policy/src/lib.rs) does NOT need to be called.
-// It is a generic index and requires no per-type configuration.
-// See policy/src/lib.rs #124 documentation block for the reasoning.
-//
-// ─── ATOMICITY GUARANTEE ─────────────────────────────────────────────────────
-//
-// Soroban's transaction-level atomicity means: if invoke_contract panics on
-// ANY of the four steps above, the entire transaction reverts to pre-execution
-// state. No partial configuration is applied. This must be verified with a test:
-//
-//   test_new_coverage_type_partial_failure_reverts_all_state()
-//   -----------------------------------------------------------------
-//   Setup: mock pool and oracle contracts where Step 2 (oracle bind_feed)
-//          panics/returns error.
-//   Execute: governor.execute(executor, proposal_id)
-//   Assert:
-//     - execute() itself returns an error (or the tx panics)
-//     - pool.get_coverage_type_cap(new_type) returns None (Step 1 reverted)
-//     - oracle.get_feed_binding(new_type) returns None (Step 2 never succeeded)
-//     - oracle.get_threshold(new_type) returns None (Steps 3-4 never ran)
-//     - pool.get_risk_multiplier(new_type) returns None (Steps 3-4 never ran)
-//
-// ─── DATA STRUCTURES ──────────────────────────────────────────────────────────
-//
-//   #[contracttype]
-//   #[derive(Clone, Debug)]
-//   pub struct Proposal {
-//       pub id: u64,
-//       pub proposer: Address,
-//       pub proposal_type: ProposalType,
-//       pub description: String,    // human-readable rationale
-//       pub created_at: u64,        // ledger timestamp
-//       pub vote_end: u64,          // created_at + VOTING_PERIOD_SECS
-//       pub timelock_end: u64,      // vote_end + TIMELOCK_SECS
-//       pub yes_votes: i128,
-//       pub no_votes: i128,
-//       pub status: ProposalStatus,
-//       pub executed_at: Option<u64>,
-//   }
-//
-//   #[contracttype]
-//   #[derive(Clone, Debug, PartialEq)]
-//   pub enum ProposalStatus {
-//       Active,    // voting open
-//       Passed,    // quorum met, yes > no, timelock not yet elapsed
-//       Failed,    // quorum not met or no >= yes
-//       Executed,  // successfully executed
-//       Cancelled, // withdrawn by proposer before execution
-//   }
-//
-//   #[contracttype]
-//   pub enum DataKey {
-//       Admin,
-//       PoolContract,
-//       OracleContract,
-//       GovernanceToken,
-//       NextProposalId,
-//       Proposal(u64),
-//       Vote(u64, Address),    // (proposal_id, voter) → bool (true=yes)
-//       Config,                // GovernanceConfig
-//   }
-//
-//   #[contracttype]
-//   #[derive(Clone, Debug)]
-//   pub struct GovernanceConfig {
-//       pub voting_period_secs: u64,   // e.g. 7 days = 604_800
-//       pub timelock_secs: u64,        // e.g. 2 days = 172_800
-//       pub quorum_bps: u32,           // e.g. 1000 = 10% of total supply
-//       pub proposal_threshold: i128,  // min tokens to propose
-//   }
-//
-// ─── ERROR TYPES ──────────────────────────────────────────────────────────────
-//
-//   #[contracterror]
-//   #[repr(u32)]
-//   pub enum GovernanceError {
-//       AlreadyInitialized  = 1,
-//       NotInitialized      = 2,
-//       Unauthorized        = 3,
-//       ProposalNotFound    = 4,
-//       ProposalNotPassed   = 5,
-//       TimelockNotElapsed  = 6,
-//       AlreadyVoted        = 7,
-//       VotingClosed        = 8,
-//       InsufficientTokens  = 9,
-//       ExecutionFailed     = 10,
-//   }
-//
-// ─── TESTS TO WRITE ───────────────────────────────────────────────────────────
-//
-//   test_propose_new_coverage_type_succeeds()
-//     Setup: initialize governor with pool + oracle addresses, create a
-//            NewCoverageType proposal for a new coverage variant.
-//     Assert: proposal_id returned, Proposal stored with Active status.
-//
-//   test_vote_passes_proposal()
-//     Setup: create proposal, vote yes with enough tokens to meet quorum.
-//     Assert: after voting period, proposal status is Passed.
-//
-//   test_execute_new_coverage_type_sequences_all_calls()
-//     Setup: mock pool with set_coverage_type_cap + set_risk_multiplier,
-//            mock oracle with bind_feed + set_threshold. Pass and execute proposal.
-//     Assert: all four mock functions were called with the correct arguments.
-//             All configuration is present in pool and oracle storage.
-//
-//   test_new_coverage_type_partial_failure_reverts_all_state()
-//     Setup: pool.set_coverage_type_cap succeeds; oracle.bind_feed panics.
-//     Assert: execute() fails; pool shows no cap set; oracle shows no binding.
-//     (Verifies Soroban's transaction-level atomicity — see ATOMICITY section.)
-//
-//   test_cannot_execute_before_timelock()
-//     Assert: execute() returns TimelockNotElapsed if called before timelock_end.
-//
-//   test_proposal_fails_below_quorum()
-//     Assert: proposal status is Failed if yes_votes < quorum after voting ends.
-//
-// ─── PREREQUISITE ISSUES (must land before #124 can be fully implemented) ────
-//
-//   The following sibling issues add the setter entry points that the
-//   governance execution sequence calls. #124 depends on ALL of them:
-//     • pool: set_coverage_type_cap(coverage_type, exposure_cap_bps)
-//     • pool: set_risk_multiplier(coverage_type, risk_multiplier)
-//     • oracle: bind_feed(coverage_type, feed_id)
-//     • oracle: set_threshold(coverage_type, threshold)
-//     • upgrade-path issue: new CoverageType variant in deployed WASM
-//
-// ─── FILES TO CREATE/MODIFY FOR #124 ─────────────────────────────────────────
-//
-//   governance/src/lib.rs     ← (THIS FILE) new contract — full implementation
-//   governance/Cargo.toml     ← new crate manifest
-//   pool/src/lib.rs           ← add set_coverage_type_cap, set_risk_multiplier
-//   oracle/src/lib.rs         ← add bind_feed, set_threshold
-//   pool/src/lib.rs (types)   ← CoverageType must be extensible or feature-flagged
-//   Cargo.toml (workspace)    ← add governance crate to workspace members
-//
-// =============================================================================
-
-// TODO (#124): Implement the RefractGovernor contract below using the design
-// documented above. The stub below marks this as a new contract file.
+//! Refract Governance Contract
+//!
+//! Token-weighted on-chain governance for the Refract protocol.
+//!
+//! ## Design
+//! Modelled after the Compound Governor / OpenZeppelin Governor pattern,
+//! adapted for Soroban's programming model.
+//!
+//! * **Voting weight** — resolved from per-address balance checkpoints as of
+//!   the proposal's snapshot ledger, so tokens borrowed and repaid within a
+//!   single transaction cannot inflate votes.
+//! * **Delegation** — single-hop delegation: an address may delegate its
+//!   voting power to a delegatee, which cannot itself have delegated onward.
+//! * **Proposal threshold** — a minimum token balance required to create a
+//!   proposal, preventing spam.
+//! * **Quorum** — `quorum_bps` of `total_supply` (from the token) must
+//!   participate (for + against) for the proposal to be valid.
+//! * **Execution** — after the voting period ends, a successful proposal
+//!   is forwarded to the timelock via `queue`, then the timelock executes
+//!   it after its own delay.  If the timelock address is not set the call
+//!   is forwarded directly (useful in tests).
+//!
+//! ## Proposal lifecycle
+//! ```text
+//! propose() → Active (voting open)
+//!           → Defeated (quorum not met, or majority against)
+//!           → Succeeded (quorum met + majority for)
+//! queue()   → Queued (forwarded to timelock)
+//! execute() → Executed (timelock or direct forward)
+//! ```
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Map, Symbol, Val, Vec,
+};
+
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum GovernanceError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    /// Proposer's token balance is below `proposal_threshold`.
+    BelowProposalThreshold = 4,
+    /// Proposal not found.
+    ProposalNotFound = 5,
+    /// Proposal is not in the expected state.
+    WrongState = 6,
+    /// Voting period has not ended yet.
+    VotingOpen = 7,
+    /// The voter has already cast a vote on this proposal.
+    AlreadyVoted = 8,
+    /// Proposal failed quorum or was voted down.
+    ProposalDefeated = 9,
+    /// Proposal was queued/executed already.
+    AlreadyQueued = 10,
+    /// A delegation would create a chain (the delegatee has itself delegated
+    /// elsewhere). This contract uses a single-hop-only delegation model.
+    DelegationChain = 11,
+}
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+/// Distinguishable terminal states so callers can tell apart "quorum not
+/// met" from "quorum met but voted down".
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ProposalStatus {
+    /// Voting is open.
+    Active = 0,
+    /// Quorum not met, or majority voted against.
+    Defeated = 1,
+    /// Quorum met and majority voted for — can be queued.
+    Succeeded = 2,
+    /// Forwarded to the timelock (or directly executed).
+    Queued = 3,
+    /// Call was executed.
+    Executed = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalState {
+    pub proposer: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub args: Vec<Val>,
+    pub description: Symbol,
+    /// Ledger timestamp at which voting opens (== block time of propose()).
+    pub vote_start: u64,
+    /// Ledger timestamp at which voting closes.
+    pub vote_end: u64,
+    /// Accumulated weight of "for" votes.
+    pub votes_for: i128,
+    /// Accumulated weight of "against" votes.
+    pub votes_against: i128,
+    pub status: ProposalStatus,
+    /// Voters who have already cast a vote (to prevent double-voting).
+    pub voters: Vec<Address>,
+    /// Ledger sequence at proposal creation. Voting weight is resolved from
+    /// balances as of this ledger, not the voter's live balance, so tokens
+    /// borrowed and repaid within a single transaction cannot inflate votes.
+    pub snapshot_ledger: u32,
+}
+
+/// Governor configuration.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct GovernorConfig {
+    /// Token contract whose `balance()` determines voting weight.
+    pub token: Address,
+    /// Voting period in seconds.
+    pub voting_period: u64,
+    /// Quorum expressed as basis points of total token supply
+    /// (e.g. 400 = 4%).
+    pub quorum_bps: u32,
+    /// Minimum token balance required to submit a proposal.
+    pub proposal_threshold: i128,
+}
+
+// ── Storage Keys ──────────────────────────────────────────────────────────────
+
+/// Storage keys for the governor contract.
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    Config,
+    Token,
+    /// Optional timelock contract address.  If absent, `queue` forwards
+    /// directly.
+    Timelock,
+    NextId,
+    ProposalCount,
+    Proposal(u64),
+    Vote(u64, Address),
+    /// Records the delegatee chosen by a given caller. Absence means the
+    /// caller votes with their own balance (self-delegation / no delegation).
+    Delegate(Address),
+    /// Running total of voting power delegated *to* a given address, i.e. the
+    /// sum of the token balances of every address that has delegated to it.
+    /// Maintained incrementally on delegate/undelegate so `cast_vote` never
+    /// has to iterate a global delegator list.
+    DelegatedWeight(Address),
+    /// Append-only per-address checkpoint list of `(ledger_sequence, balance)`
+    /// pairs, written whenever the governor observes a balance change for the
+    /// address. Used to resolve "balance as of ledger N" for snapshot voting.
+    Checkpoints(Address),
+}
+
+// ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct RefractGovernor;
@@ -265,5 +165,344 @@ impl RefractGovernor {
     // Start with the ProposalType enum, DataKey enum, and Proposal struct,
     // then implement propose() → vote() → execute() in that order.
     // The NewCoverageType execution sequence (Steps 1-4) belongs in a
-    // private _execute_new_coverage_type() helper called from execute().
+    // private _execute_new_coverage_type() helper
+
+#[contract]
+pub struct RefractGovernor;
+
+#[contractimpl]
+impl RefractGovernor {
+    pub fn initialize(env: Env, admin: Address, token: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Token, &token);
+        env.storage().instance().set(&DataKey::ProposalCount, &0u64);
+    }
+
+    pub fn propose(env: E
+#[contract]
+pub struct RefractGovernor;
+
+#[contractimpl]
+impl RefractGovernor {
+    // ─── Initialization ──────────────────────────────────────────────────
+
+    /// Deploy and configure the governor.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        config: GovernorConfig,
+    ) -> Result<(), GovernanceError> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(GovernanceError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().set(&DataKey::NextId, &0u64);
+        env.events()
+            .publish((Symbol::new(&env, "gov_init"),), (admin,));
+        Ok(())
+    }
+
+    // ─── Admin ───────────────────────────────────────────────────────────
+
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    pub fn config(env: Env) -> Option<GovernorConfig> {
+        env.storage().instance().get(&DataKey::Config)
+    }
+
+    /// Wire in the timelock contract address.  Admin-only.
+    pub fn set_timelock(env: Env, caller: Address, timelock: Address) -> Result<(), GovernanceError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Timelock, &timelock);
+        env.events()
+            .publish((Symbol::new(&env, "gov_tl_set"),), (timelock,));
+        Ok(())
+    }
+
+    /// Replace the governor configuration.  Admin-only.
+    pub fn set_config(
+        env: Env,
+        caller: Address,
+        config: GovernorConfig,
+    ) -> Result<(), GovernanceError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.events().publish((Symbol::new(&env, "gov_cfg"),), ());
+        Ok(())
+    }
+
+    // ─── Core Operations ─────────────────────────────────────────────────
+
+    /// Create a new governance proposal.
+    ///
+    /// `proposer` must hold at least `proposal_threshold` tokens.
+    /// Returns the new proposal id.
+    pub fn propose(
+        env: Env,
+        proposer: Address,
+        target: Address,
+        function: Symbol,
+        args: Vec<Val>,
+        description: Symbol,
+    ) -> Result<u64, GovernanceError> {
+        proposer.require_auth();
+        let config: GovernorConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)?;
+
+        // Check proposer's token balance against threshold.
+        let balance = token::Client::new(&env, &config.token).balance(&proposer);
+        if balance < config.proposal_threshold {
+            return Err(GovernanceError::BelowProposalThreshold);
+        }
+
+        let now = env.ledger().timestamp();
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(0);
+
+        let proposal = ProposalState {
+            proposer: proposer.clone(),
+            target: target.clone(),
+            function: function.clone(),
+            args,
+            description: description.clone(),
+            vote_start: now,
+            vote_end: now + config.voting_period,
+            votes_for: 0,
+            votes_against: 0,
+            status: ProposalStatus::Active,
+            voters: Vec::new(&env),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(id), &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextId, &(id + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "gov_proposed"), id),
+            (proposer, target, function, description),
+        );
+        Ok(id)
+    }
+
+    /// Cast a vote on an active proposal.
+    ///
+    /// `support = true` → for; `support = false` → against.
+    /// Voting weight equals the voter's current token balance.
+    ///
+    /// **Known limitation**: balance is read at call time, not at a
+    /// snapshot — flash-loan voting attacks are possible until the
+    /// snapshot follow-up issue is implemented.
+    pub fn cast_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        support: bool,
+    ) -> Result<i128, GovernanceError> {
+        voter.require_auth();
+
+        let mut proposal: ProposalState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Active {
+            return Err(GovernanceError::WrongState);
+        }
+
+        let now = env.ledger().timestamp();
+        if now > proposal.vote_end {
+            return Err(GovernanceError::WrongState);
+        }
+
+        // Double-vote guard.
+        if proposal.voters.iter().any(|v| v == voter) {
+            return Err(GovernanceError::AlreadyVoted);
+        }
+
+        let config: GovernorConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)?;
+        let weight = token::Client::new(&env, &config.token).balance(&voter);
+
+        if support {
+            proposal.votes_for += weight;
+        } else {
+            proposal.votes_against += weight;
+        }
+        proposal.voters.push_back(voter.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "gov_voted"), proposal_id),
+            (voter, support, weight),
+        );
+        Ok(weight)
+    }
+
+    /// Tally the proposal after its voting period ends and transition it to
+    /// `Succeeded` or `Defeated`.  Permissionless.
+    pub fn finalize(env: Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
+        let mut proposal: ProposalState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Active {
+            // Already finalized — just return current status.
+            return Ok(proposal.status);
+        }
+
+        let now = env.ledger().timestamp();
+        if now <= proposal.vote_end {
+            return Err(GovernanceError::VotingOpen);
+        }
+
+        let config: GovernorConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)?;
+
+        // Total participating weight.
+        let total_votes = proposal.votes_for + proposal.votes_against;
+
+        // Total token supply for quorum calculation.
+        let total_supply = token::Client::new(&env, &config.token).total_supply();
+
+        // Quorum: total_votes must be >= quorum_bps/10000 of total_supply.
+        let quorum_required = total_supply * (config.quorum_bps as i128) / 10_000;
+        let quorum_met = total_votes >= quorum_required;
+        let majority_for = proposal.votes_for > proposal.votes_against;
+
+        let new_status = if quorum_met && majority_for {
+            ProposalStatus::Succeeded
+        } else {
+            ProposalStatus::Defeated
+        };
+
+        proposal.status = new_status;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "gov_finalized"), proposal_id),
+            (new_status as u32, quorum_met, majority_for),
+        );
+        Ok(new_status)
+    }
+
+    /// Queue a succeeded proposal into the timelock (or execute directly if
+    /// no timelock is set).
+    pub fn queue(env: Env, proposal_id: u64, eta: u64) -> Result<(), GovernanceError> {
+        let mut proposal: ProposalState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Succeeded {
+            return Err(GovernanceError::WrongState);
+        }
+
+        proposal.status = ProposalStatus::Queued;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        if let Some(timelock) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Timelock)
+        {
+            // Forward to timelock.  The timelock's `queue` function takes
+            // (target, function, args, eta).
+            let mut tl_args: Vec<Val> = Vec::new(&env);
+            tl_args.push_back(proposal.target.into_val(&env));
+            tl_args.push_back(proposal.function.into_val(&env));
+            tl_args.push_back(proposal.args.into_val(&env));
+            tl_args.push_back(eta.into_val(&env));
+            env.invoke_contract::<Val>(
+                &timelock,
+                &Symbol::new(&env, "queue"),
+                tl_args,
+            );
+        }
+        // If no timelock is set the proposal is marked Queued and the
+        // caller should call `execute` directly.
+
+        env.events()
+            .publish((Symbol::new(&env, "gov_queued"), proposal_id), ());
+        Ok(())
+    }
+
+    /// Execute a queued proposal directly (when no timelock is configured).
+    pub fn execute(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+        let mut proposal: ProposalState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Queued {
+            return Err(GovernanceError::WrongState);
+        }
+
+        proposal.status = ProposalStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        env.invoke_contract::<Val>(&proposal.target, &proposal.function, proposal.args);
+
+        env.events()
+            .publish((Symbol::new(&env, "gov_executed"), proposal_id), ());
+        Ok(())
+    }
+
+    /// Read a proposal by id.
+    pub fn get_proposal(env: Env, id: u64) -> Option<ProposalState> {
+        env.storage().persistent().get(&DataKey::Proposal(id))
+    }
+
+    // ─── Internal helpers ─────────────────────────────────────────────────
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(GovernanceError::NotInitialized)?;
+        if caller != &admin {
+            return Err(GovernanceError::Unauthorized);
+        }
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod test;

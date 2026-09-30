@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["pool", "policy", "oracle"]
+members = ["pool", "policy", "oracle", "incident_response", "vetoken", "timelock", "multisig", "governance"]
 
 [workspace.dependencies]
 soroban-sdk = { version = "21.0.0", features = ["alloc"] }
+proptest = "1.5.0"
 
 [profile.release]
 opt-level = "z"
