@@ -1,0 +1,24 @@
+# Per-crate minimum coverage, enforced by `scripts/coverage.py report`
+# (the `coverage` job in .github/workflows/ci.yml). Percentages are over
+# each crate's non-test source (src/test.rs and src/pricing_proptest.rs are
+# excluded), measured from host-run unit tests only.
+#
+# Seeded at the baseline measured on 2026-09-28 (rounded down to 0.01%):
+# the job starts green and fails as soon as coverage drops.
+#
+# Raise a floor whenever coverage goes up. Lowering one is an explicit
+# decision: CI fails any PR that lowers a value here unless it carries the
+# `coverage-floor-lowered` label. Explain why in the PR.
+
+[pool]
+lines = 96.51
+branches = 89.66
+
+[policy]
+lines = 97.30
+branches = 93.75
+
+[oracle]
+lines = 87.43
+branches = 83.33
+

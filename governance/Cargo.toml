@@ -1,5 +1,5 @@
 [package]
-name = "refract-policy"
+name = "refract-governance"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,4 +11,3 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
-proptest = "1.5.0"
