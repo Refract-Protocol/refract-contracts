@@ -1264,6 +1264,119 @@ impl RefractPool {
     }
 
     fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
+        // =======================================================================
+        // Issue #126 — [High] Kani-based formal proofs for overflow safety
+        // across all i128 arithmetic in the three contracts
+        // https://github.com/Refract-Protocol/refract-contracts/issues/126
+        //
+        // ── THIS FUNCTION: _calc_premium ────────────────────────────────────────
+        //
+        // Expression chain:
+        //   base             = coverage_amount * base_premium_rate_bps / BPS
+        //   duration_factor  = duration_days * PRECISION / 365
+        //   premium          = base * duration_factor / PRECISION * risk_multiplier / 100
+        //
+        // OVERFLOW RISK ANALYSIS
+        // ----------------------
+        // Intermediate 1: coverage_amount * base_premium_rate_bps
+        //   • coverage_amount is bounded by config.max_coverage (checked in
+        //     _check_coverage_capacity before buy_policy calls this function).
+        //     The contract does not enforce a hard max_coverage limit today;
+        //     an admin could set max_coverage up to i128::MAX.
+        //   • base_premium_rate_bps is a u32; practical range 1..10_000 (0.01%–100%)
+        //   • Worst case: i128::MAX * 10_000 — this OVERFLOWS. No guard exists.
+        //
+        // Intermediate 2: duration_days * PRECISION
+        //   • duration_days is u32, cast to i128. Max u32 = 4_294_967_295 days
+        //     (~11.7 million years — clearly unrealistic but currently uncapped).
+        //   • PRECISION = 10_000_000
+        //   • Worst case: 4_294_967_295 * 10_000_000 = 4.3e16 — fits in i128 ✓
+        //   • But realistic bound (365 days max): 365 * 10_000_000 = 3.65e9 ✓
+        //
+        // Intermediate 3: base * duration_factor
+        //   • This is the HIGHEST RISK intermediate. base itself can overflow
+        //     (see Intermediate 1); then multiplying by duration_factor compounds it.
+        //   ⚠️  FINDING F-01: _calc_premium multiplication chain is not guarded
+        //       against overflow when max_coverage is large and duration is long.
+        //       A realistic example: max_coverage = 10^18 USDC (admin-configurable),
+        //       base_rate = 500 bps (5%), duration = 365 days, risk_mult = 300 →
+        //       base = 10^18 * 500 / 10_000 = 5*10^16
+        //       duration_factor = 365 * 10^7 / 365 = 10^7
+        //       base * duration_factor = 5*10^16 * 10^7 = 5*10^23 → OVERFLOW (i128::MAX ≈ 1.7*10^38... wait, fits)
+        //       Actually i128::MAX = 1.7*10^38 so 5*10^23 fits. Safe at this scale.
+        //       However: base = i128::MAX / BPS * BPS overflows before division.
+        //       The overflow happens at `coverage_amount * base_premium_rate_bps`
+        //       BEFORE the `/BPS` division when coverage_amount > i128::MAX/10_000.
+        //       i128::MAX / 10_000 ≈ 1.7*10^34. Any max_coverage above 1.7*10^34
+        //       with max rate 10_000 bps causes silent wrap.
+        //
+        // KANI HARNESS TO WRITE (pool/src/lib.rs or a separate kani/ directory)
+        // -----------------------------------------------------------------------
+        //
+        //   #[cfg(kani)]
+        //   mod overflow_proofs {
+        //     use super::*;
+        //
+        //     /// Prove _calc_premium does not overflow for realistic inputs.
+        //     /// Input bounds are derived from the contract's own validation:
+        //     ///   coverage_amount ∈ [min_coverage, max_coverage]
+        //     ///   We assume max_coverage ≤ 10^18 (1 billion USDC at 1e9 precision)
+        //     ///     as a reasonable production cap. If admin sets higher, overflow
+        //     ///     is possible — documented as FINDING F-01.
+        //     ///   base_premium_rate_bps ∈ [1, 500] (0.01% to 5% — typical range)
+        //     ///   duration_days ∈ [1, 365]
+        //     ///   risk_multiplier ∈ [80, 300] (from the match arms above)
+        //     #[kani::proof]
+        //     fn prove_calc_premium_no_overflow() {
+        //         let coverage_amount: i128 = kani::any();
+        //         kani::assume(coverage_amount >= 0 && coverage_amount <= 1_000_000_000_000_000_000i128); // 10^18
+        //
+        //         let base_rate: i128 = kani::any();
+        //         kani::assume(base_rate >= 1 && base_rate <= 500);
+        //
+        //         let duration_days: i128 = kani::any();
+        //         kani::assume(duration_days >= 1 && duration_days <= 365);
+        //
+        //         let risk_multiplier: i128 = kani::any();
+        //         kani::assume(risk_multiplier >= 80 && risk_multiplier <= 300);
+        //
+        //         // Replicate the exact computation
+        //         let base = coverage_amount.checked_mul(base_rate)
+        //             .expect("F-01: overflow in coverage_amount * base_rate_bps");
+        //         let base = base / 10_000i128;
+        //         let duration_factor = duration_days.checked_mul(10_000_000i128)
+        //             .expect("overflow in duration_days * PRECISION")
+        //             / 365;
+        //         let step1 = base.checked_mul(duration_factor)
+        //             .expect("F-01: overflow in base * duration_factor");
+        //         let step2 = step1 / 10_000_000i128;
+        //         let result = step2.checked_mul(risk_multiplier)
+        //             .expect("overflow in step2 * risk_multiplier")
+        //             / 100;
+        //         kani::assert(result >= 0, "premium must be non-negative");
+        //     }
+        //   }
+        //
+        // FINDINGS REQUIRING FOLLOW-UP
+        // -----------------------------
+        // ⚠️  FINDING F-01: _calc_premium — overflow possible when
+        //     coverage_amount > i128::MAX / base_premium_rate_bps
+        //     (i.e., > 1.7*10^34 at rate=1, > 1.7*10^30 at rate=10_000).
+        //     A realistic production bound of max_coverage ≤ 10^18 USDC is SAFE.
+        //     The fix is to enforce max_coverage ≤ 10^18 in admin validation OR
+        //     use checked_mul throughout. File as a follow-up, not patched here.
+        //     See OVERFLOW_AUDIT.md for the full findings list.
+        //
+        // FILES TO CREATE/MODIFY FOR #126
+        // --------------------------------
+        //   pool/src/lib.rs        ← (THIS FILE) harness in #[cfg(kani)] block
+        //   oracle/src/lib.rs      ← harness for threshold comparisons
+        //   policy/src/lib.rs      ← harness for counter increments
+        //   OVERFLOW_AUDIT.md      ← new file: full findings list with
+        //                              minimal reproducing inputs for each
+        //   Cargo.toml             ← add kani as dev-dependency
+        //   .github/workflows/     ← add kani CI step
+        // =======================================================================
         // Premium = coverage × base_rate × risk_multiplier × (days/365)
         let base = params.coverage_amount * (config.base_premium_rate_bps as i128) / BPS;
         let duration_factor = params.duration_days as i128 * PRECISION / 365;
@@ -1278,6 +1391,45 @@ impl RefractPool {
     }
 
     fn _calc_shares(env: &Env, amount: i128) -> i128 {
+        // =======================================================================
+        // Issue #126 — overflow audit: _calc_shares
+        //
+        // Expression: amount * total_shares / total_capital
+        //
+        // OVERFLOW RISK ANALYSIS
+        // ----------------------
+        // Intermediate: amount * total_shares
+        //   • amount is an LP deposit; bounded by the token transfer (USDC
+        //     token contract enforces the caller has the balance).
+        //   • total_shares accumulates over all LP deposits. In the worst case
+        //     total_shares approaches i128::MAX if many LPs have deposited.
+        //   • If amount = 10^18 and total_shares = 10^18, then
+        //     amount * total_shares = 10^36 → fits in i128 (max ≈ 1.7*10^38) ✓
+        //   • If both are near i128::MAX/2, the product overflows.
+        //
+        // ⚠️  FINDING F-02: _calc_shares — overflow possible when
+        //     amount * total_shares > i128::MAX. Both values are bounded by
+        //     USDC token supply in practice, but no contract-level guard exists.
+        //     At realistic USDC supplies (< 10^19 with 7-decimal precision),
+        //     the product stays well within i128 range. Document as low-risk
+        //     finding requiring a checked_mul guard for defense in depth.
+        //
+        // KANI HARNESS
+        // ------------
+        //   #[kani::proof]
+        //   fn prove_calc_shares_no_overflow() {
+        //       let amount: i128 = kani::any();
+        //       kani::assume(amount >= 0 && amount <= 1_000_000_000_000_000_000i128); // 10^18
+        //       let total_shares: i128 = kani::any();
+        //       kani::assume(total_shares >= 0 && total_shares <= 1_000_000_000_000_000_000i128);
+        //       let total_capital: i128 = kani::any();
+        //       kani::assume(total_capital > 0 && total_capital <= 1_000_000_000_000_000_000i128);
+        //       kani::assume(total_shares > 0);
+        //       let result = amount.checked_mul(total_shares)
+        //           .expect("F-02: overflow in amount * total_shares") / total_capital;
+        //       kani::assert(result >= 0);
+        //   }
+        // =======================================================================
         let total_capital: i128 = env
             .storage()
             .instance()
@@ -1369,6 +1521,41 @@ impl RefractPool {
         let usdc_out = if total_shares == 0 {
             0
         } else {
+            // =================================================================
+            // Issue #126 — overflow audit: _quote_withdrawal
+            //
+            // Expression: shares * total_capital / total_shares
+            //
+            // OVERFLOW RISK ANALYSIS
+            // ----------------------
+            // Intermediate: shares * total_capital
+            //   • shares is bounded by total_shares (guard above ensures this)
+            //   • total_capital bounded by USDC supply in practice (< 10^19)
+            //   • shares * total_capital: worst case (10^18)^2 = 10^36 — fits ✓
+            //   • At near-i128::MAX values both would overflow; same practical
+            //     bound as _calc_shares (FINDING F-02 class — see above).
+            //
+            // DOWNSTREAM: total_coverage * BPS / new_capital
+            //   • total_coverage bounded by total_capital * max_utilization_bps / BPS
+            //   • total_coverage * BPS: worst case 10^18 * 10_000 = 10^22 — fits ✓
+            //   • No overflow at realistic USDC supply bounds.
+            //
+            // KANI HARNESS
+            // ------------
+            //   #[kani::proof]
+            //   fn prove_quote_withdrawal_no_overflow() {
+            //       let shares: i128 = kani::any();
+            //       let total_capital: i128 = kani::any();
+            //       let total_shares: i128 = kani::any();
+            //       kani::assume(shares >= 0 && shares <= total_shares);
+            //       kani::assume(total_shares > 0);
+            //       kani::assume(total_capital >= 0 && total_capital <= 1_000_000_000_000_000_000i128);
+            //       let usdc_out = shares.checked_mul(total_capital)
+            //           .expect("overflow shares * total_capital") / total_shares;
+            //       kani::assert(usdc_out >= 0);
+            //       kani::assert(usdc_out <= total_capital);
+            //   }
+            // =================================================================
             shares * total_capital / total_shares
         };
 

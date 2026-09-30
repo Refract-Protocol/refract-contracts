@@ -1,0 +1,14 @@
+[package]
+name = "refract-governor"
+version = "0.1.0"
+edition = "2021"
+
+# TODO (#124): Add soroban-sdk dependency once implementing the contract.
+# [dependencies]
+# soroban-sdk = { version = "21", default-features = false }
+#
+# [dev-dependencies]
+# soroban-sdk = { version = "21", features = ["testutils"] }
+#
+# [lib]
+# crate-type = ["cdylib", "rlib"]

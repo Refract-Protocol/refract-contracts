@@ -98,6 +98,90 @@
 //! Stores all policy metadata on-chain as a lightweight sidecar to the Pool
 //! contract.  The Pool contract is the source of truth for capital; this
 //! contract provides a queryable index of policies per holder.
+//!
+// =============================================================================
+// Issue #126 — [High] Kani-based formal proofs for overflow safety
+// https://github.com/Refract-Protocol/refract-contracts/issues/126
+//
+// ── THIS FILE: policy/src/lib.rs ─────────────────────────────────────────────
+//
+// ARITHMETIC INVENTORY — policy/src/lib.rs
+// ----------------------------------------
+// This contract is an index/registry. It stores policy records and increments
+// counters. The arithmetic is minimal:
+//
+//   1. Policy ID counter increment: next_id = current_id + 1
+//      • next_id is u64 (not i128). At 1 policy per second it would take
+//        ~585 billion years to overflow u64. Safe — no harness needed, but
+//        document explicitly per the issue's requirement to enumerate ALL ops.
+//      • ✓ SAFE (no harness required; document argument is sufficient)
+//
+//   2. Holder policy index: vec.push_back(policy_id)
+//      • Vec length is bounded by the Soroban storage limits (no arithmetic).
+//      • ✓ SAFE (not arithmetic — storage bound, not overflow risk)
+//
+//   3. register_policy() — no i128 arithmetic. All stored fields (coverage_amount,
+//      premium) are i128 values passed in from the pool and stored verbatim.
+//      No computation is performed on them in this contract.
+//      • ✓ SAFE (store-only, no computation)
+//
+// FINDINGS SUMMARY FOR THIS FILE
+// --------------------------------
+//   No overflow-risk arithmetic found in policy/src/lib.rs.
+//   All i128 values are stored verbatim from the pool; the only arithmetic
+//   is a u64 counter increment which cannot practically overflow.
+//   Document this explicitly in OVERFLOW_AUDIT.md so reviewers know it was
+//   audited and not merely omitted.
+//
+// KANI HARNESS (documentation argument only — no harness required)
+// ----------------------------------------------------------------
+//   The issue requires either a proof OR a documented argument for why a
+//   proof is unnecessary. The documented argument:
+//
+//     "policy/src/lib.rs contains no i128 arithmetic operations. The only
+//     counter increment is u64 and practically cannot overflow. All i128
+//     values are received from the pool and stored without modification.
+//     No Kani harness is required for this file."
+//
+// =============================================================================
+//
+// =============================================================================
+// Issue #124 — [High] Build an on-chain proposal-and-vote flow for onboarding
+// a new coverage type end-to-end
+// https://github.com/Refract-Protocol/refract-contracts/issues/124
+//
+// ── RELATION OF THIS FILE TO #124 ────────────────────────────────────────────
+//
+// The policy registry is one of the contracts that must be configured as part
+// of a NewCoverageType onboarding proposal. Specifically, when a new coverage
+// type is added (after the prerequisite WASM upgrade that adds the new enum
+// variant), the governance execution sequence must:
+//
+//   1. Pool:    set per-type exposure cap (pool's exposure_cap setter)
+//   2. Oracle:  bind feed ID + set trigger threshold for the new type
+//   3. Pool:    set risk multiplier for the new type
+//   4. Policy:  (this contract) — no configuration setter needed here today.
+//              The registry is a generic index; it stores PolicyRecord structs
+//              for ANY coverage type without type-specific configuration.
+//              The registry does NOT need to be updated as part of the
+//              NewCoverageType onboarding sequence.
+//
+// This means the governance contract's execution sequence for
+// ProposalType::NewCoverageType does NOT need to call this contract.
+// That is a simplification worth documenting explicitly so the governance
+// implementation does not add an unnecessary call site here.
+//
+// FULL GOVERNANCE DESIGN (for the new governance/src/lib.rs contract)
+// -------------------------------------------------------------------
+// See governance/src/lib.rs for the complete implementation plan for #124.
+// The key points relevant to this file:
+//
+//   • The registry is NOT in the onboarding call sequence.
+//   • If a future version of the registry gains per-type configuration
+//     (e.g., type-specific query limits or fee tiers), the governance
+//     NewCoverageType proposal type can be extended at that time.
+//
+// =============================================================================
 
 #![no_std]
 use soroban_sdk::{
