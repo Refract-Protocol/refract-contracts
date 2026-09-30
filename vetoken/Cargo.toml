@@ -1,0 +1,15 @@
+[package]
+name = "refract-vetoken"
+version = "0.1.0"
+edition = "2021"
+description = "Refract veToken-style staking contract for governance weight and fee-sharing"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { version = "21.0.0" }
+
+[dev-dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }

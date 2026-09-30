@@ -1,3 +1,98 @@
+// =============================================================================
+// Issue #130 — [High] pool→registry cross-contract trust boundary
+// https://github.com/Refract-Protocol/refract-contracts/issues/130
+//
+// ─── ROLE OF THIS FILE IN THE TRUST BOUNDARY ─────────────────────────────────
+//
+// The registry is the secondary index — the pool is the source of truth.
+// The trust boundary has two call sites from the pool side:
+//   1. pool → registry.register_policy()  (via invoke_contract, panics on fail)
+//   2. pool → registry.deactivate_policy() (via try_invoke_contract, silent fail)
+//
+// This file enforces the trust boundary from the REGISTRY side via
+// require_pool_or_admin(). The key invariants:
+//
+//   INV-R1: Only the registered pool address or the admin may write to the
+//           registry. Any other caller gets RegistryError::Unauthorized.
+//
+//   INV-R2: register_policy() echoes back the policy_id from the
+//           PolicyRegistration struct — it does NOT generate its own id.
+//           This is intentional: the pool assigns the id, and the registry
+//           mirrors it. A malicious registry returning a different id is the
+//           attack surface fixed by PoolError::RegistryMismatch in pool/src/lib.rs.
+//
+//   INV-R3: deactivate_policy() is idempotent — calling it twice on the same
+//           id is a no-op (already guarded by the `if !record.is_active` check).
+//           This means the pool can safely retry a failed deactivation.
+//
+//   INV-R4: The registry CANNOT block a payout — if deactivate_policy() fails
+//           or panics, the pool absorbs that via try_invoke_contract.
+//           The registry's is_active flag is a queryable index only, not a
+//           gate on fund movement.
+//
+// ─── WHAT A DESYNC LOOKS LIKE ────────────────────────────────────────────────
+//
+// A desync between pool.Policy.status and registry.PolicyRecord.is_active
+// can occur if _deactivate_in_registry's try_invoke_contract is absorbed
+// (registry was unavailable or panicked).
+//
+// In a desync:
+//   pool.Policy.status  = Claimed (or Expired)
+//   registry.is_active  = true    (stale — never updated)
+//
+// Impact: The holder sees the policy as "active" in the registry index but
+// cannot claim again (process_claim checks pool.Policy.status, not the registry).
+// The coverage obligation (TotalCoverage) has already been freed on the pool
+// side. The registry is purely cosmetic in this state.
+//
+// Detection: pool.check_registry_sync(policy_id) — a view function to be
+// added to pool/src/lib.rs that calls try_invoke_contract to read
+// registry.get_policy() and compares is_active with pool.Policy.status.
+//
+// Repair: Call pool.expire_policy() or a new admin repair entry point that
+// retries _deactivate_in_registry for a given policy_id.
+//
+// =============================================================================
+// Issue #134 — [High] cross-contract authorization semantics audit
+// https://github.com/Refract-Protocol/refract-contracts/issues/134
+//
+// ─── require_pool_or_admin() — AUTHORIZATION AUDIT ───────────────────────────
+//
+// This is the single enforcement point for the pool→registry trust boundary.
+// The audit in pool/src/lib.rs (Issue #134) confirms the following about this
+// function:
+//
+//   1. caller.require_auth() is called BEFORE the principal check.
+//      This means: if the transaction has no auth entry for the caller,
+//      require_auth() panics immediately. The Unauthorized error is only
+//      ever returned to a caller who DID authenticate but is not the pool
+//      or admin. This ordering is correct and intentional.
+//
+//   2. The pool address checked (stored at initialize() time) is the CONTRACT
+//      ADDRESS, not a WASM hash. A second pool deployed from the same WASM
+//      at a different address does NOT automatically inherit trust.
+//      See the cross-instance replay analysis in pool/src/lib.rs (#134).
+//
+//   3. The admin can call set_pool_contract() to update which pool is trusted.
+//      This is the governance attack surface: a compromised admin can repoint
+//      the registry to a malicious pool. This is addressed by the sibling
+//      governance/timelock issue and is explicitly OUT OF SCOPE for #134.
+//      See AUTH_MODEL_AUDIT.md (to be created per #134 acceptance criteria).
+//
+//   4. This function is used by register_policy() and deactivate_policy() but
+//      NOT by set_pool_contract() and set_admin() — those use the stricter
+//      require_admin(), which does not allow the pool to repoint itself.
+//      This is a correct separation of privilege.
+//
+// ─── CROSS-REFERENCE ─────────────────────────────────────────────────────────
+//
+//   For the full authorization model audit, including cross-instance replay,
+//   cross-network replay, and confused-deputy analysis, see:
+//     - pool/src/lib.rs (Issue #134 documentation block)
+//     - AUTH_MODEL_AUDIT.md (to be created as part of #134)
+//
+// =============================================================================
+
 //! Refract Policy Registry Contract
 //!
 //! Stores all policy metadata on-chain as a lightweight sidecar to the Pool
@@ -37,6 +132,7 @@ pub enum RegistryError {
     PolicyAlreadyExists = 5,
     NoPendingPoolContract = 6,
     PoolContractChangeNotReady = 7,
+    NoPendingAdmin = 8,  // Issue #88: no pending admin to accept
 }
 
 /// Parameters for indexing a policy that the Pool contract already created.
@@ -89,6 +185,10 @@ pub enum DataKey {
     TotalPolicies,
     TotalPremium,
     ActivePolicies,
+    /// Issue #88: Pending admin awaiting acceptance
+    PendingAdmin,
+    /// #70: Track contract version for migration purposes
+    ContractVersion,
 }
 
 #[contract]
@@ -330,6 +430,63 @@ impl RefractPolicyRegistry {
         Ok(())
     }
 
+    /// Rotate the admin key. The only recovery path if the current admin
+    /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
+    pub fn propose_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_proposed"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Issue #88: Accept admin role. Must be called by the proposed admin.
+    pub fn accept_admin(env: Env, caller: Address) -> Result<(), RegistryError> {
+        caller.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(RegistryError::NoPendingAdmin)?;
+        if pending != caller {
+            return Err(RegistryError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_accepted"),), (caller,));
+        Ok(())
+    }
+
+    /// #70: Admin-gated contract upgrade.
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), RegistryError> {
+        Self::require_admin(&env, &caller)?;
+
+        let old_wasm_hash = env.deployer().get_current_contract_wasm().unwrap_or_default();
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Bump contract version for migration tracking
+        let version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &(version + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+        );
+        Ok(())
+    }
+
     /// Cancel a pending pool-contract repoint before it is confirmed. The
     /// active pool address is untouched.
     pub fn cancel_pool_contract(
@@ -400,3 +557,8 @@ impl RefractPolicyRegistry {
         Ok(())
     }
 }
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod registry_proptest;

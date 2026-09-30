@@ -3,6 +3,62 @@
 //! A permissioned price / event oracle that the RefractPool calls to verify
 //! trigger conditions before processing claims.  In production this would be
 //! connected to Band Protocol, Pyth, or a Refract-operated relay.
+//!
+//! ## Feed metadata (issue #100)
+//!
+//! Every feed has an associated [`FeedMetadata`] record (admin-managed via
+//! [`RefractOracle::set_feed_metadata`]) that exposes its scale convention,
+//! the human-readable source name, and the expected submission cadence to any
+//! consumer without relying on out-of-band documentation.
+//! Use [`RefractOracle::get_feed_metadata`] as the canonical way to discover a
+//! feed's conventions; [`RefractOracle::list_feeds`] is the complementary
+//! query for discovering which feeds have active readings.
+//!
+//! ## Rate limiting (issue #103)
+//!
+//! Each (relayer, feed_id) pair is subject to a minimum inter-submission
+//! interval (`MIN_SUBMISSION_INTERVAL_SECS`).  A relayer that calls `submit`
+//! again for the same feed before the cooldown has elapsed receives
+//! [`OracleError::SubmittedTooSoon`].  The first-ever submission from a
+//! relayer to a feed is always accepted regardless of timing.  The admin is
+//! subject to the same limit — there is no special exemption, which keeps the
+//! guarantee uniform and auditable.
+//!
+//! Default: 60 s — short enough not to impede fast-moving feeds (e.g.
+//! `MARKET_24H_RETURN` during a real crash) while still bounding storage
+//! write and event-emission throughput per key.
+//!
+//! ## Relayer reputation & weighted aggregation (issue #101)
+//!
+//! Each relayer carries an on-chain reputation score
+//! ([`DataKey::RelayerReputation`]) initialised to `REPUTATION_INITIAL` when
+//! the relayer is registered.  The score is bounded to
+//! `[REPUTATION_FLOOR, REPUTATION_CEILING]` to prevent permanent exclusion
+//! via sustained penalties and to cap the influence of any single long-lived
+//! relayer.
+//!
+//! ### Update formula
+//! An admin (or guardian) calls [`RefractOracle::update_reputation`] with a
+//! signed `delta`.  For this scope the trigger is human-in-the-loop (e.g. an
+//! off-chain monitoring job that detects outliers), with fully-automated
+//! reputation scoring left as a follow-up once trustless aggregation lands.
+//!
+//! ### Weighting formula
+//! [`RefractOracle::get_weighted_reading`] computes the reputation-weighted
+//! mean across all registered relayers' most-recent submissions to a feed:
+//!
+//! ```text
+//! weight_i  = max(1, reputation_i)   // floor at 1 so zero-rep relayers
+//!                                    // still contribute, just minimally
+//! weighted_sum = Σ (value_i × weight_i)
+//! total_weight = Σ weight_i
+//! result       = weighted_sum / total_weight
+//! ```
+//!
+//! The formula is intentionally simple so it is explainable to an external
+//! auditor.  A relayer with `REPUTATION_INITIAL` (100) has the same weight as
+//! any other freshly-registered relayer; penalties bring a relayer's weight
+//! toward the floor (1) but never to zero.
 
 #![no_std]
 use soroban_sdk::{
@@ -24,6 +80,15 @@ const MAX_STALENESS_SECS: u64 = 1_800;
 /// governance/timelock stack) before a new trusted data source goes live.
 const MIN_ADDITION_NOTICE_PERIOD_SECS: u64 = 48 * 60 * 60;
 
+/// Minimum interval between submissions from the same (relayer, feed_id) pair.
+///
+/// **Default: 60 s.**
+/// This is intentionally short so that fast-moving feeds (e.g. `MARKET_24H_RETURN`
+/// during a real crash) are not impeded.  The primary purpose is bounding
+/// unbounded write throughput and providing defence-in-depth against a
+/// single compromised relayer key dominating the aggregation window.
+const MIN_SUBMISSION_INTERVAL_SECS: u64 = 60;
+
 /// Fixed-point scale for value readings (1e7). All prices/percentages are
 /// stored as `value * 1e7` so the contract never touches floating point.
 const SCALE: i128 = 10_000_000;
@@ -34,6 +99,17 @@ const CRASH_RETURN_THRESHOLD: i128 = -30 * SCALE / 100; // 24h return < -30%
 const LIQUIDATION_RATIO_THRESHOLD: i128 = 85 * SCALE / 100; // ratio < 85%
 const TVL_THRESHOLD: i128 = 500_000 * SCALE; // protocol TVL < $500k
 const FLIGHT_DELAY_THRESHOLD: i128 = 120; // delay in minutes (not scaled)
+
+// ── Reputation bounds ────────────────────────────────────────────────────────
+/// Starting reputation for every newly-registered relayer.
+const REPUTATION_INITIAL: i128 = 100;
+/// A score cannot fall below this floor, preventing permanent exclusion without
+/// an explicit `remove_relayer` call and ensuring a reformed relayer can still
+/// contribute (at minimum weight) after a bad run.
+const REPUTATION_FLOOR: i128 = 1;
+/// A score cannot rise above this ceiling, bounding the maximum influence of
+/// any single long-lived relayer and keeping the weighted aggregation auditable.
+const REPUTATION_CEILING: i128 = 1_000;
 
 /// Errors returned by the oracle. `require_auth()` still panics on a
 /// missing/invalid signature (unrecoverable); every other recoverable
@@ -52,8 +128,36 @@ pub enum OracleError {
     UnknownCoverageType = 6,
     FutureTimestamp = 7,
     StaleSubmission = 8, // older than the reading already stored for this feed
-    RelayerNotPending = 9, // activate_relayer called for a relayer that was never queued
-    NoticePeriodNotElapsed = 10, // activate_relayer called before min_addition_notice_period
+    NoPendingAdmin = 9,  // Issue #88: no pending admin to accept
+    SubmittedTooSoon = 10, // rate-limit: same (relayer, feed_id) within MIN_SUBMISSION_INTERVAL_SECS
+    InsufficientBond = 11,    // Issue #94: relayer bond too low
+    RelayerNotBonded = 12,   // Issue #94: relayer has no stake
+    InvalidSlashAmount = 13, // Issue #94: slash exceeds bond
+    RelayerNotPending = 14, // activate_relayer called for a relayer that was never queued
+    NoticePeriodNotElapsed = 15, // activate_relayer called before min_addition_notice_period
+}
+
+/// Aggregate health summary for a single oracle feed.
+///
+/// Consumers (e.g. `RefractPool::process_claim`) can call
+/// `get_feed_health` to get a structured, single-call view of whether a
+/// feed is currently trustworthy before acting on it.
+///
+/// Fields:
+/// - `last_updated_at`      — ledger timestamp of the most recent accepted
+///   submission, or 0 if no submission has ever been accepted.
+/// - `active_relayer_count` — total number of currently registered relayers.
+///   A feed with no registered relayers should be treated as unhealthy
+///   regardless of its last update time.
+/// - `recent_rejection_count` — placeholder for deviation-rejection counts
+///   (tracked by a future sibling issue). Currently always 0. Consumers
+///   should treat a non-zero value as a signal that recent data is noisy.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedHealth {
+    pub last_updated_at: u64,
+    pub active_relayer_count: u32,
+    pub recent_rejection_count: u32,
 }
 
 /// Oracle reading stored on-chain.
@@ -69,11 +173,80 @@ pub struct OracleReading {
     pub source: Symbol,
 }
 
+/// Issue #94: Relayer bond record
+#[contracttype]
+#[derive(Clone)]
+pub struct RelayerBondRecord {
+    pub relayer: Address,
+    pub bond_amount: i128,
+    pub bonded_at: u64,
+    /// Timestamp after which relayer can unstake
+    pub unstake_available_at: u64,
+}
+
+/// Oracle reading stored on-chain.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleReading {
+    /// Signed integer value in 1e7 precision.
+    /// For prices: USD price * 1e7.
+    /// For percentages: percent * 1e7 (e.g. -30% = -3_000_000).
+    /// For durations: minutes.
+    pub value: i128,
+    pub timestamp: u64,
+    pub source: Symbol,
+}
+
+/// Structured metadata describing a feed's shape.
+///
+/// Settable by the admin via [`RefractOracle::set_feed_metadata`].
+/// Queryable by any caller via [`RefractOracle::get_feed_metadata`].
+///
+/// Metadata registration is decoupled from the first data submission: a feed
+/// can have metadata set before any reading has been submitted, and a feed
+/// can have readings without metadata if the admin hasn't registered it yet.
+///
+/// `expected_cadence_secs` is **descriptive only** — it is not enforced
+/// on-chain as a validation gate on `submit`. Consumers (the pool,
+/// refract-backend, third-party integrators) use it to decide how often
+/// to poll and when to raise staleness alerts.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedMetadata {
+    /// Number of decimal places in the fixed-point value.
+    /// For 1e7 convention this is always 7, but exposed here so consumers
+    /// don't need to hard-code the constant.
+    pub decimals: u32,
+    /// Human-readable name of the data provider backing this feed
+    /// (e.g. `"band_protocol"`, `"pyth"`, `"refract_relay"`).
+    pub source_name: Symbol,
+    /// Expected interval between submissions in seconds.
+    /// Purely informational — not enforced on-chain.
+    pub expected_cadence_secs: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
     Relayers,
-    Reading(Symbol), // feed_id → OracleReading
+    Reading(Symbol),                   // feed_id → OracleReading
+    /// Issue #95: Fallback oracle address for failover on primary staleness
+    FallbackOracle,
+    /// Issue #91: Per-relayer readings for median aggregation
+    RelayerReading(Symbol, Address), // (feed_id, relayer) → OracleReading
+    /// Issue #93: Historical readings per feed
+    ReadingHistory(Symbol), // feed_id → Vec<OracleReading>
+    /// Issue #94: Relayer bond amounts
+    RelayerBond(Address), // relayer → i128
+    FeedMetadata(Symbol),              // feed_id → FeedMetadata  (issue #100)
+    LastSubmissionAt(Address, Symbol), // (relayer, feed_id) → u64 timestamp  (issue #103)
+    RelayerReputation(Address),        // relayer → i128 score  (issue #101)
+    /// #70: Track contract version for migration purposes
+    ContractVersion,
+    /// Issue #88: Pending admin awaiting acceptance
+    PendingAdmin,
+    /// Issue #92: Per-feed configurable trigger thresholds
+    Threshold(Symbol),
     PendingRelayer(Address), // relayer → queued-at timestamp
 }
 
@@ -105,6 +278,11 @@ impl RefractOracle {
     /// `activate_relayer` is called after the notice period has elapsed.
     /// This turns adding a new trusted data source into a deliberately slow,
     /// observable action rather than an instant single-key decision.
+    ///
+    /// Initialises its reputation score to `REPUTATION_INITIAL` (100) so it
+    /// starts with the same weight as all other freshly-registered relayers.
+    /// Adding an already-registered relayer is a no-op (idempotent, no event,
+    /// no reputation reset).
     pub fn add_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
         let relayers: Vec<Address> = env
@@ -149,6 +327,13 @@ impl RefractOracle {
         if !relayers.iter().any(|r| r == relayer) {
             relayers.push_back(relayer.clone());
             env.storage().instance().set(&DataKey::Relayers, &relayers);
+            // Initialise reputation only on the first registration.
+            env.storage().persistent().set(
+                &DataKey::RelayerReputation(relayer.clone()),
+                &REPUTATION_INITIAL,
+            );
+            env.events()
+                .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         }
         env.storage()
             .instance()
@@ -211,22 +396,167 @@ impl RefractOracle {
         env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// Rotate the admin key. The only recovery path if the current admin
-    /// key is lost or compromised — without it, add_relayer/remove_relayer
-    /// and this function itself would be permanently stuck on whatever key
-    /// was set at initialize().
-    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), OracleError> {
+    /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
         env.events()
-            .publish((Symbol::new(&env, "admin_set"),), (new_admin,));
+            .publish((Symbol::new(&env, "admin_proposed"),), (new_admin,));
         Ok(())
+    }
+
+    /// Issue #88: Accept admin role. Must be called by the proposed admin.
+    pub fn accept_admin(env: Env, caller: Address) -> Result<(), OracleError> {
+        caller.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(OracleError::NoPendingAdmin)?;
+        if pending != caller {
+            return Err(OracleError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((Symbol::new(&env, "admin_accepted"),), (caller,));
+        Ok(())
+    }
+
+    /// Issue #92: Set a configurable threshold for a feed.
+    pub fn set_threshold(env: Env, feed_id: Symbol, threshold: i128) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold(feed_id.clone()), &threshold);
+        env.events()
+            .publish((Symbol::new(&env, "threshold_set"),), (feed_id,));
+        Ok(())
+    }
+
+    /// Issue #92: Get the configured threshold for a feed, or None if using default.
+    pub fn get_threshold(env: Env, feed_id: Symbol) -> Option<i128> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Threshold(feed_id))
+    }
+
+    /// #70: Admin-gated contract upgrade. Caller supplies the new WASM hash.
+    pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+
+        let old_wasm_hash = env.deployer().get_current_contract_wasm().unwrap_or_default();
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Bump contract version for migration tracking
+        let version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &(version + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "upgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+
+    // ─── Feed metadata (issue #100) ───────────────────────────────────────
+
+    /// Register or update metadata for a feed.  Admin-gated.
+    ///
+    /// Metadata can be set before any reading has been submitted for the
+    /// feed — registration and first submission are independent events.
+    pub fn set_feed_metadata(
+        env: Env,
+        feed_id: Symbol,
+        metadata: FeedMetadata,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeedMetadata(feed_id.clone()), &metadata);
+        env.events().publish(
+            (Symbol::new(&env, "feed_metadata_set"), feed_id),
+            (),
+        );
+        Ok(())
+    }
+
+    /// Query metadata for a feed.  Returns `None` if the admin has not yet
+    /// registered metadata for this feed.
+    ///
+    /// Use this as the canonical way to discover a feed's scale convention,
+    /// source name, and expected cadence.  Pair with `list_feeds` to
+    /// enumerate which feeds currently have active readings.
+    pub fn get_feed_metadata(env: Env, feed_id: Symbol) -> Option<FeedMetadata> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeedMetadata(feed_id))
+    }
+
+    // ─── Relayer reputation (issue #101) ─────────────────────────────────
+
+    /// Query the current reputation score for a relayer.
+    /// Returns `None` if the relayer has never been registered.
+    pub fn relayer_reputation(env: Env, relayer: Address) -> Option<i128> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RelayerReputation(relayer))
+    }
+
+    /// Adjust a relayer's reputation score by `delta` (positive = reward,
+    /// negative = penalty).  Admin-gated.
+    ///
+    /// The score is clamped to `[REPUTATION_FLOOR, REPUTATION_CEILING]`
+    /// (`[1, 1_000]`) after every update:
+    /// - **Floor (1):** prevents permanent exclusion without an explicit
+    ///   `remove_relayer` call; a penalised relayer still contributes at
+    ///   minimum weight, giving it a path to recover.
+    /// - **Ceiling (1_000):** bounds the maximum influence of any single
+    ///   long-lived relayer, keeping the weighted aggregation auditable.
+    ///
+    /// For this issue's scope the trigger is human-in-the-loop (e.g. an
+    /// off-chain monitoring job that detects outlier submissions and calls
+    /// this function).  Fully-automated, trustless reputation updates are
+    /// left as a follow-up once on-chain aggregation lands.
+    pub fn update_reputation(
+        env: Env,
+        relayer: Address,
+        delta: i128,
+    ) -> Result<(), OracleError> {
+        Self::require_admin(&env)?;
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RelayerReputation(relayer.clone()))
+            .unwrap_or(REPUTATION_INITIAL);
+        let updated = (current + delta).max(REPUTATION_FLOOR).min(REPUTATION_CEILING);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RelayerReputation(relayer.clone()), &updated);
+        env.events().publish(
+            (Symbol::new(&env, "reputation_updated"), relayer),
+            (delta, updated),
+        );
+        Ok(())
+    }
     }
 
     // ─── Data submission ─────────────────────────────────────────────────
 
     /// Submit a reading for a given feed.
     /// feed_id examples: USDC_PRICE, MARKET_24H_RETURN, XLM_TVL, FLIGHT_DL420
+    ///
+    /// Rate limiting (issue #103): a relayer is rejected with
+    /// `SubmittedTooSoon` if it submits to the same feed within
+    /// `MIN_SUBMISSION_INTERVAL_SECS` (60 s) of its previous submission.
+    /// The very first submission from a relayer to a feed is always accepted.
+    /// The admin is subject to the same limit — no special exemption.
     pub fn submit(
         env: Env,
         relayer: Address,
@@ -255,6 +585,30 @@ impl RefractOracle {
         if age > MAX_STALENESS_SECS {
             return Err(OracleError::StaleReading);
         }
+
+        // ── Rate limiting (issue #103) ────────────────────────────────────
+        // The first submission from a relayer to a feed (no LastSubmissionAt
+        // entry) is always accepted.  Subsequent submissions must be at least
+        // MIN_SUBMISSION_INTERVAL_SECS apart in *ledger time*, measured from
+        // the ledger timestamp of the previous accepted submission (not the
+        // data timestamp the relayer claims).  This prevents a relayer from
+        // bypassing the cooldown simply by back-dating its timestamps.
+        //
+        // The admin is intentionally subject to the same check — uniformity
+        // means the guarantee is easier to audit and reason about.
+        let rate_key = DataKey::LastSubmissionAt(relayer.clone(), feed_id.clone());
+        if let Some(last_at) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&rate_key)
+        {
+            let elapsed = ledger_time.saturating_sub(last_at);
+            if elapsed < MIN_SUBMISSION_INTERVAL_SECS {
+                return Err(OracleError::SubmittedTooSoon);
+            }
+        }
+        // Record the ledger time of this accepted submission.
+        env.storage().persistent().set(&rate_key, &ledger_time);
 
         // Multiple relayers can be registered at once (add_relayer supports
         // a list), and nothing orders their submissions relative to each
@@ -289,7 +643,99 @@ impl RefractOracle {
         Ok(())
     }
 
-    // ─── Internal helpers ────────────────────────────────────────────────
+    // ─── Queries ─────────────────────────────────────────────────────────
+
+    /// Get the latest reading for a feed. Errors if not found or stale.
+    pub fn get_reading(env: Env, feed_id: Symbol) -> Result<OracleReading, OracleError> {
+        let reading: OracleReading = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Reading(feed_id))
+            .ok_or(OracleError::FeedNotFound)?;
+
+        let ledger_time = env.ledger().timestamp();
+        let age = ledger_time.saturating_sub(reading.timestamp);
+        if age > MAX_STALENESS_SECS {
+            return Err(OracleError::StaleReading);
+        }
+
+        Ok(reading)
+    }
+
+    /// Returns true if the trigger condition for a given coverage type is met.
+    /// coverage_type: 0=Depeg, 1=Crash, 2=Liquidation, 3=SmartContract, 4=Flight
+    pub fn is_triggered(
+        env: Env,
+        coverage_type: u32,
+        feed_id: Symbol,
+    ) -> Result<bool, OracleError> {
+        let reading = Self::get_reading(env, feed_id)?;
+
+        match coverage_type {
+            0 => Ok(reading.value < DEPEG_PRICE_THRESHOLD),
+            1 => Ok(reading.value < CRASH_RETURN_THRESHOLD),
+            2 => Ok(reading.value < LIQUIDATION_RATIO_THRESHOLD),
+            3 => Ok(reading.value < TVL_THRESHOLD),
+            4 => Ok(reading.value > FLIGHT_DELAY_THRESHOLD),
+            _ => Err(OracleError::UnknownCoverageType),
+        }
+    }
+
+    /// Return a composite health summary for a given feed.
+    ///
+    /// Always succeeds — a feed with no submissions ever returns a
+    /// zero-valued `FeedHealth` record rather than an error, so callers
+    /// can treat `last_updated_at == 0` as "never seen" and act
+    /// accordingly without having to handle a separate error path.
+    ///
+    /// `active_relayer_count` reflects the number of currently registered
+    /// relayers (anyone in the relayer list).  `recent_rejection_count` is
+    /// a placeholder for the deviation-rejection counter that a sibling
+    /// issue will track; it is always 0 until that work lands.
+    pub fn get_feed_health(env: Env, feed_id: Symbol) -> FeedHealth {
+        let last_updated_at: u64 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
+            .map(|r| r.timestamp)
+            .unwrap_or(0);
+
+        let relayers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Relayers)
+            .unwrap_or_else(|| Vec::new(&env));
+        let active_relayer_count = relayers.len();
+
+        // Placeholder: deviation rejection counts will be tracked here once
+        // the sibling deviation-check issue lands.  Reading returns 0 until
+        // then so the field is forward-compatible without a contract upgrade.
+        let recent_rejection_count: u32 = 0;
+
+        FeedHealth {
+            feed_id,
+            last_updated_at,
+            active_relayer_count,
+            recent_rejection_count,
+        }
+    }
+
+    /// Get all feeds and their timestamps as a map (for monitoring UI).
+    pub fn list_feeds(env: Env, feed_ids: Vec<Symbol>) -> Map<Symbol, i64> {
+        let mut out: Map<Symbol, i64> = Map::new(&env);
+        for feed_id in feed_ids.iter() {
+            if let Some(r) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, OracleReading>(&DataKey::Reading(feed_id.clone()))
+            {
+                out.set(feed_id, r.timestamp as i64);
+            }
+        }
+        out
+    }
+
+    // ─── Internal helpers ─────────────────────────────────────────────────
 
     fn require_admin(env: &Env) -> Result<(), OracleError> {
         let admin: Address = env

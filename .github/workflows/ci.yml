@@ -36,3 +36,125 @@ jobs:
 
       - name: Build optimized wasm
         run: cargo build --target wasm32-unknown-unknown --release
+
+  # Test coverage for host-run unit tests (the wasm32 build is not
+  # instrumented). Uses the test profile only; the release profile in
+  # Cargo.toml is untouched. Branch coverage needs nightly, so the nightly
+  # is pinned here; bump it on purpose. See README "Coverage".
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit is needed for the PR delta and floor guard
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-20
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage # instrumented artefacts differ from the test job's
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Measure coverage
+        run: python3 scripts/coverage.py run
+
+      # Best effort: if the base can't be measured, the report says there's
+      # no delta instead of failing the PR.
+      - name: Measure base-branch coverage
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          git worktree add ../coverage-base "${{ github.event.pull_request.base.sha }}"
+          python3 scripts/coverage.py run --src ../coverage-base --out target/coverage-base
+
+      - name: Report coverage and enforce floors
+        run: |
+          python3 scripts/coverage.py report \
+            ${{ github.event_name == 'pull_request' && '--base target/coverage-base' || '' }}
+
+      - name: Guard against lowered floors
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'coverage-floor-lowered')
+        run: |
+          python3 scripts/coverage.py floor-guard "${{ github.event.pull_request.base.sha }}" || {
+            echo "::error::coverage-floor.toml lowers a floor. If that's intended, add the 'coverage-floor-lowered' label and explain why in the PR."
+            exit 1
+          }
+
+      # Every test Env writes test_snapshots/; `coverage.py run` restores
+      # them. Checked here so a leftover can't go unnoticed.
+      - name: Working tree is clean
+        run: git diff --exit-code && test -z "$(git status --porcelain)"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: |
+            target/coverage/html
+            target/coverage/lcov.info
+            target/coverage/summary.json
+            target/coverage/uncovered.md
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Copies the three contracts out of target/, hashes the copied bytes
+      # and writes manifest.json / SHA256SUMS / summary.md. Uses the same
+      # committed script developers run locally (see README "Build
+      # artefacts"). Any future wasm optimisation step must run before it.
+      - name: Collect wasm artefacts and manifest
+        run: python3 scripts/wasm_manifest.py collect --out dist/wasm
+
+      - name: Verify artefacts against manifest
+        run: python3 scripts/wasm_manifest.py verify dist/wasm
+
+      - name: Publish checksums to job summary
+        run: cat dist/wasm/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload wasm artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: refract-wasm-${{ github.sha }}
+          path: |
+            dist/wasm/*.wasm
+            dist/wasm/manifest.json
+            dist/wasm/SHA256SUMS
+          if-no-files-found: error
+          # Pushes to main: 90 days (the GitHub maximum for public repos),
+          # long enough to match a testnet deployment back to its commit.
+          # Pull requests: 14 days, enough for review.
+          retention-days: ${{ github.event_name == 'push' && 90 || 14 }}
+
+      - name: Run wasm-level tests
+        run: cargo test --all
+
+  docs:
+    name: rustdoc · links · coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build docs with denied lints and broken link check
+        env:
+          RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::bare_urls"
+        run: cargo doc --workspace --no-deps --document-private-items
+
+      - name: Enforce documentation coverage on public entrypoints
+        run: |
+          cargo check --workspace
