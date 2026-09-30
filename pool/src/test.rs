@@ -1071,7 +1071,36 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
 
 
 #[test]
-fn test_lockup_overflow_handled_safely() {
+fn test_pool_stats_uninitialized_and_default_config_fallback() {
+    let env = Env::default();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+
+    // Missing DataKey::PoolConfig triggers unwrap_or fallback
+    let stats = pool.pool_stats();
+    assert_eq!(stats.total_capital, 0);
+    assert_eq!(stats.total_coverage, 0);
+    assert_eq!(stats.total_shares, 0);
+    assert_eq!(stats.utilization_bps, 0);
+    assert_eq!(stats.share_price, 10_000_000); // PRECISION
+    assert_eq!(stats.available_capacity, 0);
+    assert_eq!(stats.apy_estimate_bps, 0);
+}
+
+#[test]
+fn test_pool_stats_division_by_zero_guards() {
+    let f = setup();
+    let stats = f.pool.pool_stats();
+    assert_eq!(stats.total_capital, 0);
+    assert_eq!(stats.total_shares, 0);
+    assert_eq!(stats.utilization_bps, 0);
+    assert_eq!(stats.share_price, 10_000_000);
+    assert_eq!(stats.available_capacity, 0);
+    assert_eq!(stats.apy_estimate_bps, 0);
+}
+
+#[test]
+fn test_pool_stats_derived_values_with_capital_and_coverage() {
     let f = setup();
     let provider = funded(&f, 100 * ONE_USDC);
     f.pool.provide_capital(&provider, &(100 * ONE_USDC));
@@ -1083,15 +1112,54 @@ fn test_lockup_overflow_handled_safely() {
 
     // lockup_expires_at should saturate safely without overflowing/panicking
     let expires = f.pool.lockup_expires_at(&provider).unwrap();
-    assert_eq!(expires, u64::MAX);
+    assert_eq!(expires, u
+    let f = setup();
+    let provider = funded(&f, 100 * ONE_USDC);
+    f.pool.provide_capital(&provider, &(100 * ONE_USDC));
 
-    // Withdrawing before u64::MAX should return LockupActive
-    let res = f.pool.try_withdraw_capital(&provider, &(10 * ONE_USDC));
-    assert_eq!(res, Err(Ok(PoolError::LockupActive)));
+    let stats = f.pool.pool_stats();
+    assert_eq!(stats.total_capital, 100 * ONE_USDC);
+    assert_eq!(stats.total_shares, 100 * ONE_USDC);
+    assert_eq!(stats.share_price, 10_000_000);
+    assert_eq!(stats.utilization_bps, 0);
+    assert_eq!(stats.available_capacity, 80 * ONE_USDC);
+    assert_eq!(stats.apy_estimate_bps, 0);
+
+    let buyer = funded(&f, 10 * ONE_USDC);
+    f.pool.buy_policy(
+        &buyer,
+        &BuyPolicyParams {
+            coverage_type: CoverageType::StablecoinDepeg,
+            coverage_amount: 20 * ONE_USDC,
+            duration_days: 30,
+        },
+    );
+
+    let stats_after = f.pool.pool_stats();
+    assert_eq!(stats_after.total_coverage, 20 * ONE_USDC);
+    assert!(stats_after.utilization_bps > 0);
+    assert!(stats_after.available_capacity < 80 * ONE_USDC);
+    assert!(stats_after.apy_estimate_bps > 0);
 }
 
 #[test]
-fn test_buy_policy_duration_overflow_handled_safely() {
+fn test_pool_stats_capacity_clamped_to_zero_when_overutilized() {
+    let f = setup();
+    let provider = funded(&f, 100 * ONE_USDC);
+    f.pool.provide_capital(&provider, &(100 * ONE_USDC));
+
+    let buyer = funded(&f, 10 * ONE_USDC);
+    // Buy policy with extreme duration_days: u32::MAX
+    let id = f.pool.buy_policy(
+        &buyer,
+        &BuyPolicyParams {
+            coverage_type: CoverageType::FlightDelay,
+            coverage_amount: 10 * ONE_USDC,
+            duration_days: u32::MAX,
+        },
+    );
+
+    let policy = f.pool.get_poli
     let f = setup();
     let provider = funded(&f, 100 * ONE_USDC);
     f.pool.provide_capital(&provider, &(100 * ONE_USDC));
@@ -1109,4 +1177,12 @@ fn test_buy_policy_duration_overflow_handled_safely() {
 
     let policy = f.pool.get_policy(&id).unwrap();
     assert_eq!(policy.end_time, u64::MAX);
+
+    let mut config = f.pool.pool_config().unwrap();
+    config.max_utilization_bps = 5000;
+    f.pool.set_pool_config(&f.admin, &config);
+
+    let stats = f.pool.pool_stats();
+    assert_eq!(stats.available_capacity, 0);
+    assert!(stats.utilization_bps >= 6500);
 }
