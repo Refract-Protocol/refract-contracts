@@ -5,8 +5,15 @@ seriously and appreciate responsible disclosure.
 
 ## Status
 
-⚠️ **Pre-audit / testnet only.** Refract has **not** undergone a professional
-security audit. Do not deploy to mainnet or custody real value until it has.
+🔍 **Audit Readiness & Scoping Phase.** Refract is actively preparing for an independent third-party security audit prior to mainnet launch. All pre-audit hardening findings, scope boundaries, and the live remediation board are tracked in [AUDIT_TRACKING.md](AUDIT_TRACKING.md).
+
+Do not deploy to mainnet or custody production value until the external audit engagement has concluded and all critical findings are formally signed off.
+
+## Security Artifacts & Runbooks
+
+- **Audit Scoping & Remediation Tracker**: [AUDIT_TRACKING.md](AUDIT_TRACKING.md)
+- **Griefing-Cost Analysis**: [GRIEFING_ANALYSIS.md](GRIEFING_ANALYSIS.md)
+- **Incident Response & Recovery Runbook**: [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md)
 
 ## Reporting a vulnerability
 
@@ -80,4 +87,4 @@ tooling, is retried once and then only warns. A real finding always fails.
 - The oracle is **permissioned** (admin/relayer submitted). Decentralizing it is
   on the roadmap.
 - Trigger thresholds are set at deployment and changed only via admin.
-- Mainnet deployment is intentionally gated until an external audit completes.
+- Mainnet deployment is strictly gated until an external audit completes and sign-offs are logged in [AUDIT_TRACKING.md](AUDIT_TRACKING.md).
