@@ -107,3 +107,54 @@ jobs:
             target/coverage/uncovered.md
           if-no-files-found: warn
           retention-days: 14
+
+      # Copies the three contracts out of target/, hashes the copied bytes
+      # and writes manifest.json / SHA256SUMS / summary.md. Uses the same
+      # committed script developers run locally (see README "Build
+      # artefacts"). Any future wasm optimisation step must run before it.
+      - name: Collect wasm artefacts and manifest
+        run: python3 scripts/wasm_manifest.py collect --out dist/wasm
+
+      - name: Verify artefacts against manifest
+        run: python3 scripts/wasm_manifest.py verify dist/wasm
+
+      - name: Publish checksums to job summary
+        run: cat dist/wasm/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload wasm artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: refract-wasm-${{ github.sha }}
+          path: |
+            dist/wasm/*.wasm
+            dist/wasm/manifest.json
+            dist/wasm/SHA256SUMS
+          if-no-files-found: error
+          # Pushes to main: 90 days (the GitHub maximum for public repos),
+          # long enough to match a testnet deployment back to its commit.
+          # Pull requests: 14 days, enough for review.
+          retention-days: ${{ github.event_name == 'push' && 90 || 14 }}
+
+      - name: Run wasm-level tests
+        run: cargo test --all
+
+  docs:
+    name: rustdoc · links · coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build docs with denied lints and broken link check
+        env:
+          RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::bare_urls"
+        run: cargo doc --workspace --no-deps --document-private-items
+
+      - name: Enforce documentation coverage on public entrypoints
+        run: |
+          cargo check --workspace
