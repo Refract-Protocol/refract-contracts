@@ -1,0 +1,58 @@
+name: Dependency audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Daily, so advisories published after a merge still show up.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # scripts/audit.py exits 1 for a policy violation (an unaccepted
+      # runtime/build advisory, or an expired audit.toml entry) and 2 when
+      # the tooling itself failed. A tooling failure is retried once. If it
+      # still fails, a scheduled run only warns instead of going red over
+      # an infra flake. PR and push runs still fail, because there the
+      # advisory status can't be confirmed.
+      - name: Audit dependencies
+        run: |
+          set +e
+          for attempt in 1 2; do
+            python3 scripts/audit.py
+            code=$?
+            [ "$code" -ne 2 ] && break
+            echo "::warning::cargo audit tooling failed (attempt $attempt)"
+            sleep 30
+          done
+          if [ "$code" -eq 2 ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "::warning::Scheduled audit could not run (tooling failure); no advisory result for today."
+            exit 0
+          fi
+          exit "$code"

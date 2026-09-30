@@ -1,11 +1,12 @@
 #![cfg(test)]
 
 use super::*;
+use refract_oracle::{RefractOracle, RefractOracleClient};
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, Env, Symbol,
 };
 
 const ONE_USDC: i128 = 10_000_000; // 1e7 fixed-point
@@ -14,9 +15,11 @@ struct Fixture<'a> {
     env: Env,
     pool: RefractPoolClient<'a>,
     registry: RefractPolicyRegistryClient<'a>,
+    oracle: RefractOracleClient<'a>,
     usdc: TokenClient<'a>,
     usdc_admin: StellarAssetClient<'a>,
     admin: Address,
+    relayer: Address,
 }
 
 fn setup<'a>() -> Fixture<'a> {
@@ -28,25 +31,38 @@ fn setup<'a>() -> Fixture<'a> {
     let usdc = TokenClient::new(&env, &sac.address());
     let usdc_admin = StellarAssetClient::new(&env, &sac.address());
 
-    // Contract addresses are known as soon as they're registered, so both
-    // the pool and the registry can be wired to each other before either is
-    // initialized — mirrors how they'd be deployed and wired on testnet.
+    // Register all contracts before wiring them together — addresses are known
+    // as soon as they're registered, so the pool, registry, and oracle can be
+    // wired to each other before any is initialized.
     let pool_id = env.register_contract(None, RefractPool);
     let pool = RefractPoolClient::new(&env, &pool_id);
 
     let registry_id = env.register_contract(None, RefractPolicyRegistry);
     let registry = RefractPolicyRegistryClient::new(&env, &registry_id);
 
+    let oracle_id = env.register_contract(None, RefractOracle);
+    let oracle = RefractOracleClient::new(&env, &oracle_id);
+
     registry.initialize(&admin, &pool_id);
     pool.initialize(&admin, &sac.address(), &registry_id);
+
+    // Wire the oracle into the pool so process_claim can call is_triggered.
+    pool.set_oracle(&admin, &oracle_id);
+
+    // Initialize the oracle and register a relayer.
+    oracle.initialize(&admin);
+    let relayer = Address::generate(&env);
+    oracle.add_relayer(&relayer);
 
     Fixture {
         env,
         pool,
         registry,
+        oracle,
         usdc,
         usdc_admin,
         admin,
+        relayer,
     }
 }
 
@@ -64,6 +80,26 @@ fn past_lockup(f: &Fixture) {
     f.env.ledger().with_mut(|li| {
         li.timestamp += 7 * 86_400;
     });
+}
+
+/// Helper: submit a reading to the real oracle contract.
+/// Used by process_claim tests in place of the removed update_oracle().
+fn oracle_submit(f: &Fixture, feed: &str, value: i128) {
+    let now = f.env.ledger().timestamp();
+    f.oracle.submit(
+        &f.relayer,
+        &Symbol::new(&f.env, feed),
+        &value,
+        &now,
+        &Symbol::new(&f.env, "test_relayer"),
+    );
+}
+
+/// Helper: advance time past the rate-limit cooldown (60s) then submit.
+/// Use when you need two consecutive submissions to the same feed in a test.
+fn oracle_submit_after_cooldown(f: &Fixture, feed: &str, value: i128) {
+    f.env.ledger().with_mut(|li| li.timestamp += 60);
+    oracle_submit(f, feed, value);
 }
 
 #[test]
@@ -406,6 +442,7 @@ fn set_pool_config_replaces_the_operational_parameters() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
+        min_relayers_for_claim: 0,
     };
 
     f.pool.set_pool_config(&f.admin, &new_config);
@@ -435,6 +472,7 @@ fn set_pool_config_rejects_non_admin() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
+        min_relayers_for_claim: 0,
     };
     let res = f.pool.try_set_pool_config(&stranger, &new_config);
     assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
@@ -449,6 +487,7 @@ fn set_pool_config_emits_an_event() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
+        min_relayers_for_claim: 0,
     };
 
     let before = f.env.events().all().len();
@@ -491,6 +530,7 @@ fn pool_config_reflects_defaults_and_tracks_updates() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
+        min_relayers_for_claim: 0,
     };
     f.pool.set_pool_config(&f.admin, &new_config);
     assert_eq!(f.pool.pool_config(), Some(new_config));
@@ -624,20 +664,43 @@ fn quote_premium_matches_what_buy_policy_actually_charges() {
     assert_eq!(quoted, before - after);
 }
 
+/// Verify that set_oracle wires the oracle address correctly and
+/// oracle() reflects it.  This replaces the old update_oracle_emits_an_event
+/// test, which exercised the now-removed admin-push path.
 #[test]
-fn update_oracle_emits_an_event() {
+fn set_oracle_wires_oracle_contract_and_is_queryable() {
     let f = setup();
+    // setup() already called set_oracle — oracle() must reflect the address.
+    assert_eq!(f.pool.oracle(), Some(f.oracle.address.clone()));
+
+    // Rewiring to a new oracle contract must update the stored address.
+    let new_oracle_id = f.env.register_contract(None, RefractOracle);
+    f.pool.set_oracle(&f.admin, &new_oracle_id);
+    assert_eq!(f.pool.oracle(), Some(new_oracle_id));
+}
+
+#[test]
+fn set_oracle_emits_an_event() {
+    let f = setup();
+    let new_oracle_id = f.env.register_contract(None, RefractOracle);
 
     let before = f.env.events().all().len();
-    f.pool.update_oracle(
-        &f.admin,
-        &CoverageType::StablecoinDepeg,
-        &(9 * ONE_USDC / 10),
-    );
+    f.pool.set_oracle(&f.admin, &new_oracle_id);
     let after = f.env.events().all().len();
 
     assert_eq!(after, before + 1);
 }
+
+#[test]
+fn set_oracle_rejects_non_admin() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let new_oracle_id = f.env.register_contract(None, RefractOracle);
+    let res = f.pool.try_set_oracle(&stranger, &new_oracle_id);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
+}
+
+// ─── process_claim via real oracle (issue #102) ───────────────────────────────
 
 #[test]
 fn process_claim_pays_out_when_oracle_triggered() {
@@ -655,11 +718,8 @@ fn process_claim_pays_out_when_oracle_triggered() {
     let id = f.pool.buy_policy(&holder, &params);
 
     // USDC drops to $0.90 — below the $0.95 trigger.
-    f.pool.update_oracle(
-        &f.admin,
-        &CoverageType::StablecoinDepeg,
-        &(9 * ONE_USDC / 10),
-    );
+    // The pool reads USDC_PRICE via the oracle's is_triggered(0, "USDC_PRICE").
+    oracle_submit(&f, "USDC_PRICE", 9 * ONE_USDC / 10);
 
     let holder_before = f.usdc.balance(&holder);
     let payout = f.pool.process_claim(&id);
@@ -689,11 +749,7 @@ fn process_claim_deactivates_the_registry_record() {
     let id = f.pool.buy_policy(&holder, &params);
     assert!(f.registry.get_policy(&id).is_active);
 
-    f.pool.update_oracle(
-        &f.admin,
-        &CoverageType::StablecoinDepeg,
-        &(9 * ONE_USDC / 10),
-    );
+    oracle_submit(&f, "USDC_PRICE", 9 * ONE_USDC / 10);
     f.pool.process_claim(&id);
 
     // The pool's own record and the registry's mirrored record must both
@@ -721,13 +777,45 @@ fn process_claim_rejected_when_not_triggered() {
     let id = f.pool.buy_policy(&holder, &params);
 
     // USDC steady at $0.999 — no trigger.
-    f.pool.update_oracle(
-        &f.admin,
-        &CoverageType::StablecoinDepeg,
-        &(999 * ONE_USDC / 1000),
-    );
+    oracle_submit(&f, "USDC_PRICE", 999 * ONE_USDC / 1000);
 
     let res = f.pool.try_process_claim(&id);
+    assert_eq!(res, Err(Ok(PoolError::PolicyNotTriggered)));
+}
+
+#[test]
+fn process_claim_rejected_when_no_oracle_wired() {
+    // If no oracle has been set, process_claim must conservatively reject.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let usdc_admin = StellarAssetClient::new(&env, &sac.address());
+
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+    let registry = RefractPolicyRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &pool_id);
+    pool.initialize(&admin, &sac.address(), &registry_id);
+    // Intentionally do NOT call set_oracle.
+
+    let lp = Address::generate(&env);
+    usdc_admin.mint(&lp, &(100_000 * ONE_USDC));
+    pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = Address::generate(&env);
+    usdc_admin.mint(&holder, &(1_000 * ONE_USDC));
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = pool.buy_policy(&holder, &params);
+    let res = pool.try_process_claim(&id);
     assert_eq!(res, Err(Ok(PoolError::PolicyNotTriggered)));
 }
 
@@ -754,11 +842,7 @@ fn process_claim_rejects_after_end_time() {
     let id = f.pool.buy_policy(&holder, &params);
 
     // USDC depegged, but the coverage window has already lapsed.
-    f.pool.update_oracle(
-        &f.admin,
-        &CoverageType::StablecoinDepeg,
-        &(9 * ONE_USDC / 10),
-    );
+    oracle_submit(&f, "USDC_PRICE", 9 * ONE_USDC / 10);
     f.env.ledger().with_mut(|li| {
         li.timestamp += 31 * 86_400;
     });
@@ -781,11 +865,7 @@ fn double_claim_is_rejected() {
         trigger_threshold: 500,
     };
     let id = f.pool.buy_policy(&holder, &params);
-    f.pool.update_oracle(
-        &f.admin,
-        &CoverageType::StablecoinDepeg,
-        &(9 * ONE_USDC / 10),
-    );
+    oracle_submit(&f, "USDC_PRICE", 9 * ONE_USDC / 10);
 
     f.pool.process_claim(&id);
     let res = f.pool.try_process_claim(&id);
@@ -857,11 +937,7 @@ fn expire_policy_rejects_an_already_claimed_policy() {
         trigger_threshold: 500,
     };
     let id = f.pool.buy_policy(&holder, &params);
-    f.pool.update_oracle(
-        &f.admin,
-        &CoverageType::StablecoinDepeg,
-        &(9 * ONE_USDC / 10),
-    );
+    oracle_submit(&f, "USDC_PRICE", 9 * ONE_USDC / 10);
     f.pool.process_claim(&id);
 
     f.env.ledger().with_mut(|li| {
@@ -1067,4 +1143,343 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     // larger than the entire pool holds (see _quote_withdrawal).
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}
+
+#[test]
+fn test_cross_contract_and_token_transfer_failure_paths() {
+    let f = setup();
+    let provider = funded(&f, 10_000 * ONE_USDC);
+
+    // 1. Zero capital deposit is rejected
+    let res_zero_dep = f.pool.try_provide_capital(&provider, &0);
+    assert_eq!(res_zero_dep, Err(Ok(PoolError::ZeroAmount)));
+
+    // 2. Negative capital deposit is rejected
+    let res_neg_dep = f.pool.try_provide_capital(&provider, &-100);
+    assert_eq!(res_neg_dep, Err(Ok(PoolError::ZeroAmount)));
+
+    // 3. Withdraw shares greater than LP balance is rejected
+    let res_excess_wdr = f.pool.try_withdraw_capital(&provider, &(100_000 * ONE_USDC));
+    assert_eq!(res_excess_wdr, Err(Ok(PoolError::InsufficientShares)));
+
+    // 4. Buy policy with duration violating bounds is rejected
+    let buyer = funded(&f, 5_000 * ONE_USDC);
+    let quote = 100 * ONE_USDC;
+    let res_dur = f.pool.try_buy_policy(&buyer, &CoverageType::StablecoinDepeg, &(1_000 * ONE_USDC), &0u32, &quote);
+    assert_eq!(res_dur, Err(Ok(PoolError::DurationOutOfBounds)));
+
+    // 5. Expiring non-existent policy is rejected
+    let res_exp = f.pool.try_expire_policy(&buyer, &999999u64);
+    assert_eq!(res_exp, Err(Ok(PoolError::PolicyNotFound)));
+}
+
+fn test_systematic_pool_event_topics_and_payloads() {
+    let f = setup();
+    let contract_id = f.pool.address.clone();
+    let provider = funded(&f, 50_000 * ONE_USDC);
+
+    // 1. provide_capital event assertion: topics: (symbol_short!("DEP_CAP"), provider), data: (amount, shares_minted)
+    let deposit_amount = 20_000 * ONE_USDC;
+    let before_count = f.env.events().all().len();
+    let shares = f.pool.provide_capital(&provider, &deposit_amount);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_provider: Address = Address::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("DEP_CAP"));
+    assert_eq!(topic_provider, provider);
+    let (amt, sh): (i128, i128) = <(i128, i128)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(amt, deposit_amount);
+    assert_eq!(sh, shares);
+
+    // 2. buy_policy event assertion: topics: (symbol_short!("POL_BUY"), holder), data: (policy_id, premium, coverage_amount, end_time)
+    let buyer = funded(&f, 5_000 * ONE_USDC);
+    let cov_amount = 5_000 * ONE_USDC;
+    let duration_days = 30u32;
+    let quote = f.pool.quote_policy(&CoverageType::StablecoinDepeg, &cov_amount, &duration_days);
+    let before_count = f.env.events().all().len();
+    let policy_id = f.pool.buy_policy(&buyer, &CoverageType::StablecoinDepeg, &cov_amount, &duration_days, &quote);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_buyer: Address = Address::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("POL_BUY"));
+    assert_eq!(topic_buyer, buyer);
+    let (pid, prem, cov, _et): (u64, i128, i128, u64) = <(u64, i128, i128, u64)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(pid, policy_id);
+    assert_eq!(prem, quote);
+    assert_eq!(cov, cov_amount);
+
+    // 3. withdraw_capital event assertion: topics: (symbol_short!("WDR_CAP"), provider), data: (shares, usdc_out)
+    advance_past_lockup(&f);
+    let withdraw_shares = 5_000 * ONE_USDC;
+    let before_count = f.env.events().all().len();
+    let usdc_out = f.pool.withdraw_capital(&provider, &withdraw_shares);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_provider: Address = Address::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("WDR_CAP"));
+    assert_eq!(topic_provider, provider);
+    let (sh_out, u_out): (i128, i128) = <(i128, i128)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(sh_out, withdraw_shares);
+    assert_eq!(u_out, usdc_out);
+
+    // 4. set_admin event assertion: topics: (symbol_short!("ADM_SET"),), data: (new_admin,)
+    let new_admin = Address::generate(&f.env);
+    let before_count = f.env.events().all().len();
+    f.pool.set_admin(&f.admin, &new_admin);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("ADM_SET"));
+    let payload_admin: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_admin, new_admin);
+
+    // 5. set_policy_registry event assertion: topics: (symbol_short!("REG_SET"),), data: (new_registry,)
+    let new_registry = Address::generate(&f.env);
+    let before_count = f.env.events().all().len();
+    f.pool.set_policy_registry(&new_admin, &new_registry);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("REG_SET"));
+    let payload_registry: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(payload_registry, new_registry);
+
+    // 6. set_pool_config event assertion: topics: (symbol_short!("CFG_SET"),), data: ()
+    let cfg = PoolConfig::default(&f.env);
+    let before_count = f.env.events().all().len();
+    f.pool.set_pool_config(&new_admin, &cfg);
+    let events = f.env.events().all();
+    assert_eq!(events.len(), before_count + 1);
+    let (addr, topics, _data) = events.last().unwrap();
+    assert_eq!(addr, contract_id);
+    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic_0, symbol_short!("CFG_SET"));
+}
+
+// ── Scoped Auth Mocking Test Suite ──────────────────────────────────────────
+
+#[test]
+#[should_panic]
+fn test_set_admin_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    // Create a strict environment without blanket mock_all_auths
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    pool_strict.set_admin(&admin, &new_admin);
+}
+
+#[test]
+#[should_panic]
+fn test_provide_capital_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let provider = Address::generate(&env_strict);
+    pool_strict.provide_capital(&provider, &10_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_withdraw_capital_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let provider = Address::generate(&env_strict);
+    pool_strict.withdraw_capital(&provider, &10_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_buy_policy_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let buyer = Address::generate(&env_strict);
+    pool_strict.buy_policy(
+        &buyer,
+        &BuyPolicyParams {
+            coverage_type: CoverageType::StablecoinDepeg,
+            coverage_amount: 10_000_000,
+            duration_days: 30,
+        },
+    );
+}
+
+#[test]
+fn test_set_admin_succeeds_with_proper_scoped_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    pool.set_admin(&admin, &new_admin);
+    assert_eq!(pool.admin(), Some(new_admin));
+}
+
+#[test]
+fn test_pool_stats_uninitialized_and_default_config_fallback() {
+    let env = Env::default();
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+
+    // Missing DataKey::PoolConfig triggers unwrap_or fallback
+    let stats = pool.pool_stats();
+    assert_eq!(stats.total_capital, 0);
+    assert_eq!(stats.total_coverage, 0);
+    assert_eq!(stats.total_shares, 0);
+    assert_eq!(stats.utilization_bps, 0);
+    assert_eq!(stats.share_price, 10_000_000); // PRECISION
+    assert_eq!(stats.available_capacity, 0);
+    assert_eq!(stats.apy_estimate_bps, 0);
+}
+
+#[test]
+fn test_pool_stats_division_by_zero_guards() {
+    let f = setup();
+    let stats = f.pool.pool_stats();
+    assert_eq!(stats.total_capital, 0);
+    assert_eq!(stats.total_shares, 0);
+    assert_eq!(stats.utilization_bps, 0);
+    assert_eq!(stats.share_price, 10_000_000);
+    assert_eq!(stats.available_capacity, 0);
+    assert_eq!(stats.apy_estimate_bps, 0);
+}
+
+#[test]
+fn test_pool_stats_derived_values_with_capital_and_coverage() {
+    let f = setup();
+    let provider = funded(&f, 100 * ONE_USDC);
+    f.pool.provide_capital(&provider, &(100 * ONE_USDC));
+
+    // Admin sets an extreme lockup_days (e.g. u32::MAX)
+    let mut config = f.pool.pool_config().unwrap();
+    config.lockup_days = u32::MAX;
+    f.pool.set_pool_config(&f.admin, &config);
+
+    // lockup_expires_at should saturate safely without overflowing/panicking
+    let expires = f.pool.lockup_expires_at(&provider).unwrap();
+    assert_eq!(expires, u64::MAX);
+
+    let stats = f.pool.pool_stats();
+    assert_eq!(stats.total_capital, 100 * ONE_USDC);
+    assert_eq!(stats.total_shares, 100 * ONE_USDC);
+    assert_eq!(stats.share_price, 10_000_000);
+    assert_eq!(stats.utilization_bps, 0);
+    assert_eq!(stats.available_capacity, 80 * ONE_USDC);
+    assert_eq!(stats.apy_estimate_bps, 0);
+
+    let buyer = funded(&f, 10 * ONE_USDC);
+    f.pool.buy_policy(
+        &buyer,
+        &BuyPolicyParams {
+            coverage_type: CoverageType::StablecoinDepeg,
+            coverage_amount: 20 * ONE_USDC,
+            duration_days: 30,
+        },
+    );
+
+    let stats_after = f.pool.pool_stats();
+    assert_eq!(stats_after.total_coverage, 20 * ONE_USDC);
+    assert!(stats_after.utilization_bps > 0);
+    assert!(stats_after.available_capacity < 80 * ONE_USDC);
+    assert!(stats_after.apy_estimate_bps > 0);
+}
+
+#[test]
+fn test_pool_stats_capacity_clamped_to_zero_when_overutilized() {
+    let f = setup();
+    let provider = funded(&f, 100 * ONE_USDC);
+    f.pool.provide_capital(&provider, &(100 * ONE_USDC));
+
+    let buyer = funded(&f, 10 * ONE_USDC);
+    // Buy policy with extreme duration_days: u32::MAX
+    let id = f.pool.buy_policy(
+        &buyer,
+        &BuyPolicyParams {
+            coverage_type: CoverageType::FlightDelay,
+            coverage_amount: 10 * ONE_USDC,
+            duration_days: u32::MAX,
+        },
+    );
+
+    let policy = f.pool.get_policy(&id).unwrap();
+    assert_eq!(policy.end_time, u64::MAX);
+
+    let mut config = f.pool.pool_config().unwrap();
+    config.max_utilization_bps = 5000;
+    f.pool.set_pool_config(&f.admin, &config);
+
+    let stats = f.pool.pool_stats();
+    assert_eq!(stats.available_capacity, 0);
+    assert!(stats.utilization_bps >= 6500);
+}
+
+#[test]
+fn test_quote_withdrawal_more_shares_than_exist() {
+    let f = setup();
+    let lp = funded(&f, 10_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(10_000 * ONE_USDC));
+
+    // No caller can ever hold more shares than total_shares, so quoting
+    // more than that must error rather than silently returning a payout
+    // larger than the entire pool holds (see _quote_withdrawal).
+    let res = f.pool.try_quote_withdrawal(&(shares + 1));
+    assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}
 }
