@@ -1,0 +1,45 @@
+# Refract Protocol Label Taxonomy
+
+- name: 'type:bug'
+  color: 'd73a4a'
+  description: 'Something isn\'t working'
+
+- name: 'type:feature'
+  color: 'a2eeef'
+  description: 'New feature or enhancement'
+
+- name: 'type:documentation'
+  color: '0075ca'
+  description: 'Improvements or additions to documentation'
+
+- name: 'type:test'
+  color: 'bfdadc'
+  description: 'Adding or updating test suites'
+
+- name: 'component:pool'
+  color: '1d76db'
+  description: 'Refract pool contract'
+
+- name: 'component:policy'
+  color: '5319e7'
+  description: 'Refract policy registry contract'
+
+- name: 'component:oracle'
+  color: '006b75'
+  description: 'Refract oracle contract'
+
+- name: 'component:ci'
+  color: 'fef2c0'
+  description: 'CI/CD workflows and automated checks'
+
+- name: 'priority:P0-critical'
+  color: 'b60205'
+  description: 'Critical issue or security vulnerability'
+
+- name: 'priority:P1-high'
+  color: 'd93f0b'
+  description: 'High priority item'
+
+- name: 'status:needs-review'
+  color: 'fbca04'
+  description: 'Awaiting maintainer review'

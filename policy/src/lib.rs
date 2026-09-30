@@ -416,3 +416,6 @@ impl RefractPolicyRegistry {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod registry_proptest;
