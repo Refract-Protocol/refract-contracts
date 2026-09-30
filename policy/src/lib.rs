@@ -425,6 +425,10 @@ impl RefractPolicyRegistry {
             .persistent()
             .set(&DataKey::Policy(policy_id), &record);
 
+        // Issue #129 (plan): reject with a new RegistryError::TooManyPolicies
+        // (appended, = 9) when holder_policies.len() >= MAX_POLICIES_PER_HOLDER,
+        // the same bound as the pool (see the plan in pool/src/lib.rs above
+        // _calc_premium). The check goes before the Policy record is written.
         // Append to holder index
         let mut holder_policies: Vec<u64> = env
             .storage()

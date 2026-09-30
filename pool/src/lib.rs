@@ -56,6 +56,24 @@ pub struct PolicyRegistration {
     pub expires_at: u64,
 }
 
+// ── Issue #128 — audit-readiness package (plan) ───────────────────────────────
+//
+// Three new root docs, cross-linked from SECURITY.md, stating current state
+// (not target state):
+//  - THREAT_MODEL.md: adversaries are malicious holder, malicious LP,
+//    compromised admin key, compromised oracle relayer, a repointed or
+//    malicious registry/oracle callee (see the invoke_contract wiring
+//    above), and MEV/front-runners. For each: what they can do today.
+//  - ATTACK_SURFACE.md: one row per pub fn across pool, policy and oracle,
+//    with auth (require_auth / require_admin / pool-or-admin / none) and the
+//    worst-case misuse. Starts from README's "Authorization model".
+//  - INVARIANTS.md: testable statements such as sum(shares_of) ==
+//    TotalShares; TotalCoverage <= TotalCapital * max_utilization_bps / BPS
+//    at purchase; preview == execution for quote_*; oracle freshness < 1800s
+//    for claims; every pool policy id mirrored in the registry. Each is
+//    mapped to the test covering it, or marked "gap". Known gaps are listed
+//    honestly, including that the pool crate currently doesn't compile
+//    (#174) and the rounding (#127) and unbounded-Vec (#129) items.
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 #[contracttype]
 #[derive(Clone)]
@@ -927,6 +945,61 @@ impl RefractPool {
         );
     }
 
+    // ── Issue #127 — rounding-direction audit (plan) ────────────────────────
+    //
+    // Every division below truncates toward zero. All operands are
+    // non-negative on these paths, so truncation == floor. Site table (to be
+    // copied into ROUNDING.md):
+    //
+    //  site                           | rounds | favours       | action
+    //  -------------------------------|--------|---------------|---------------------------
+    //  _calc_premium  num/den         | down   | holder        | FIX: round UP (charged to user)
+    //  _calc_shares   amt*S/C         | down   | pool/LPs      | keep (minted to user)
+    //  _quote_withdrawal  sh*C/S      | down   | remaining LPs | keep (paid to user)
+    //  _quote_withdrawal  util check  | down   | withdrawer    | FIX: round UP so a withdrawal
+    //                                 |        |               | can't slip under the cap
+    //  _check_coverage_capacity cap   | down   | pool          | keep (limits coverage sold)
+    //  process_claim depeg threshold  | down   | holder (lower | review: PRECISION - t*P/BPS rounds
+    //                                 |        | trigger bar)  | the bar up by < 1 unit; use ceil
+    //  pool_stats (util, share price, | down   | n/a (views)   | document only; no funds move
+    //    apy, capacity)               |        |               |
+    //
+    // Fix mechanics: add `fn div_ceil_nonneg(n: i128, d: i128) -> i128`
+    // (n >= 0, d > 0: `n / d + (n % d != 0) as i128`). i128::div_ceil is not
+    // stable for signed ints on all toolchains, so don't rely on it; the
+    // helper is explicit and auditable. Use it in _calc_premium and in the
+    // post-withdrawal utilization check. quote_premium/buy_policy and
+    // quote_withdrawal/withdraw_capital already share these helpers, so
+    // preview == execution parity is preserved automatically.
+    //
+    // Tests: for each fixed site, inputs with a nonzero remainder (e.g.
+    // coverage=1_000_001, rate=333, days=7) asserting the new result equals
+    // floor+1; a zero-remainder case unchanged; pricing_proptest.rs updated
+    // to assert premium >= exact rational premium and shares/usdc_out <=
+    // exact rational value.
+    //
+    // Blocker: since #174, `_calc_shares`, `_quote_withdrawal` and
+    // `_check_coverage_capacity` are called with `&PoolState` but still take
+    // `&Env`, so this crate does not compile. Finish #174 first (read from
+    // the snapshot, not storage). oracle/ and policy/ do no value-bearing
+    // division; that gets confirmed in ROUNDING.md.
+    //
+    // ── Issue #129 — bound UserPolicies growth (plan) ────────────────────────
+    //
+    // buy_policy (UserPolicies push) and the registry's register_policy
+    // (HolderPolicies push) append to an unbounded Vec<u64>. Plan:
+    //  1. Measurement test (pool/src/test.rs, #[ignore] + run in CI nightly):
+    //     loop buy_policy for one holder, after N = 50, 100, 200, 400, 800, 1600
+    //     read env.budget().cpu_instruction_cost()/memory_bytes_cost() and
+    //     entry size, for the *combined* call (pool + registry writes). Record
+    //     the N where either cost crosses 50% of the Soroban per-tx limit.
+    //  2. MAX_POLICIES_PER_HOLDER = that N rounded down to a safe constant.
+    //     New PoolError::TooManyActivePolicies = 16 (appended), checked before
+    //     the premium transfer so nothing is charged on rejection.
+    //  3. Mirror as RegistryError::TooManyPolicies in policy/src/lib.rs.
+    //  4. Boundary tests: purchase MAX succeeds, MAX+1 fails.
+    //  5. RESOURCE_LIMITS.md documents the numbers and methodology, and links
+    //     #59 (chunked per-holder index) as the long-term fix and #25.
     pub fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
         // Optimized deferred-division formulation:
         // Premium = (coverage × base_rate × duration_days × risk_multiplier) / (BPS × 365 × 100)
