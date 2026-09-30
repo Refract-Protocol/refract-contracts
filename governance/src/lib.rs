@@ -159,6 +159,19 @@ pub struct RefractGovernor;
 
 #[contractimpl]
 impl RefractGovernor {
+    // TODO (#124): Implement initialize, propose, vote, execute, and
+    // cancel entry points per the design documentation above.
+    //
+    // Start with the ProposalType enum, DataKey enum, and Proposal struct,
+    // then implement propose() → vote() → execute() in that order.
+    // The NewCoverageType execution sequence (Steps 1-4) belongs in a
+    // private _execute_new_coverage_type() helper
+
+#[contract]
+pub struct RefractGovernor;
+
+#[contractimpl]
+impl RefractGovernor {
     pub fn initialize(env: Env, admin: Address, token: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
