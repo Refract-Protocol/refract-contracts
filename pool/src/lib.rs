@@ -87,6 +87,16 @@ pub enum DataKey {
     Admin,
     UsdcToken,
     PolicyRegistry, // RefractPolicyRegistry contract address
+    TotalCapital,
+    TotalCoverage, // sum of all active policy coverage amounts
+    TotalPremiums, // accumulated premiums (protocol revenue)
+    Shares(Address),
+    TotalShares,
+    Policy(u64),
+    UserPolicies(Address),
+    NextPolicyId,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolAccounting {
     pub total_capital: i128,
@@ -111,6 +121,22 @@ pub enum DataKey {
     Policy(u64),
     UserPolicies(Address),
     NextPolicyId,   // Legacy key for migration
+    PoolConfig,
+    Initialized,
+    OracleData(CoverageType), // latest oracle reading per type
+    LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+}
+
+// ── Errors ────────────────────────────────────────────────────────────────────
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PoolError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    InsufficientCapacity = 4,
+    Pol
     PoolConfig,
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
@@ -324,7 +350,6 @@ impl RefractPool {
         acc.total_capital += amount;
         acc.total_shares += shares;
         Self::_save_accounting(&env, &acc);
-
         let mut user_shares: i128 = env
             .storage()
             .persistent()
@@ -1085,6 +1110,17 @@ impl RefractPool {
         env.events().publish((symbol_short!("MIGRATE"),), (admin,));
         Ok(())
     }
+
+}
+
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod pricing_proptest;
+
+#[cfg(test)]
+mod wasm_test;
 
 }
 
