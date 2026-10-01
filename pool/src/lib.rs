@@ -58,6 +58,16 @@ pub struct PolicyRegistration {
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolAccounting {
+    pub total_capital: i128,
+    pub total_coverage: i128,
+    pub total_premiums: i128,
+    pub total_shares: i128,
+    pub next_policy_id: u64,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
@@ -71,6 +81,62 @@ pub enum DataKey {
     Policy(u64),
     UserPolicies(Address),
     NextPolicyId,
+}
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    UsdcToken,
+    PolicyRegistry, // RefractPolicyRegistry contract address
+    TotalCapital,
+    TotalCoverage, // sum of all active policy coverage amounts
+    TotalPremiums, // accumulated premiums (protocol revenue)
+    Shares(Address),
+    TotalShares,
+    Policy(u64),
+    UserPolicies(Address),
+    NextPolicyId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolAccounting {
+    pub total_capital: i128,
+    pub total_coverage: i128,
+    pub total_premiums: i128,
+    pub total_shares: i128,
+    pub next_policy_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    UsdcToken,
+    PolicyRegistry, // RefractPolicyRegistry contract address
+    Accounting,     // Consolidated PoolAccounting struct
+    TotalCapital,   // Legacy key for migration
+    TotalCoverage,  // Legacy key for migration
+    TotalPremiums,  // Legacy key for migration
+    Shares(Address),
+    TotalShares,    // Legacy key for migration
+    Policy(u64),
+    UserPolicies(Address),
+    NextPolicyId,   // Legacy key for migration
+    PoolConfig,
+    Initialized,
+    OracleData(CoverageType), // latest oracle reading per type
+    LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+}
+
+// ── Errors ────────────────────────────────────────────────────────────────────
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PoolError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    InsufficientCapacity = 4,
+    Pol
     PoolConfig,
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
@@ -155,27 +221,13 @@ impl PoolState {
                 max_coverage: 50_000 * PRECISION,
                 lockup_days: 7,
             });
-        let total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let total_shares: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalShares)
-            .unwrap_or(0);
-        let total_coverage: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCoverage)
-            .unwrap_or(0);
+        let acc = RefractPool::_accounting(env);
 
         Self {
             config,
-            total_capital,
-            total_shares,
-            total_coverage,
+            total_capital: acc.total_capital,
+            total_shares: acc.total_shares,
+            total_coverage: acc.total_coverage,
         }
     }
 }
@@ -237,15 +289,14 @@ impl RefractPool {
         env.storage()
             .instance()
             .set(&DataKey::PolicyRegistry, &policy_registry);
-        env.storage().instance().set(&DataKey::TotalCapital, &0i128);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCoverage, &0i128);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalPremiums, &0i128);
-        env.storage().instance().set(&DataKey::TotalShares, &0i128);
-        env.storage().instance().set(&DataKey::NextPolicyId, &0u64);
+        let accounting = PoolAccounting {
+            total_capital: 0i128,
+            total_coverage: 0i128,
+            total_premiums: 0i128,
+            total_shares: 0i128,
+            next_policy_id: 0u64,
+        };
+        Self::_save_accounting(&env, &accounting);
 
         let config = PoolConfig {
             base_premium_rate_bps: 300,       // 3% base
@@ -295,8 +346,10 @@ impl RefractPool {
 
         let shares = Self::_calc_shares(&state, amount);
 
-        let total_capital = state.total_capital + amount;
-        let total_shares = state.total_shares + shares;
+        let mut acc = Self::_accounting(&env);
+        acc.total_capital += amount;
+        acc.total_shares += shares;
+        Self::_save_accounting(&env, &acc);
         let mut user_shares: i128 = env
             .storage()
             .persistent()
@@ -304,12 +357,11 @@ impl RefractPool {
             .unwrap_or(0);
         user_shares += shares;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCapital, &total_capital);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalShares, &total_shares);
+        let mut acc = Self::_accounting(&env);
+        acc.total_capital += amount;
+        acc.total_shares += shares;
+        Self::_save_accounting(&env, &acc);
+
         env.storage()
             .persistent()
             .set(&DataKey::Shares(provider.clone()), &user_shares);
@@ -377,15 +429,11 @@ impl RefractPool {
         }
 
         let usdc_out = Self::_quote_withdrawal(&state, shares)?;
-        let total_capital = state.total_capital - usdc_out;
-        let total_shares = state.total_shares - shares;
+        let mut acc = Self::_accounting(&env);
+        acc.total_capital -= usdc_out;
+        acc.total_shares -= shares;
+        Self::_save_accounting(&env, &acc);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCapital, &total_capital);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalShares, &total_shares);
         env.storage()
             .persistent()
             .set(&DataKey::Shares(provider.clone()), &(user_shares - shares));
@@ -438,31 +486,15 @@ impl RefractPool {
             &premium,
         );
 
-        // Record in pool capital (premiums accrue to LPs)
-        let total_cap = state.total_capital + premium;
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCapital, &total_cap);
+        // Record in pool capital (premiums accrue to LPs) and create policy via single accounting record
+        let mut acc = Self::_accounting(&env);
+        let id = acc.next_policy_id;
+        acc.total_capital += premium;
+        acc.total_premiums += premium;
+        acc.total_coverage = new_coverage;
+        acc.next_policy_id += 1;
+        Self::_save_accounting(&env, &acc);
 
-        let mut total_prem: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalPremiums)
-            .unwrap_or(0);
-        total_prem += premium;
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalPremiums, &total_prem);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCoverage, &new_coverage);
-
-        // Create policy
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextPolicyId)
-            .unwrap_or(0);
         let policy = Policy {
             id,
             holder: holder.clone(),
@@ -593,27 +625,11 @@ impl RefractPool {
             .persistent()
             .set(&DataKey::Policy(policy_id), &policy);
 
-        // Reduce pool capital
-        let mut total_cap: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        total_cap = (total_cap - payout).max(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCapital, &total_cap);
-
-        // Reduce outstanding coverage
-        let mut total_cov: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCoverage)
-            .unwrap_or(0);
-        total_cov = (total_cov - payout).max(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCoverage, &total_cov);
+        // Reduce pool capital and outstanding coverage in consolidated record
+        let mut acc = Self::_accounting(&env);
+        acc.total_capital = (acc.total_capital - payout).max(0);
+        acc.total_coverage = (acc.total_coverage - payout).max(0);
+        Self::_save_accounting(&env, &acc);
 
         // Transfer USDC to holder
         let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
@@ -664,15 +680,9 @@ impl RefractPool {
             .persistent()
             .set(&DataKey::Policy(policy_id), &policy);
 
-        let mut total_cov: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCoverage)
-            .unwrap_or(0);
-        total_cov = (total_cov - policy.coverage_amount).max(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCoverage, &total_cov);
+        let mut acc = Self::_accounting(&env);
+        acc.total_coverage = (acc.total_coverage - policy.coverage_amount).max(0);
+        Self::_save_accounting(&env, &acc);
 
         Self::_deactivate_in_registry(&env, policy_id);
 
@@ -755,21 +765,10 @@ impl RefractPool {
     // ── View Functions ────────────────────────────────────────────────────────
 
     pub fn pool_stats(env: Env) -> PoolStats {
-        let total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let total_coverage: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCoverage)
-            .unwrap_or(0);
-        let total_shares: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalShares)
-            .unwrap_or(0);
+        let acc = Self::_accounting(&env);
+        let total_capital: i128 = acc.total_capital;
+        let total_coverage: i128 = acc.total_coverage;
+        let total_shares: i128 = acc.total_shares;
         let config: PoolConfig = env
             .storage()
             .instance()
@@ -983,16 +982,9 @@ impl RefractPool {
             return Err(PoolError::InsufficientCapacity);
         }
 
-        let total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let total_coverage: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCoverage)
-            .unwrap_or(0);
+        let acc = Self::_accounting(env);
+        let total_capital = acc.total_capital;
+        let total_coverage = acc.total_coverage;
         let new_coverage = total_coverage + coverage_amount;
         let max_coverage_capacity = total_capital * (config.max_utilization_bps as i128) / BPS;
 
@@ -1006,21 +998,10 @@ impl RefractPool {
     /// Shared by quote_withdrawal() and withdraw_capital() so the preview
     /// and the real withdrawal path can never silently diverge.
     fn _quote_withdrawal(env: &Env, shares: i128) -> Result<i128, PoolError> {
-        let total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let total_coverage: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCoverage)
-            .unwrap_or(0);
-        let total_shares: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalShares)
-            .unwrap_or(0);
+        let acc = Self::_accounting(env);
+        let total_capital = acc.total_capital;
+        let total_coverage = acc.total_coverage;
+        let total_shares = acc.total_shares;
         let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
 
         // No caller can ever hold more than total_shares (provide_capital/
@@ -1077,6 +1058,59 @@ impl RefractPool {
         }
         Ok(())
     }
+    pub fn _accounting(env: &Env) -> PoolAccounting {
+        if let Some(acc) = env.storage().instance().get(&DataKey::Accounting) {
+            acc
+        } else {
+            PoolAccounting {
+                total_capital: env.storage().instance().get(&DataKey::TotalCapital).unwrap_or(0i128),
+                total_coverage: env.storage().instance().get(&DataKey::TotalCoverage).unwrap_or(0i128),
+                total_premiums: env.storage().instance().get(&DataKey::TotalPremiums).unwrap_or(0i128),
+                total_shares: env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0i128),
+                next_policy_id: env.storage().instance().get(&DataKey::NextPolicyId).unwrap_or(0u64),
+            }
+        }
+    }
+
+    pub fn _save_accounting(env: &Env, acc: &PoolAccounting) {
+        env.storage().instance().set(&DataKey::Accounting, acc);
+    }
+
+    pub fn accounting(env: Env) -> PoolAccounting {
+        Self::_accounting(&env)
+    }
+
+    /// One-shot admin entrypoint to migrate legacy independent instance entries into
+    /// the consolidated PoolAccounting record.
+    pub fn migrate_accounting(env: Env, caller: Address) -> Result<(), PoolError> {
+        caller.require_auth();
+        let admin = Self::admin(env.clone()).ok_or(PoolError::NotInitialized)?;
+        if caller != admin {
+            return Err(PoolError::Unauthorized);
+        }
+        if env.storage().instance().has(&DataKey::Accounting) {
+            return Err(PoolError::AlreadyInitialized);
+        }
+
+        let acc = PoolAccounting {
+            total_capital: env.storage().instance().get(&DataKey::TotalCapital).unwrap_or(0i128),
+            total_coverage: env.storage().instance().get(&DataKey::TotalCoverage).unwrap_or(0i128),
+            total_premiums: env.storage().instance().get(&DataKey::TotalPremiums).unwrap_or(0i128),
+            total_shares: env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0i128),
+            next_policy_id: env.storage().instance().get(&DataKey::NextPolicyId).unwrap_or(0u64),
+        };
+        Self::_save_accounting(&env, &acc);
+
+        env.storage().instance().remove(&DataKey::TotalCapital);
+        env.storage().instance().remove(&DataKey::TotalCoverage);
+        env.storage().instance().remove(&DataKey::TotalPremiums);
+        env.storage().instance().remove(&DataKey::TotalShares);
+        env.storage().instance().remove(&DataKey::NextPolicyId);
+
+        env.events().publish((symbol_short!("MIGRATE"),), (admin,));
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]
@@ -1084,3 +1118,16 @@ mod test;
 
 #[cfg(test)]
 mod pricing_proptest;
+
+#[cfg(test)]
+mod wasm_test;
+
+}
+
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod pricing_proptest;
+#[cfg(test)]
+mod wasm_test;
