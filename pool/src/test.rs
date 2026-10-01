@@ -1279,6 +1279,48 @@ fn griefing_stranger_untriggered_claim_fails_cleanly() {
 }
 
 
+#[test]
+fn test_lockup_overflow_handled_safely() {
+    let f = setup();
+    let provider = funded(&f, 100 * ONE_USDC);
+    f.pool.provide_capital(&provider, &(100 * ONE_USDC));
+
+    // Admin sets an extreme lockup_days (e.g. u32::MAX)
+    let mut config = f.pool.pool_config().unwrap();
+    config.lockup_days = u32::MAX;
+    f.pool.set_pool_config(&f.admin, &config);
+
+    // lockup_expires_at should saturate safely without overflowing/panicking
+    let expires = f.pool.lockup_expires_at(&provider).unwrap();
+    assert_eq!(expires, u64::MAX);
+
+    // Withdrawing before u64::MAX should return LockupActive
+    let res = f.pool.try_withdraw_capital(&provider, &(10 * ONE_USDC));
+    assert_eq!(res, Err(Ok(PoolError::LockupActive)));
+}
+
+#[test]
+fn test_buy_policy_duration_overflow_handled_safely() {
+    let f = setup();
+    let provider = funded(&f, 100 * ONE_USDC);
+    f.pool.provide_capital(&provider, &(100 * ONE_USDC));
+
+    let buyer = funded(&f, 10 * ONE_USDC);
+    // Buy policy with extreme duration_days: u32::MAX
+    let id = f.pool.buy_policy(
+        &buyer,
+        &PolicyParams {
+            coverage_type: CoverageType::FlightDelay,
+            coverage_amount: 10 * ONE_USDC,
+            duration_days: u32::MAX,
+            trigger_threshold: 100,
+        },
+    );
+
+    let policy = f.pool.get_policy(&id).unwrap();
+    assert_eq!(policy.end_time, u64::MAX);
+}
+
 // ─── Issues #22, #23, #28, #29: Economic Conservation & Auth Invariants ───────
 
 #[test]
@@ -1387,17 +1429,8 @@ fn auth_failure_rejected_for_unauthorized_admin_actions() {
     let f = setup();
     let stranger = Address::generate(&f.env);
 
-    let res = f.pool.try_set_admin(&stranger,
-        coverage_type: CoverageType::StablecoinDepeg,
-        duration_days: 30,
-        trigger_threshold: 500,
-    };
-    f.pool.buy_policy(&holder, &params);
-
-    let acc2 = f.pool.accounting();
-    assert_eq!(acc2.next_policy_id, 1);
-    assert_eq!(acc2.total_coverage, 1_000 * ONE_USDC);
-    assert!(acc2.total_premiums > 0);
+    let res = f.pool.try_set_admin(&stranger, &stranger);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
 }
 
 #[test]

@@ -96,6 +96,20 @@ pub enum DataKey {
     UserPolicies(Address),
     NextPolicyId,
 }
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    UsdcToken,
+    PolicyRegistry, // RefractPolicyRegistry contract address
+    TotalCapital,
+    TotalCoverage, // sum of all active policy coverage amounts
+    TotalPremiums, // accumulated premiums (protocol revenue)
+    Shares(Address),
+    TotalShares,
+    Policy(u64),
+    UserPolicies(Address),
+    NextPolicyId,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolAccounting {
@@ -422,7 +436,8 @@ impl RefractPool {
             .persistent()
             .get(&DataKey::LastDeposit(provider.clone()));
         if let Some(last_deposit) = last_deposit {
-            let unlocks_at = last_deposit + (state.config.lockup_days as u64) * 86_400;
+            let lockup_secs = (state.config.lockup_days as u64).checked_mul(86_400).unwrap_or(u64::MAX);
+            let unlocks_at = last_deposit.checked_add(lockup_secs).unwrap_or(u64::MAX);
             if env.ledger().timestamp() < unlocks_at {
                 return Err(PoolError::LockupActive);
             }
@@ -475,7 +490,8 @@ impl RefractPool {
 
         let premium = Self::_calc_premium(&state.config, &params);
         let now = env.ledger().timestamp();
-        let end_time = now + (params.duration_days as u64) * 86_400;
+        let duration_secs = (params.duration_days as u64).checked_mul(86_400).unwrap_or(u64::MAX);
+        let end_time = now.checked_add(duration_secs).unwrap_or(u64::MAX);
         let registry_coverage_type = Self::_to_registry_coverage_type(&params.coverage_type);
 
         // Transfer premium from holder
@@ -856,7 +872,8 @@ impl RefractPool {
             .persistent()
             .get(&DataKey::LastDeposit(provider))?;
         let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
-        Some(last_deposit + (config.lockup_days as u64) * 86_400)
+        let lockup_secs = (config.lockup_days as u64).checked_mul(86_400).unwrap_or(u64::MAX);
+        Some(last_deposit.checked_add(lockup_secs).unwrap_or(u64::MAX))
     }
 
     /// The RefractPolicyRegistry address this pool currently indexes
@@ -1124,6 +1141,11 @@ mod wasm_test;
 
 }
 
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod pricing_proptest;
 #[cfg(test)]
 mod test;
 
