@@ -1306,6 +1306,387 @@ fn test_differential_calc_premium_against_reference_model() {
 
 #[test]
 fn test_precision_loss_bounds_in_deferred_division() {
+    let confi
+
+#[test]
+fn test_lockup_overflow_handled_safely() {
+    let f = setup();
+    let provider = funded(&f, 100 * ONE_USDC);
+    f.pool.provide_capital(&provider, &(100 * ONE_USDC));
+
+    // Admin sets an extreme lockup_days (e.g. u32::MAX)
+    let mut config = f.pool.pool_config().unwrap();
+    config.lockup_days = u32::MAX;
+    f.pool.set_pool_config(&f.admin, &config);
+
+    // lockup_expires_at should saturate safely without overflowing/panicking
+    let expires = f.pool.lockup_expires_at(&provider).unwrap();
+    assert_eq!(expires, u64::MAX);
+
+    // Withdrawing before u64::MAX should return LockupActive
+    let res = f.pool.try_withdraw_capital(&provider, &(10 * ONE_USDC));
+    assert_eq!(res, Err(Ok(PoolError::LockupActive)));
+}
+
+#[test]
+fn test_buy_policy_duration_overflow_handled_safely() {
+    let f = setup();
+    let provider = funded(&f, 100 * ONE_USDC);
+    f.pool.provide_capital(&provider, &(100 * ONE_USDC));
+
+    let buyer = funded(&f, 10 * ONE_USDC);
+    // Buy policy with extreme duration_days: u32::MAX
+    let id = f.pool.buy_policy(
+        &buyer,
+        &PolicyParams {
+            coverage_type: CoverageType::FlightDelay,
+            coverage_amount: 10 * ONE_USDC,
+            duration_days: u32::MAX,
+            trigger_threshold: 100,
+        },
+    );
+
+    let policy = f.pool.get_policy(&id).unwrap();
+    assert_eq!(policy.end_time, u64::MAX);
+}
+
+// ─── Issues #22, #23, #28, #29: Economic Conservation & Auth Invariants ───────
+
+#[test]
+fn economic_conservation_inflows_equal_outflows_and_pool_balance() {
+    let f = setup();
+    let pool_addr = f.pool.address.clone();
+
+    // 1. Initial balance is 0
+    assert_eq!(f.usdc.balance(&pool_addr), 0);
+    assert_eq!(f.pool.pool_stats().total_capital, 0);
+
+    // 2. Deposit 100,000 USDC
+    let deposit_amount = 100_000 * ONE_USDC;
+    let lp = funded(&f, deposit_amount);
+    f.pool.provide_capital(&lp, &deposit_amount);
+
+    let mut expected_inflows = deposit_amount;
+    let mut expected_outflows = 0i128;
+
+    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
+    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+
+    // 3. Buy policy with premium
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 10_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let mut expected_outflows = 0i128;
+
+    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
+    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+
+    // 3. Buy policy with premium
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 10_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let premium = f.pool.quote_premium(&params);
+    let _id = f.pool.buy_policy(&holder, &params);
+
+    expected_inflows += premium;
+    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
+    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+
+    // 4. Past lockup, withdraw capital
+    past_lockup(&f);
+    let shares_to_withdraw = 10_000 * ONE_USDC;
+    let usdc_out = f.pool.withdraw_capital(&lp, &shares_to_withdraw);
+
+    expected_outflows += usdc_out;
+    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
+    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+}
+
+#[test]
+fn pro_rata_capital_withdrawal_cannot_exceed_share_proportion() {
+    let f = setup();
+    let lp1 = funded(&f, 60_000 * ONE_USDC);
+    let lp2 = funded(&f, 40_000 * ONE_USDC);
+
+    let shares1 = f.pool.provide_capital(&lp1, &(60_000 * ONE_USDC));
+    let shares2 = f.pool.provide_capital(&lp2, &(40_000 * ONE_USDC));
+
+    assert_eq!(shares1, 60_000 * ONE_USDC);
+    assert_eq!(shares2, 40_000 * ONE_USDC);
+
+    // Premium arrives from policy purchase
+    let holder = funded(&f, 5_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 5_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let _id = f.pool.buy_policy(&holder, &params);
+
+    past_lockup(&f);
+
+    let stats = f.pool.pool_stats();
+    // LP1's fair share is 60% of total_capital
+    let lp1_quote = f.pool.quote_withdrawal(&shares1);
+    let expected_lp1_max = stats.total_capital * 60 / 100;
+    assert!(lp1_quote <= expected_lp1_max + 1); // allows 1-unit rounding in LP's disfavour
+
+    // Attempting to withdraw more than owned shares is rejected
+    let res = f.pool.try_withdraw_capital(&lp1, &(shares1 + 1));
+    assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
+}
+
+#[test]
+fn share_price_monotonicity_under_premium_accrual() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let price_0 = f.pool.pool_stats().share_price;
+
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 5_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    f.pool.buy_policy(&holder, &params);
+
+    let price_1 = f.pool.pool_stats().share_price;
+    assert!(price_1 >= price_0, "Share price must never decrease upon premium accrual");
+}
+
+#[test]
+fn auth_failure_rejected_for_unauthorized_admin_actions() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+
+    let res = f.pool.try_set_admin(&stranger, &stranger);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
+}
+
+#[test]
+fn test_spec_pool_interface_and_error_snapshot() {
+    // Pin PoolError discriminants
+    assert_eq!(PoolError::AlreadyInitialized as u32, 1);
+    assert_eq!(PoolError::NotInitialized as u32, 2);
+    assert_eq!(PoolError::Unauthorized as u32, 3);
+    assert_eq!(PoolError::InsufficientCapacity as u32, 4);
+    assert_eq!(PoolError::PolicyNotFound as u32, 5);
+    assert_eq!(PoolError::PolicyExpired as u32, 6);
+    assert_eq!(PoolError::PolicyNotTriggered as u32, 7);
+    assert_eq!(PoolError::NotPolicyholder as u32, 8);
+    assert_eq!(PoolError::AlreadyClaimed as u32, 9);
+    assert_eq!(PoolError::InsufficientPremium as u32, 10);
+    assert_eq!(PoolError::ZeroAmount as u32, 11);
+    assert_eq!(PoolError::InsufficientShares as u32, 12);
+    assert_eq!(PoolError::CapitalLocked as u32, 13);
+    assert_eq!(PoolError::PolicyNotYetExpired as u32, 14);
+    assert_eq!(PoolError::LockupActive as u32, 15);
+
+    // Pin CoverageType variants and discriminants in pool
+    assert_eq!(CoverageType::StablecoinDepeg as u32, 0);
+    assert_eq!(CoverageType::MarketCrash as u32, 1);
+    assert_eq!(CoverageType::LiquidationShield as u32, 2);
+    assert_eq!(CoverageType::SmartContractRisk as u32, 3);
+    assert_eq!(CoverageType::FlightDelay as u32, 4);
+
+    // Pin PoolConfig layout
+    let config = PoolConfig {
+        base_premium_rate_bps: 200,
+        max_utilization_bps: 8000,
+        min_coverage: 10_000_000,
+        max_coverage: 1_000_000_000,
+        lockup_days: 7,
+    };
+    assert_eq!(config.base_premium_rate_bps, 200);
+    assert_eq!(config.max_utilization_bps, 8000);
+    assert_eq!(config.lockup_days, 7);
+
+    // Pin PoolStats layout
+    let stats = PoolStats {
+        total_capital: 100_000_000,
+        total_coverage: 20_000_000,
+        total_shares: 100_000_000,
+        utilization_bps: 2000,
+        share_price: 10_000_000,
+        available_capacity: 60_000_000,
+        apy_estimate_bps: 40,
+    };
+    assert_eq!(stats.utilization_bps, 2000);
+    assert_eq!(stats.available_capacity, 60_000_000);
+}
+
+#[test]
+fn test_spec_mirrored_registry_types_match() {
+    assert_eq!(RegistryCoverageType::StablecoinDepeg as u32, refract_policy::CoverageType::StablecoinDepeg as u32);
+    assert_eq!(RegistryCoverageType::MarketCrash as u32, refract_policy::CoverageType::MarketCrash as u32);
+    assert_eq!(RegistryCoverageType::LiquidationShield as u32, refract_policy::CoverageType::LiquidationShield as u32);
+    assert_eq!(RegistryCoverageType::SmartContractRisk as u32, refract_policy::CoverageType::SmartContractRisk as u32);
+    assert_eq!(RegistryCoverageType::FlightDelay as u32, refract_policy::CoverageType::FlightDelay as u32);
+
+    let env = Env::default();
+    let holder = Address::generate(&env);
+    let pool_reg = PolicyRegistration {
+        policy_id: 42,
+        holder: holder.clone(),
+        coverage_type: RegistryCoverageType::StablecoinDepeg,
+        coverage_amount: 50_000_000,
+        premium: 500_000,
+        expires_at: 1_900_000_000,
+    };
+    let policy_reg = refract_policy::PolicyRegistration {
+        policy_id: 42,
+        holder: holder.clone(),
+        coverage_type: refract_policy::CoverageType::StablecoinDepeg,
+        coverage_amount: 50_000_000,
+        premium: 500_000,
+        expires_at: 1_900_000_000,
+    };
+    assert_eq!(pool_reg.policy_id, policy_reg.policy_id);
+    assert_eq!(pool_reg.coverage_amount, policy_reg.coverage_amount);
+    assert_eq!(pool_reg.premium, policy_reg.premium);
+    assert_eq!(pool_reg.expires_at, policy_reg.expires_at);
+}
+
+// ── Scoped Auth Mocking Test Suite ──────────────────────────────────────────
+
+#[test]
+#[should_panic]
+fn test_set_admin_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    // Create a strict environment without blanket mock_all_auths
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    pool_strict.set_admin(&admin, &new_admin);
+}
+
+#[test]
+#[should_panic]
+fn test_provide_capital_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let provider = Address::generate(&env_strict);
+    pool_strict.provide_capital(&provider, &10_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_withdraw_capital_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let provider = Address::generate(&env_strict);
+    pool_strict.withdraw_capital(&provider, &10_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_buy_policy_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let buyer = Address::generate(&env_strict);
+    pool_strict.buy_policy(
+        &buyer,
+        &PolicyParams {
+            coverage_type: CoverageType::StablecoinDepeg,
+            coverage_amount: 10_000_000,
+            duration_days: 30,
+            trigger_threshold: 500,
+        },
+    );
+}
+
+#[test]
+fn test_set_admin_succeeds_with_proper_scoped_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    pool.set_admin(&admin, &new_admin);
+    assert_eq!(pool.admin(), Some(new_admin));
+}
+
+#[test]
+fn test_calc_premium_matches_expected_formula() {
+    let config = PoolConfig {
+        base_premium_rate_bps: 300,
+        max_utilization_bps: 8000,
+        min_coverage: 100 * ONE_USDC,
+        max_coverage: 50_000 * ONE_USDC,
+        lockup_days: 7,
+    };
+    let params = PolicyParams {
+        coverage_amount: 10_000 * ONE_USDC,
+        coverage_type: CoverageType::MarketCrash,
+        duration_days: 30,
+        trigger_threshold: 300,
+    };
+
+    let actual = RefractPool::_calc_premium(&config, &params);
+    let expected = (10_000 * ONE_USDC as i128 * 300 * 30 * 100) / (10_000 * 365 * 100);
+    assert_eq!(actual, expected);
+    assert!(actual > 0);
+}
+
+#[test]
+fn test_precision_loss_bounds_in_deferred_division() {
     let config = PoolConfig {
         base_premium_rate_bps: 300,
         max_utilization_bps: 8000,
@@ -1327,4 +1708,6 @@ fn test_precision_loss_bounds_in_deferred_division() {
             * 150 / 100;
         assert!(premium >= naive);
     }
+}
+
 }

@@ -81,3 +81,65 @@ fn per_holder_indexing_invariants() {
         })
         .unwrap();
 }
+
+#[test]
+fn arbitrary_interleaving_deactivation_decrement_invariants() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let pool = Address::generate(&env);
+    let id = env.register_contract(None, RefractPolicyRegistry);
+    let registry = RefractPolicyRegistryClient::new(&env, &id);
+    registry.initialize(&admin, &pool);
+
+    let cases = (1u32..15u32,);
+    TestRunner::default()
+        .run(&cases, |(batch_size,)| {
+            let holder = Address::generate(&env);
+            for i in 1..=batch_size {
+                let pid = 20_000 + (i as u64);
+                let reg = PolicyRegistration {
+                    policy_id: pid,
+                    holder: holder.clone(),
+                    coverage_type: CoverageType::MarketCrash,
+                    coverage_amount: 50_000_000,
+                    premium: 500_000,
+                    expires_at: 20_000_000,
+                };
+                registry.register_policy(&pool, &reg);
+            }
+            let active_before = registry.get_stats().active_policies;
+            prop_assert_eq!(active_before, batch_size as u64);
+
+            for i in 1..=batch_size {
+                let pid = 20_000 + (i as u64);
+                registry.deactivate_policy(&pool, &pid);
+                let active_now = registry.get_stats().active_policies;
+                prop_assert_eq!(active_now, (batch_size - i) as u64);
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn non_existent_policy_lookup_invariants() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let pool = Address::generate(&env);
+    let id = env.register_contract(None, RefractPolicyRegistry);
+    let registry = RefractPolicyRegistryClient::new(&env, &id);
+    registry.initialize(&admin, &pool);
+
+    let cases = (100_000u64..100_050u64,);
+    TestRunner::default()
+        .run(&cases, |(non_existent_id,)| {
+            let record = registry.get_policy(&non_existent_id);
+            prop_assert!(record.is_none());
+            Ok(())
+        })
+        .unwrap();
+}
