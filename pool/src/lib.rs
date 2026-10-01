@@ -73,6 +73,11 @@ pub enum DataKey {
     Admin,
     UsdcToken,
     PolicyRegistry, // RefractPolicyRegistry contract address
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    UsdcToken,
+    PolicyRegistry, // RefractPolicyRegistry contract address
     Accounting,     // Consolidated PoolAccounting struct
     TotalCapital,   // Legacy key for migration
     TotalCoverage,  // Legacy key for migration
@@ -291,6 +296,11 @@ impl RefractPool {
 
         let shares = Self::_calc_shares(&state, amount);
 
+        let mut acc = Self::_accounting(&env);
+        acc.total_capital += amount;
+        acc.total_shares += shares;
+        Self::_save_accounting(&env, &acc);
+
         let mut user_shares: i128 = env
             .storage()
             .persistent()
@@ -452,6 +462,9 @@ impl RefractPool {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(id), &policy);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextPolicyId, &(id + 1));
 
         let mut user_policies: Vec<u64> = env
             .storage()
@@ -1051,3 +1064,11 @@ impl RefractPool {
     }
 
 }
+
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod pricing_proptest;
+#[cfg(test)]
+mod wasm_test;
