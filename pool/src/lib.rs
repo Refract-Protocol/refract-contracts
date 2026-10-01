@@ -1084,3 +1084,5 @@ mod test;
 
 #[cfg(test)]
 mod pricing_proptest;
+#[cfg(test)]
+mod wasm_test;

@@ -1362,3 +1362,108 @@ fn test_spec_mirrored_registry_types_match() {
     assert_eq!(pool_reg.premium, policy_reg.premium);
     assert_eq!(pool_reg.expires_at, policy_reg.expires_at);
 }
+
+// ── Scoped Auth Mocking Test Suite ──────────────────────────────────────────
+
+#[test]
+#[should_panic]
+fn test_set_admin_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    // Create a strict environment without blanket mock_all_auths
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    pool_strict.set_admin(&admin, &new_admin);
+}
+
+#[test]
+#[should_panic]
+fn test_provide_capital_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let provider = Address::generate(&env_strict);
+    pool_strict.provide_capital(&provider, &10_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_withdraw_capital_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let provider = Address::generate(&env_strict);
+    pool_strict.withdraw_capital(&provider, &10_000_000);
+}
+
+#[test]
+#[should_panic]
+fn test_buy_policy_rejects_unauthorized_signer() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    let env_strict = Env::default();
+    let pool_strict = RefractPoolClient::new(&env_strict, &pool_id);
+    let buyer = Address::generate(&env_strict);
+    pool_strict.buy_policy(
+        &buyer,
+        &PolicyParams {
+            coverage_type: CoverageType::StablecoinDepeg,
+            coverage_amount: 10_000_000,
+            duration_days: 30,
+            trigger_threshold: 500,
+        },
+    );
+}
+
+#[test]
+fn test_set_admin_succeeds_with_proper_scoped_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_id = env.register_contract(None, RefractPool);
+    let pool = RefractPoolClient::new(&env, &pool_id);
+    let registry_id = env.register_contract(None, RefractPolicyRegistry);
+
+    env.mock_all_auths();
+    pool.initialize(&admin, &sac.address(), &registry_id);
+
+    pool.set_admin(&admin, &new_admin);
+    assert_eq!(pool.admin(), Some(new_admin));
+}
+}
