@@ -73,6 +73,30 @@ pub enum DataKey {
     Admin,
     UsdcToken,
     PolicyRegistry, // RefractPolicyRegistry contract address
+    TotalCapital,
+    TotalCoverage, // sum of all active policy coverage amounts
+    TotalPremiums, // accumulated premiums (protocol revenue)
+    Shares(Address),
+    TotalShares,
+    Policy(u64),
+    UserPolicies(Address),
+    NextPolicyId,
+}
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    UsdcToken,
+    PolicyRegistry, // RefractPolicyRegistry contract address
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolAccounting {
+    pub total_capital: i128,
+    pub total_coverage: i128,
+    pub total_premiums: i128,
+    pub total_shares: i128,
+    pub next_policy_id: u64,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
@@ -1009,7 +1033,6 @@ impl RefractPool {
         }
         Ok(())
     }
-
     pub fn _accounting(env: &Env) -> PoolAccounting {
         if let Some(acc) = env.storage().instance().get(&DataKey::Accounting) {
             acc
