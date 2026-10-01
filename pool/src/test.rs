@@ -1280,6 +1280,51 @@ fn griefing_stranger_untriggered_claim_fails_cleanly() {
 
 
 #[test]
+fn migrate_accounting_migrates_legacy_keys_and_removes_them() {
+    let f = setup();
+    let stats_before = f.pool.pool_stats();
+    assert_eq!(stats_before.total_capital, 0);
+
+    // Calling migrate on an already packed pool should return AlreadyInitialized
+    let res = f.pool.try_migrate_accounting(&f.admin);
+    assert_eq!(res, Err(Ok(PoolError::AlreadyInitialized)));
+}
+
+#[test]
+fn migrate_accounting_rejects_non_admin() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let res = f.pool.try_migrate_accounting(&stranger);
+    assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
+}
+
+#[test]
+fn accounting_view_reflects_capital_and_shares() {
+    let f = setup();
+    let lp = funded(&f, 50_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(50_000 * ONE_USDC));
+
+    let acc = f.pool.accounting();
+    assert_eq!(acc.total_capital, 50_000 * ONE_USDC);
+    assert_eq!(acc.total_shares, 50_000 * ONE_USDC);
+    assert_eq!(acc.next_policy_id, 0);
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    f.pool.buy_policy(&holder, &params);
+
+    let acc2 = f.pool.accounting();
+    assert_eq!(acc2.next_policy_id, 1);
+    assert_eq!(acc2.total_coverage, 1_000 * ONE_USDC);
+    assert!(acc2.total_premiums > 0);
+}
+
+#[test]
 fn test_spec_pool_interface_and_error_snapshot() {
     // Pin PoolError discriminants
     assert_eq!(PoolError::AlreadyInitialized as u32, 1);
