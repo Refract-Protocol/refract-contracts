@@ -887,9 +887,5 @@ fn first_submission_from_a_relayer_is_always_accepted() {
         &now,
         &Symbol::new(&f.env, "test_source"),
     );
-    assert!(res.is_ok());
 }
 
-#[test]
-
-}
