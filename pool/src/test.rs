@@ -1279,6 +1279,35 @@ fn griefing_stranger_untriggered_claim_fails_cleanly() {
 }
 
 
+// ─── Issues #20, #21: Differential Premium & Precision Loss Tests ─────────────
+
+#[test]
+fn test_differential_calc_premium_against_reference_model() {
+    let config = PoolConfig {
+        base_premium_rate_bps: 300,
+        max_utilization_bps: 8000,
+        min_coverage: 100 * ONE_USDC,
+        max_coverage: 50_000 * ONE_USDC,
+        lockup_days: 7,
+    };
+
+    let params = PolicyParams {
+        coverage_amount: 10_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+
+    let actual = RefractPool::_calc_premium(&config, &params);
+    let expected = (10_000 * ONE_USDC as i128 * 300 * 30 * 100) / (10_000 * 365 * 100);
+    assert_eq!(actual, expected);
+    assert!(actual > 0);
+}
+
+#[test]
+fn test_precision_loss_bounds_in_deferred_division() {
+    let confi
+
 #[test]
 fn test_lockup_overflow_handled_safely() {
     let f = setup();
@@ -1338,6 +1367,19 @@ fn economic_conservation_inflows_equal_outflows_and_pool_balance() {
     f.pool.provide_capital(&lp, &deposit_amount);
 
     let mut expected_inflows = deposit_amount;
+    let mut expected_outflows = 0i128;
+
+    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
+    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+
+    // 3. Buy policy with premium
+    let holder = funded(&f, 10_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 10_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
     let mut expected_outflows = 0i128;
 
     assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
@@ -1620,4 +1662,52 @@ fn test_set_admin_succeeds_with_proper_scoped_auth() {
     pool.set_admin(&admin, &new_admin);
     assert_eq!(pool.admin(), Some(new_admin));
 }
+
+#[test]
+fn test_calc_premium_matches_expected_formula() {
+    let config = PoolConfig {
+        base_premium_rate_bps: 300,
+        max_utilization_bps: 8000,
+        min_coverage: 100 * ONE_USDC,
+        max_coverage: 50_000 * ONE_USDC,
+        lockup_days: 7,
+    };
+    let params = PolicyParams {
+        coverage_amount: 10_000 * ONE_USDC,
+        coverage_type: CoverageType::MarketCrash,
+        duration_days: 30,
+        trigger_threshold: 300,
+    };
+
+    let actual = RefractPool::_calc_premium(&config, &params);
+    let expected = (10_000 * ONE_USDC as i128 * 300 * 30 * 100) / (10_000 * 365 * 100);
+    assert_eq!(actual, expected);
+    assert!(actual > 0);
+}
+
+#[test]
+fn test_precision_loss_bounds_in_deferred_division() {
+    let config = PoolConfig {
+        base_premium_rate_bps: 300,
+        max_utilization_bps: 8000,
+        min_coverage: 100 * ONE_USDC,
+        max_coverage: 50_000 * ONE_USDC,
+        lockup_days: 7,
+    };
+
+    for days in [1u32, 7, 30, 90, 180, 365] {
+        let params = PolicyParams {
+            coverage_amount: 1_000 * ONE_USDC,
+            coverage_type: CoverageType::MarketCrash,
+            duration_days: days,
+            trigger_threshold: 300,
+        };
+        let premium = RefractPool::_calc_premium(&config, &params);
+        let naive = (params.coverage_amount * (config.base_premium_rate_bps as i128) / 10_000)
+            * (days as i128) / 365
+            * 150 / 100;
+        assert!(premium >= naive);
+    }
+}
+
 }

@@ -96,20 +96,6 @@ pub enum DataKey {
     UserPolicies(Address),
     NextPolicyId,
 }
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    UsdcToken,
-    PolicyRegistry, // RefractPolicyRegistry contract address
-    TotalCapital,
-    TotalCoverage, // sum of all active policy coverage amounts
-    TotalPremiums, // accumulated premiums (protocol revenue)
-    Shares(Address),
-    TotalShares,
-    Policy(u64),
-    UserPolicies(Address),
-    NextPolicyId,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolAccounting {
@@ -1146,10 +1132,16 @@ mod test;
 
 #[cfg(test)]
 mod pricing_proptest;
+        env.events().publish((symbol_short!("MIGRATE"),), (admin,));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
 mod pricing_proptest;
+
 #[cfg(test)]
 mod wasm_test;
