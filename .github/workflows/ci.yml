@@ -46,6 +46,22 @@ jobs:
       - name: SDK upgrade verification gate
         run: python3 scripts/verify_sdk_upgrade.py
 
+  # Issue #131 (plan): add a `miri` job here:
+  #   - dtolnay/rust-toolchain@nightly with components: miri
+  #   - cargo miri setup
+  #   - cargo miri test -p refract-pool -p refract-policy -p refract-oracle
+  #     with MIRIFLAGS="-Zmiri-disable-isolation" (the soroban test Env reads
+  #     the clock/RNG).
+  # Miri runs the native test harness, not the wasm32 artifact. It
+  # validates the logic the tests exercise, not the wasm runtime.
+  # Proptest suites (pricing_proptest.rs, registry_proptest.rs) are too
+  # slow under Miri: gate them with #[cfg_attr(miri, ignore)] and a comment.
+  # Any finding inside soroban-sdk/test harness internals is suppressed the
+  # same way, with a justification and an upstream issue link; genuine UB in
+  # this repo gets fixed. Findings are recorded in MIRI.md.
+  # Blocked until the pool crate compiles again (see the #174 note in
+  # pool/src/lib.rs).
+
   docs:
     name: rustdoc · links · coverage
     runs-on: ubuntu-latest

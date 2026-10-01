@@ -1,0 +1,22 @@
+[package]
+name = "refract-pool"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils", "alloc"] }
+# Dev-only: the pool calls the registry and oracle purely through
+# env.invoke_contract() with locally-mirrored ABIs (see the cross-contract
+# wiring note in src/lib.rs) so neither refract-policy nor refract-oracle
+# contract code is compiled into the pool's wasm. Tests still want the real
+# contracts deployed in-process to exercise the calls end-to-end, hence
+# dev-dependencies only.
+refract-policy = { path = "../policy" }
+refract-oracle = { path = "../oracle" }
+proptest = { workspace = true }
