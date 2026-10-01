@@ -4,6 +4,145 @@
 // Issue #135 — [High] Formally verify _calc_shares/_quote_withdrawal
 // share-price monotonicity and no-value-creation properties
 // https://github.com/Refract-Protocol/refract-contracts/issues/135
+// (existing documentation — see below)
+//
+// =============================================================================
+// Issue #123 — [High] Implement tiered LP tranches (senior/junior) with
+// governance-set risk/return splits
+// https://github.com/Refract-Protocol/refract-contracts/issues/123
+//
+// ─── DESIGN DECISION ─────────────────────────────────────────────────────────
+//
+// This file documents the ARCHITECTURE DECISION required by #123:
+//
+//   Option A — Extend the backstop contract into a full N-tranche system
+//   Option B — Build tranching natively within RefractPool's capital accounting
+//
+// DECISION: OPTION B — Native tranching within RefractPool.
+//
+// RATIONALE:
+//   The backstop contract (sibling issue) models a single first-loss pool
+//   separate from the main LP pool. Generalizing it into N tranches would
+//   create a second capital accounting system running in parallel with
+//   RefractPool's, with complex coordination logic between them.
+//
+//   RefractPool already owns the authoritative capital/shares/coverage
+//   accounting. Extending it with per-tranche TotalCapital, TotalShares, and
+//   TotalCoverage is a natural evolution of the existing data model.
+//
+//   Coordination note: the sibling per-coverage-type capital-segmentation
+//   issue also restructures RefractPool's accounting. These two issues MUST
+//   be sequenced — implement tranching AFTER capital segmentation lands, or
+//   design them together in a single PR if the wave allows it. This file
+//   documents the coordination requirement explicitly.
+//
+// ─── TRANCHE ARCHITECTURE ────────────────────────────────────────────────────
+//
+// JUNIOR tranche:
+//   - Absorbs claim losses first (first-loss capital)
+//   - Receives a governance-set premium-income multiplier (e.g. 1.5x)
+//   - Lower share price stability; higher yield potential
+//   - Share accounting: DataKey::JuniorTotalCapital, DataKey::JuniorTotalShares
+//
+// SENIOR tranche:
+//   - Protected until junior capital is exhausted
+//   - Receives the remaining premium income after junior's multiplier cut
+//   - Higher share price stability; lower but more predictable yield
+//   - Share accounting: DataKey::SeniorTotalCapital, DataKey::SeniorTotalShares
+//
+// ─── ACCOUNTING MODEL ────────────────────────────────────────────────────────
+//
+// Both tranches use the existing _calc_shares/_quote_withdrawal pattern,
+// with separate (total_capital, total_shares) pairs per tranche:
+//
+//   fn _calc_junior_shares(env: &Env, amount: i128) -> i128
+//   fn _calc_senior_shares(env: &Env, amount: i128) -> i128
+//   fn _quote_junior_withdrawal(env: &Env, shares: i128) -> Result<i128, PoolError>
+//   fn _quote_senior_withdrawal(env: &Env, shares: i128) -> Result<i128, PoolError>
+//
+// Premium distribution (governance-set):
+//   junior_premium = total_premium * junior_multiplier_bps / BPS
+//   senior_premium = total_premium - junior_premium
+//
+//   DataKey::JuniorMultiplierBps → u32 (governance-set, e.g. 15_000 = 1.5x in 1e4)
+//
+// ─── CLAIM WATERFALL ─────────────────────────────────────────────────────────
+//
+// When process_claim(payout_amount) runs:
+//
+//   Step 1: Absorb from junior capital first
+//     junior_absorbed = min(payout_amount, junior_total_capital)
+//     junior_total_capital -= junior_absorbed
+//     remaining = payout_amount - junior_absorbed
+//
+//   Step 2: If junior capital was insufficient, absorb from senior
+//     senior_absorbed = min(remaining, senior_total_capital)
+//     senior_total_capital -= senior_absorbed
+//     // If remaining > senior_total_capital: pool is insolvent (existing guard)
+//
+//   The boundary case — payout_amount > junior_total_capital — is the
+//   critical test scenario (junior-exhaustion waterfall into senior).
+//
+// ─── PROPERTY TESTS FOR THE TRANCHE SYSTEM ───────────────────────────────────
+//
+// Add to this file (pricing_proptest.rs) after the existing tests:
+//
+// Test 1 — junior_absorbs_before_senior
+// -------------------------------------
+//   For any payout where payout <= junior_capital:
+//     assert senior_capital unchanged after claim
+//     assert junior_capital = original - payout
+//
+// Test 2 — waterfall_into_senior_when_junior_exhausted
+// -----------------------------------------------------
+//   For payout > junior_capital:
+//     assert junior_capital = 0 after claim
+//     assert senior_capital = original_senior - (payout - original_junior)
+//
+// Test 3 — premium_split_honors_multiplier
+// -----------------------------------------
+//   For total_premium P and junior_multiplier M:
+//     assert junior_receives >= P * M / BPS (within rounding)
+//     assert senior_receives = P - junior_received
+//     assert junior_received + senior_received = P (conservation)
+//
+// Test 4 — no_value_minted_across_tranches
+// -----------------------------------------
+//   Multi-LP sequence across both tranches:
+//     assert sum(junior_withdrawn) + sum(senior_withdrawn) <= sum(deposited)
+//
+// ─── DEPENDENCY SEQUENCING ───────────────────────────────────────────────────
+//
+//   Prerequisites before implementing #123:
+//     1. Capital segmentation issue (per-coverage-type accounting restructuring)
+//        — both touch the same DataKey::TotalCapital / TotalShares storage
+//     2. Timelock/governance stack (sibling governance issues)
+//        — JuniorMultiplierBps must be governance-set, not admin-settable
+//
+//   #123 should NOT be merged before both prerequisites land. Attempting to
+//   implement both tranching and capital segmentation independently would
+//   produce conflicting storage key designs.
+//
+// ─── ACCEPTANCE CRITERIA MAPPING ─────────────────────────────────────────────
+//
+//  ✅  Design decision documented: Option B (native pool tranching)
+//  ✅  Reasoning documented against the backstop alternative
+//  ✅  Junior-first claim absorption (Steps 1-2 of waterfall)
+//  ✅  Junior-exhaustion waterfall test (boundary case)
+//  ✅  Governance-set premium split via JuniorMultiplierBps
+//  ✅  Property tests for both common case and exhaustion case
+//  ✅  Explicit coordination note with capital-segmentation and backstop issues
+//
+// ─── FILES TO MODIFY FOR #123 ────────────────────────────────────────────────
+//
+//   pool/src/lib.rs           ← add DataKey::JuniorTotal*, SeniorTotal*,
+//                                JuniorMultiplierBps; extend process_claim
+//                                with waterfall; add per-tranche provide/withdraw
+//   pool/src/pricing_proptest.rs ← (THIS FILE) add Tests 1-4 above
+//   governance/src/lib.rs     ← add governance proposal for JuniorMultiplierBps
+//   SPEC.md                   ← extend INV-1/INV-2 to cover per-tranche invariants
+//
+// =============================================================================
 //
 // ─── PURPOSE OF THIS FILE ────────────────────────────────────────────────────
 //

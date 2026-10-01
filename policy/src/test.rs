@@ -528,3 +528,31 @@ fn test_spec_policy_registry_interface_and_error_snapshot() {
     assert!(record.is_active);
 }
 }
+
+// ─── Issue #25: Per-holder indexing growth tests ──────────────────────────────
+
+#[test]
+fn test_per_holder_indexing_unbounded_growth_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let pool = Address::generate(&env);
+    let id = env.register_contract(None, RefractPolicyRegistry);
+    let registry = RefractPolicyRegistryClient::new(&env, &id);
+    registry.initialize(&admin, &pool);
+
+    let holder = Address::generate(&env);
+    for i in 1..=50 {
+        let reg = PolicyRegistration {
+            policy_id: 80_000 + i,
+            holder: holder.clone(),
+            coverage_type: CoverageType::StablecoinDepeg,
+            coverage_amount: 1_000_000,
+            premium: 10_000,
+            expires_at: 20_000_000,
+        };
+        registry.register_policy(&pool, &reg);
+    }
+    let ids = registry.get_holder_active_policy_ids(&holder);
+    assert_eq!(ids.len(), 50);
+}
