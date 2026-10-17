@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 soroban-sdk = "21.0.0"
+refract-payout-registry = { path = "../payout_registry" }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
