@@ -1,5 +1,11 @@
 #![no_std]
 
+pub mod normalization;
+pub use normalization::{
+    normalize_inflow, normalize_outflow, to_protocol_units, to_token_units, NormalizationError,
+    Rounding, PROTOCOL_DECIMALS, PROTOCOL_SCALE,
+};
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
 };
@@ -28,13 +34,16 @@ pub enum TreasuryError {
     ReserveLocked = 6,
     UnauthorizedTimelock = 7,
     InsufficientBalance = 8,
+    NormalizationError = 9,
 }
 
-/// `RefractTreasury` is a token-custody vault with a segregated emergency reserve pool.
+/// `RefractTreasury` is a token-custody vault with a segregated emergency reserve pool
+/// and canonical asset decimal normalization support.
 ///
 /// Standard funds reside in operating balance and can be withdrawn by admin.
 /// Emergency reserves are strictly segregated and can only be released by the
-/// governance timelock contract.
+/// governance timelock contract. Canonical payout methods normalize protocol 1e7
+/// units to native token units applying floor rounding.
 #[contract]
 pub struct RefractTreasury;
 
@@ -248,6 +257,51 @@ impl RefractTreasury {
             .set(&DataKey::OperatingBalance(token), &new_operating);
 
         Ok(())
+    }
+
+    /// Convert token units to protocol units (1e7, rounding Ceil for inflow).
+    pub fn to_protocol_units(_env: Env, amount: i128, token_decimals: u32) -> Result<i128, NormalizationError> {
+        normalization::to_protocol_units(amount, token_decimals)
+    }
+
+    /// Convert protocol units (1e7) to token units (rounding Floor for outflow/payout).
+    pub fn to_token_units(_env: Env, protocol_amount: i128, token_decimals: u32) -> Result<i128, NormalizationError> {
+        normalization::to_token_units(protocol_amount, token_decimals)
+    }
+
+    /// Withdraw using canonical protocol units (1e7), normalizing to native token units
+    /// with floor rounding (payout/outflow protection against dust overpayment).
+    /// Returns the actual native token amount transferred.
+    pub fn withdraw_canonical(
+        env: Env,
+        caller: Address,
+        token: Address,
+        protocol_amount: i128,
+        to: Address,
+    ) -> Result<i128, TreasuryError> {
+        let decimals = token::Client::new(&env, &token).decimals();
+        let token_amount = normalization::to_token_units(protocol_amount, decimals)
+            .map_err(|_| TreasuryError::NormalizationError)?;
+        Self::withdraw(env, caller, token, token_amount, to)?;
+        Ok(token_amount)
+    }
+
+    /// Release emergency reserve using canonical protocol units (1e7), normalizing to native token units
+    /// with floor rounding (payout/outflow protection against dust overpayment).
+    /// Returns the actual native token amount transferred.
+    pub fn release_reserve_canonical(
+        env: Env,
+        caller: Address,
+        token: Address,
+        protocol_amount: i128,
+        to: Address,
+        purpose_tag: Symbol,
+    ) -> Result<i128, TreasuryError> {
+        let decimals = token::Client::new(&env, &token).decimals();
+        let token_amount = normalization::to_token_units(protocol_amount, decimals)
+            .map_err(|_| TreasuryError::NormalizationError)?;
+        Self::release_reserve(env, caller, token, token_amount, to, purpose_tag)?;
+        Ok(token_amount)
     }
 }
 
@@ -561,5 +615,76 @@ mod test {
             client.try_set_timelock(&stranger, &timelock),
             Err(Ok(TreasuryError::Unauthorized))
         );
+    }
+
+    #[test]
+    fn test_canonical_conversion_entrypoints() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&env, &contract_id);
+
+        // 6 decimals: 1_000_000 -> 10_000_000
+        assert_eq!(client.to_protocol_units(&1_000_000, &6), 10_000_000);
+        assert_eq!(client.to_token_units(&10_000_000, &6), 1_000_000);
+
+        // 7 decimals: 10_000_000 -> 10_000_000
+        assert_eq!(client.to_protocol_units(&10_000_000, &7), 10_000_000);
+        assert_eq!(client.to_token_units(&10_000_000, &7), 10_000_000);
+
+        // 18 decimals: 10^18 -> 10_000_000
+        let weth = 1_000_000_000_000_000_000i128;
+        assert_eq!(client.to_protocol_units(&weth, &18), 10_000_000);
+        assert_eq!(client.to_token_units(&10_000_000, &18), weth);
+    }
+
+    #[test]
+    fn test_canonical_withdraw_and_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let timelock = Address::generate(&env);
+        client.set_timelock(&admin, &timelock);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Stellar asset contract has 7 decimals (1:1 with protocol scale)
+        assert_eq!(token_client.decimals(), 7);
+
+        // Mint operating funds: 50_000_000 (5 tokens at 1e7)
+        sac.mint(&contract_id, &50_000_000);
+
+        // Deposit reserve: 20_000_000 (2 tokens at 1e7)
+        let depositor = Address::generate(&env);
+        sac.mint(&depositor, &20_000_000);
+        client.deposit_reserve(&depositor, &token_id, &20_000_000);
+
+        let to = Address::generate(&env);
+
+        // Withdraw 10_000_000 protocol units canonically
+        let withdrawn = client.withdraw_canonical(&admin, &token_id, &10_000_000, &to);
+        assert_eq!(withdrawn, 10_000_000);
+        assert_eq!(token_client.balance(&to), 10_000_000);
+
+        // Release 5_000_000 protocol units from reserve canonically
+        let released = client.release_reserve_canonical(
+            &timelock,
+            &token_id,
+            &5_000_000,
+            &to,
+            &symbol_short!("grant"),
+        );
+        assert_eq!(released, 5_000_000);
+        assert_eq!(token_client.balance(&to), 15_000_000);
+
+        let (reserve_bal, _, _) = client.get_reserve_info(&token_id);
+        assert_eq!(reserve_bal, 15_000_000);
     }
 }

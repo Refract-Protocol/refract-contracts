@@ -1,5 +1,11 @@
 #![no_std]
 
+pub mod normalization;
+pub use normalization::{
+    normalize_inflow, normalize_outflow, to_protocol_units, to_token_units, NormalizationError,
+    Rounding, PROTOCOL_DECIMALS, PROTOCOL_SCALE,
+};
+
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
 
 /// Storage keys for the bounty escrow.
@@ -38,6 +44,7 @@ pub enum BountyError {
     InsufficientBalance = 4,
     Unauthorized = 5,
     DuplicateReport = 6,
+    NormalizationError = 7,
 }
 
 /// Governance-controlled bug bounty escrow.
@@ -69,9 +76,9 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        let token = Self::token(&env)?;
+        let token = Self::get_token(&env)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
-        let balance = Self::balance(&env)?;
+        let balance = Self::get_balance(&env)?;
         env.storage().instance().set(&DataKey::Balance, &(balance + amount));
         Ok(())
     }
@@ -88,7 +95,7 @@ impl RefractBountyEscrow {
         report_hash: BytesN<32>,
     ) -> Result<(), BountyError> {
         caller.require_auth();
-        let governance = Self::governance(&env)?;
+        let governance = Self::get_governance(&env)?;
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
@@ -98,12 +105,12 @@ impl RefractBountyEscrow {
         if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
             return Err(BountyError::DuplicateReport);
         }
-        let balance = Self::balance(&env)?;
+        let balance = Self::get_balance(&env)?;
         if amount > balance {
             return Err(BountyError::InsufficientBalance);
         }
 
-        let token = Self::token(&env)?;
+        let token = Self::get_token(&env)?;
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
         env.storage().instance().set(&DataKey::Balance, &(balance - amount));
 
@@ -117,14 +124,37 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
+    /// Award a bounty using canonical protocol units (1e7), normalizing to native token units
+    /// with floor rounding (protecting against dust overpayment).
+    /// Returns the actual native token amount awarded.
+    pub fn award_canonical(
+        env: Env,
+        caller: Address,
+        researcher: Address,
+        protocol_amount: i128,
+        report_hash: BytesN<32>,
+    ) -> Result<i128, BountyError> {
+        let token = Self::get_token(&env)?;
+        let decimals = token::Client::new(&env, &token).decimals();
+        let token_amount = normalization::to_token_units(protocol_amount, decimals)
+            .map_err(|_| BountyError::NormalizationError)?;
+        Self::award(env, caller, researcher, token_amount, report_hash)?;
+        Ok(token_amount)
+    }
+
     /// Current funds held in escrow.
     pub fn balance(env: Env) -> Result<i128, BountyError> {
-        Self::balance(&env)
+        Self::get_balance(&env)
     }
 
     /// The governance/timelock address authorized to award payouts.
     pub fn governance(env: Env) -> Result<Address, BountyError> {
-        Self::governance(&env)
+        Self::get_governance(&env)
+    }
+
+    /// The token address.
+    pub fn token(env: Env) -> Result<Address, BountyError> {
+        Self::get_token(&env)
     }
 
     /// Immutable record of a rewarded disclosure, if any.
@@ -132,21 +162,21 @@ impl RefractBountyEscrow {
         env.storage().persistent().get(&DataKey::Award(report_hash))
     }
 
-    fn governance(env: &Env) -> Result<Address, BountyError> {
+    fn get_governance(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Governance)
             .ok_or(BountyError::NotInitialized)
     }
 
-    fn token(env: &Env) -> Result<Address, BountyError> {
+    fn get_token(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Token)
             .ok_or(BountyError::NotInitialized)
     }
 
-    fn balance(env: &Env) -> Result<i128, BountyError> {
+    fn get_balance(env: &Env) -> Result<i128, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Balance)
@@ -155,4 +185,37 @@ impl RefractBountyEscrow {
 }
 
 #[cfg(test)]
-mod test;
+mod test {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn test_bounty_canonical_award() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        client.initialize(&governance, &token_id);
+
+        let funder = Address::generate(&env);
+        sac.mint(&funder, &100_000_000);
+        client.fund(&funder, &100_000_000);
+
+        let researcher = Address::generate(&env);
+        let report_hash = BytesN::from_array(&env, &[42u8; 32]);
+
+        // Stellar token has 7 decimals (1:1 with protocol scale)
+        let awarded = client.award_canonical(&governance, &researcher, &50_000_000, &report_hash);
+        assert_eq!(awarded, 50_000_000);
+        assert_eq!(client.balance(), 50_000_000);
+
+        let token_client = token::Client::new(&env, &token_id);
+        assert_eq!(token_client.balance(&researcher), 50_000_000);
+    }
+}

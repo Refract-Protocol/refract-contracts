@@ -23,6 +23,12 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
+pub mod normalization;
+pub use normalization::{
+    normalize_inflow, normalize_outflow, to_protocol_units, to_token_units, NormalizationError,
+    Rounding, PROTOCOL_DECIMALS, PROTOCOL_SCALE,
+};
+
 use std::collections::BTreeMap;
 
 /// Identifier for a grant.
@@ -58,6 +64,8 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// Failed to convert amount between protocol units and token units.
+    NormalizationError,
 }
 
 /// A single milestone within a grant.
@@ -254,6 +262,19 @@ impl RefractGrants {
         Ok(amount)
     }
 
+    /// Claims the confirmed-but-unclaimed grant amount, converted from canonical protocol units (1e7)
+    /// to native token units based on `token_decimals` with floor rounding (protecting against dust overpayment).
+    pub fn claim_canonical(
+        &mut self,
+        recipient: Address,
+        grant_id: GrantId,
+        token_decimals: u32,
+    ) -> Result<i128, GrantsError> {
+        let protocol_amount = self.claim(recipient, grant_id)?;
+        normalization::to_token_units(protocol_amount, token_decimals)
+            .map_err(|_| GrantsError::NormalizationError)
+    }
+
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
         if caller != self.governance {
             return Err(GrantsError::Unauthorized);
@@ -414,5 +435,19 @@ mod tests {
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
         );
+    }
+
+    #[test]
+    fn test_grants_canonical_claim() {
+        let mut grants = contract();
+        // 10_000_000 protocol units (1 token in 1e7)
+        let id = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 10_000_000, vec![10_000_000])
+            .unwrap();
+        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+
+        // 6 decimals (USDC): 10_000_000 protocol units -> 1_000_000 USDC units
+        let claimed_usdc = grants.claim_canonical(RECIPIENT, id, 6).unwrap();
+        assert_eq!(claimed_usdc, 1_000_000);
     }
 }
