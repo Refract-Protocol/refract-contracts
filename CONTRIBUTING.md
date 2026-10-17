@@ -35,9 +35,7 @@ cargo test          # should pass on a clean checkout
 
 - Code is `#![no_std]`; **never** introduce floating-point arithmetic. Use 1e7
   fixed-point integers (`i128`) consistently.
-- Prefer typed `#[contracterror]` returns over `panic!` for recoverable errors
-  on the pool's public surface. (The registry/oracle currently panic on
-  misuse — converging these is a welcome contribution.)
+- **Panic-free policy**: Contract logic must be strictly panic-free (`panic!`, `.unwrap()`, and `.expect()` are disallowed in production contract code). All recoverable errors must return typed `#[contracterror]` enums wrapped in `Result<T, Error>`. Direct slice/collection indexing must use safe iterators or checked accessors (`get` / `get_mut`). This policy is enforced across all contracts (`pool`, `policy`, `oracle`, `backstop`, `bounty`, `grants`, `treasury`) via `clippy.toml` and `scripts/check_soroban_footguns.py`.
 - Authorize every state-changing entrypoint with `require_auth()` and verify the
   authorized principal.
 - Emit an event for every state transition.

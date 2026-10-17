@@ -3,7 +3,7 @@
 Static Analysis Gate for Soroban Footguns.
 
 Scans contract logic (excluding test modules) for:
-1. `unwrap()` / `expect()` calls in `#[contractimpl]` methods that trigger wasm traps.
+1. `unwrap()` / `expect()` / `panic!()` calls in `#[contractimpl]` methods that trigger wasm traps.
 2. Missing `require_auth()` checks on privileged state mutations.
 3. Unbounded collection or storage pattern risks.
 """
@@ -39,6 +39,10 @@ def scan_file(file_path):
     for idx, line in enumerate(lines, 1):
         stripped = line.strip()
 
+        if "#[cfg(test)]" in stripped or "mod test" in stripped:
+            in_contractimpl = False
+            break
+
         if "#[contractimpl]" in stripped:
             in_contractimpl = True
             continue
@@ -48,8 +52,8 @@ def scan_file(file_path):
             current_fn = match.group(1) if match else "unknown"
             fn_start_line = idx
 
-        # Check for unwrap/expect in production contract code
-        if in_contractimpl and (".unwrap()" in stripped or ".expect(" in stripped):
+        # Check for unwrap/expect/panic in production contract code
+        if in_contractimpl and (".unwrap()" in stripped or ".expect(" in stripped or "panic!(" in stripped):
             # Check allowlist
             allowed = False
             for (al_file, al_pattern), reason in ALLOWLIST.items():
@@ -60,8 +64,8 @@ def scan_file(file_path):
                 violations.append({
                     "file": file_path,
                     "line": idx,
-                    "type": "PANIC_RISK (unwrap/expect)",
-                    "message": f"Found direct unwrap/expect in contract method `{current_fn}`: '{stripped}'"
+                    "type": "PANIC_RISK (unwrap/expect/panic)",
+                    "message": f"Found direct unwrap/expect/panic in contract method `{current_fn}`: '{stripped}'"
                 })
 
         # Check for missing require_auth in mutating functions
@@ -92,11 +96,13 @@ def main():
         sys.exit(1)
 
     # 2. Scan core contracts
-    crates = ["pool", "policy", "oracle"]
+    crates = ["pool", "policy", "oracle", "backstop", "bounty", "grants", "treasury"]
     total_violations = 0
 
     for crate in crates:
         src_dir = os.path.join(crate, "src")
+        if not os.path.exists(src_dir):
+            continue
         for root, _, files in os.walk(src_dir):
             for file in files:
                 if file.endswith(".rs") and "test" not in file:

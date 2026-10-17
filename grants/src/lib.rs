@@ -201,13 +201,16 @@ impl RefractGrants {
 
         // Enforce in-order confirmation: every earlier milestone must already be
         // confirmed before this one can be.
-        for earlier in &grant.milestones[..milestone_index] {
+        for earlier in grant.milestones.iter().take(milestone_index) {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
             }
         }
 
-        let milestone = &mut grant.milestones[milestone_index];
+        let milestone = grant
+            .milestones
+            .get_mut(milestone_index)
+            .ok_or(GrantsError::InvalidMilestoneIndex)?;
         if milestone.confirmed {
             return Err(GrantsError::MilestoneAlreadyConfirmed);
         }
