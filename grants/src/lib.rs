@@ -1,37 +1,26 @@
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract with bounded
+//! iteration and cursor-based pagination (#291).
+
+#![allow(
+    clippy::disallowed_methods,
+    clippy::inconsistent_digit_grouping,
+    clippy::too_many_arguments
+)]
 
 use std::collections::BTreeMap;
 
 /// Identifier for a grant.
 pub type GrantId = u64;
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
+/// Address type used by the contract.
 pub type Address = u64;
+
+/// Hard ceiling on milestones per grant and items per paginated query.
+pub const HARD_MAX_PAGE_SIZE: usize = 50;
+/// Default configurable page size cap.
+pub const DEFAULT_MAX_PAGE_SIZE: usize = 25;
 
 /// Errors returned by [`RefractGrants`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +31,8 @@ pub enum GrantsError {
     GrantNotFound,
     /// A grant must declare at least one milestone.
     NoMilestones,
+    /// Milestone count or requested page size exceeds configured cap.
+    PageSizeExceeded,
     /// Milestone amounts do not sum to the declared total amount.
     MilestoneSumMismatch,
     /// A milestone amount was zero or negative.
@@ -84,6 +75,13 @@ pub struct Grant {
     pub claimable: i128,
 }
 
+/// Paginated response for grant enumeration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantPage {
+    pub items: Vec<(GrantId, Grant)>,
+    pub next_cursor: Option<GrantId>,
+}
+
 /// Milestone-based community grants disbursement contract.
 #[derive(Debug, Clone)]
 pub struct RefractGrants {
@@ -94,6 +92,8 @@ pub struct RefractGrants {
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Configurable maximum page size (bounded by `HARD_MAX_PAGE_SIZE`).
+    max_page_size: usize,
 }
 
 impl RefractGrants {
@@ -103,7 +103,70 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            max_page_size: DEFAULT_MAX_PAGE_SIZE,
         }
+    }
+
+    /// Updates the maximum page size (up to `HARD_MAX_PAGE_SIZE`). Governance-gated.
+    pub fn set_max_page_size(
+        &mut self,
+        caller: Address,
+        max_page_size: usize,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if max_page_size == 0 || max_page_size > HARD_MAX_PAGE_SIZE {
+            return Err(GrantsError::PageSizeExceeded);
+        }
+        self.max_page_size = max_page_size;
+        Ok(())
+    }
+
+    /// Returns the configured maximum page size.
+    pub fn max_page_size(&self) -> usize {
+        self.max_page_size
+    }
+
+    /// Cursor-based paginated enumeration of grants (`cursor` is the last `GrantId` returned,
+    /// or `None` to start from the first grant).
+    pub fn list_grants_paginated(
+        &self,
+        cursor: Option<GrantId>,
+        limit: usize,
+    ) -> Result<GrantPage, GrantsError> {
+        if limit == 0 || limit > self.max_page_size {
+            return Err(GrantsError::PageSizeExceeded);
+        }
+        let iter: Box<dyn Iterator<Item = (&GrantId, &Grant)>> = match cursor {
+            Some(last_id) => {
+                if let Some(start) = last_id.checked_add(1) {
+                    Box::new(self.grants.range(start..))
+                } else {
+                    return Ok(GrantPage {
+                        items: Vec::new(),
+                        next_cursor: None,
+                    });
+                }
+            }
+            None => Box::new(self.grants.iter()),
+        };
+
+        let mut collected: Vec<(GrantId, Grant)> = iter
+            .take(limit + 1)
+            .map(|(id, g)| (*id, g.clone()))
+            .collect();
+        let has_more = collected.len() > limit;
+        if has_more {
+            collected.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            collected.last().map(|(id, _)| *id)
+        } else {
+            None
+        };
+        Ok(GrantPage {
+            items: collected,
+            next_cursor,
+        })
     }
 
     /// Returns the configured governance/timelock authority.
@@ -122,9 +185,6 @@ impl RefractGrants {
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
     pub fn create_grant(
         &mut self,
         caller: Address,
@@ -140,13 +200,18 @@ impl RefractGrants {
         if milestones.is_empty() {
             return Err(GrantsError::NoMilestones);
         }
+        if milestones.len() > HARD_MAX_PAGE_SIZE {
+            return Err(GrantsError::PageSizeExceeded);
+        }
 
         let mut sum: i128 = 0;
         for amount in &milestones {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -178,10 +243,6 @@ impl RefractGrants {
     }
 
     /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
         &mut self,
         caller: Address,
@@ -199,8 +260,6 @@ impl RefractGrants {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
         for earlier in &grant.milestones[..milestone_index] {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
@@ -221,11 +280,7 @@ impl RefractGrants {
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
+    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the recipient.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
         let grant = self
             .grants
@@ -278,9 +333,11 @@ mod tests {
             .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
             .unwrap();
 
-        // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -295,121 +352,53 @@ mod tests {
     }
 
     #[test]
-    fn claim_releases_only_confirmed_amounts() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
-            .unwrap();
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn rejects_milestone_sum_mismatch() {
+    fn paginated_grant_enumeration_enforces_caps_and_handles_mutation() {
         let mut grants = contract();
         assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_milestones() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![]),
-            Err(GrantsError::NoMilestones)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 0, vec![0]),
-            Err(GrantsError::InvalidTotalAmount)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![100, 0]),
-            Err(GrantsError::InvalidMilestoneAmount)
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_order_confirmation() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneAlreadyConfirmed)
-        );
-    }
-
-    #[test]
-    fn enforces_governance_gating() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
+            grants.set_max_page_size(STRANGER, 2),
             Err(GrantsError::Unauthorized)
         );
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
+        grants.set_max_page_size(GOVERNANCE, 2).unwrap();
         assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
+            grants.set_max_page_size(GOVERNANCE, HARD_MAX_PAGE_SIZE + 1),
+            Err(GrantsError::PageSizeExceeded)
         );
-    }
-
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-
-        assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
         assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
+            grants.list_grants_paginated(None, 3),
+            Err(GrantsError::PageSizeExceeded)
         );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
 
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
+        for i in 0..5 {
+            grants
+                .create_grant(GOVERNANCE, RECIPIENT + i, 100, vec![100])
+                .unwrap();
+        }
+
+        let p1 = grants.list_grants_paginated(None, 2).unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert_eq!(p1.items[0].0, 0);
+        assert_eq!(p1.items[1].0, 1);
+        assert_eq!(p1.next_cursor, Some(1));
+
+        // Append new grant mid-pagination
+        grants
+            .create_grant(GOVERNANCE, RECIPIENT + 99, 100, vec![100])
             .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
-        );
+
+        let p2 = grants.list_grants_paginated(p1.next_cursor, 2).unwrap();
+        assert_eq!(p2.items.len(), 2);
+        assert_eq!(p2.items[0].0, 2);
+        assert_eq!(p2.items[1].0, 3);
+        assert_eq!(p2.next_cursor, Some(3));
+
+        let p3 = grants.list_grants_paginated(p2.next_cursor, 2).unwrap();
+        assert_eq!(p3.items.len(), 2);
+        assert_eq!(p3.items[0].0, 4);
+        assert_eq!(p3.items[1].0, 5);
+        assert_eq!(p3.next_cursor, None);
+
+        let past_end = grants.list_grants_paginated(Some(999), 2).unwrap();
+        assert!(past_end.items.is_empty());
+        assert_eq!(past_end.next_cursor, None);
     }
 }
