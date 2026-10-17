@@ -7,9 +7,19 @@ pub use normalization::{
 };
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN,
-    Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Symbol,
 };
+
+/// Status of a bounty program.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ProgramStatus {
+    Active = 0,
+    WindingDown = 1,
+    Terminated = 2,
+}
 
 /// Storage keys for the bounty escrow.
 #[contracttype]
@@ -27,6 +37,12 @@ pub enum DataKey {
     RefillRules(u64),
     /// Current balance allocated to a bounty program.
     ProgramBalance(u64),
+    /// Status of a bounty program (Active, WindingDown, Terminated).
+    ProgramStatus(u64),
+    /// Count of outstanding (unresolved) reports for a bounty program.
+    OutstandingReports(u64),
+    /// Configured manager role for a bounty program.
+    ProgramManager(u64),
 }
 
 /// Immutable, timestamped record that a specific disclosure was rewarded.
@@ -66,6 +82,11 @@ pub enum BountyError {
     ProgramBelowThreshold = 10,
     RefillNotNeeded = 11,
     RulesNotFound = 12,
+    ProgramNotActive = 13,
+    ProgramWindingDown = 14,
+    ProgramTerminated = 15,
+    InvalidProgramStatus = 16,
+    OutstandingReportsRemain = 17,
 }
 
 /// Governance-controlled bug bounty escrow.
@@ -85,7 +106,9 @@ impl RefractBountyEscrow {
         if env.storage().instance().has(&DataKey::Governance) {
             return Err(BountyError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Governance, &governance);
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Balance, &0i128);
 
@@ -104,10 +127,8 @@ impl RefractBountyEscrow {
     /// balance is at least equal to the escrowed balance.
     pub fn on_restore(env: Env) -> Result<i128, BountyError> {
         let (balance, _token) = Self::assert_live_and_consistent(&env)?;
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("restore")),
-            balance,
-        );
+        env.events()
+            .publish((symbol_short!("bounty"), symbol_short!("restore")), balance);
         Ok(balance)
     }
 
@@ -128,7 +149,9 @@ impl RefractBountyEscrow {
         let new_balance = balance
             .checked_add(amount)
             .ok_or(BountyError::InvalidAmount)?;
-        env.storage().instance().set(&DataKey::Balance, &new_balance);
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &new_balance);
 
         env.events().publish(
             (symbol_short!("bounty"), symbol_short!("fund")),
@@ -142,6 +165,7 @@ impl RefractBountyEscrow {
     /// Transfers tokens from the sponsor into the contract escrow and increments
     /// both the overall contract balance and the program-specific balance.
     /// Emits structured `ProgramToppedUp` event.
+    /// Fails if the program is winding down or terminated.
     pub fn top_up_program(
         env: Env,
         sponsor: Address,
@@ -152,8 +176,21 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
+
+        let status = Self::get_program_status(&env, program_id);
+        if status == ProgramStatus::WindingDown {
+            return Err(BountyError::ProgramWindingDown);
+        }
+        if status == ProgramStatus::Terminated {
+            return Err(BountyError::ProgramTerminated);
+        }
+
         let token = Self::get_token(&env)?;
-        token::Client::new(&env, &token).transfer(&sponsor, &env.current_contract_address(), &amount);
+        token::Client::new(&env, &token).transfer(
+            &sponsor,
+            &env.current_contract_address(),
+            &amount,
+        );
 
         let total_balance = Self::get_balance(&env)?;
         let new_total = total_balance
@@ -170,10 +207,7 @@ impl RefractBountyEscrow {
             .set(&DataKey::ProgramBalance(program_id), &new_prog_balance);
 
         env.events().publish(
-            (
-                Symbol::new(&env, "ProgramToppedUp"),
-                program_id,
-            ),
+            (Symbol::new(&env, "ProgramToppedUp"), program_id),
             (sponsor, amount, new_prog_balance),
         );
 
@@ -211,10 +245,7 @@ impl RefractBountyEscrow {
         let current_balance = Self::get_program_balance(&env, program_id);
         if current_balance < min_threshold {
             env.events().publish(
-                (
-                    Symbol::new(&env, "LowBalanceWarning"),
-                    program_id,
-                ),
+                (Symbol::new(&env, "LowBalanceWarning"), program_id),
                 (current_balance, min_threshold),
             );
         }
@@ -225,12 +256,16 @@ impl RefractBountyEscrow {
     /// Auto-refill a bounty program if its balance falls below `min_threshold`.
     /// Callable by keepers; draws `refill_amount` from `allowance_source` into escrow.
     /// Emits structured `ProgramAutoRefilled` event.
-    pub fn auto_refill(
-        env: Env,
-        keeper: Address,
-        program_id: u64,
-    ) -> Result<i128, BountyError> {
+    pub fn auto_refill(env: Env, keeper: Address, program_id: u64) -> Result<i128, BountyError> {
         keeper.require_auth();
+
+        let status = Self::get_program_status(&env, program_id);
+        if status == ProgramStatus::WindingDown {
+            return Err(BountyError::ProgramWindingDown);
+        }
+        if status == ProgramStatus::Terminated {
+            return Err(BountyError::ProgramTerminated);
+        }
 
         let rules = env
             .storage()
@@ -265,11 +300,13 @@ impl RefractBountyEscrow {
             .set(&DataKey::ProgramBalance(program_id), &new_prog_balance);
 
         env.events().publish(
+            (Symbol::new(&env, "ProgramAutoRefilled"), program_id),
             (
-                Symbol::new(&env, "ProgramAutoRefilled"),
-                program_id,
+                keeper,
+                rules.allowance_source,
+                rules.refill_amount,
+                new_prog_balance,
             ),
-            (keeper, rules.allowance_source, rules.refill_amount, new_prog_balance),
         );
 
         Ok(new_prog_balance)
@@ -286,10 +323,7 @@ impl RefractBountyEscrow {
             let current_balance = Self::get_program_balance(&env, program_id);
             if current_balance < rules.min_threshold {
                 env.events().publish(
-                    (
-                        Symbol::new(&env, "LowBalanceWarning"),
-                        program_id,
-                    ),
+                    (Symbol::new(&env, "LowBalanceWarning"), program_id),
                     (current_balance, rules.min_threshold),
                 );
                 return Ok(true);
@@ -317,7 +351,11 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Award(report_hash.clone()))
+        {
             return Err(BountyError::DuplicateReport);
         }
         let balance = Self::get_balance(&env)?;
@@ -326,8 +364,14 @@ impl RefractBountyEscrow {
         }
 
         let token = Self::get_token(&env)?;
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
-        env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &researcher,
+            &amount,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &(balance - amount));
 
         let record = AwardRecord {
             researcher: researcher.clone(),
@@ -335,7 +379,9 @@ impl RefractBountyEscrow {
             report_hash: report_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&DataKey::Award(report_hash.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Award(report_hash.clone()), &record);
 
         env.events().publish(
             (symbol_short!("bounty"), symbol_short!("award")),
@@ -365,8 +411,17 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Award(report_hash.clone()))
+        {
             return Err(BountyError::DuplicateReport);
+        }
+
+        let status = Self::get_program_status(&env, program_id);
+        if status == ProgramStatus::Terminated {
+            return Err(BountyError::ProgramTerminated);
         }
 
         let prog_balance = Self::get_program_balance(&env, program_id);
@@ -391,7 +446,11 @@ impl RefractBountyEscrow {
         }
 
         let token = Self::get_token(&env)?;
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &researcher,
+            &amount,
+        );
 
         let new_total = total_balance - amount;
         env.storage().instance().set(&DataKey::Balance, &new_total);
@@ -407,7 +466,9 @@ impl RefractBountyEscrow {
             report_hash: report_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&DataKey::Award(report_hash.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Award(report_hash.clone()), &record);
 
         env.events().publish(
             (symbol_short!("bounty"), symbol_short!("award")),
@@ -417,10 +478,7 @@ impl RefractBountyEscrow {
         if let Some(rules) = rules_opt {
             if new_prog_bal < rules.min_threshold {
                 env.events().publish(
-                    (
-                        Symbol::new(&env, "LowBalanceWarning"),
-                        program_id,
-                    ),
+                    (Symbol::new(&env, "LowBalanceWarning"), program_id),
                     (new_prog_bal, rules.min_threshold),
                 );
             }
@@ -477,6 +535,213 @@ impl RefractBountyEscrow {
     /// Immutable record of a rewarded disclosure, if any.
     pub fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
         env.storage().persistent().get(&DataKey::Award(report_hash))
+    }
+
+    /// Initiate wind-down for a bounty program.
+    /// Strictly governance-only.
+    /// Changes status from Active to WindingDown.
+    /// Emits `ProgramWindDownInitiated` event.
+    pub fn initiate_wind_down(
+        env: Env,
+        admin: Address,
+        program_id: u64,
+    ) -> Result<(), BountyError> {
+        admin.require_auth();
+        let governance = Self::get_governance(&env)?;
+        if admin != governance {
+            return Err(BountyError::Unauthorized);
+        }
+
+        let current_status = Self::get_program_status(&env, program_id);
+        if current_status != ProgramStatus::Active {
+            return Err(BountyError::InvalidProgramStatus);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::ProgramStatus(program_id),
+            &ProgramStatus::WindingDown,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "ProgramWindDownInitiated"), program_id),
+            (admin, ProgramStatus::WindingDown as u32),
+        );
+
+        Ok(())
+    }
+
+    /// Execute final settlement for a bounty program.
+    /// Strictly governance-only.
+    /// Transfers the entire remaining program balance to treasury, clears program balance,
+    /// marks status as Terminated, revokes program manager role, and verifies that no
+    /// outstanding reports remain.
+    /// Emits `ProgramFinalSettlement` event.
+    /// Returns the refunded amount transferred to treasury.
+    pub fn final_settlement(
+        env: Env,
+        admin: Address,
+        program_id: u64,
+        treasury: Address,
+    ) -> Result<i128, BountyError> {
+        admin.require_auth();
+        let governance = Self::get_governance(&env)?;
+        if admin != governance {
+            return Err(BountyError::Unauthorized);
+        }
+
+        let current_status = Self::get_program_status(&env, program_id);
+        if current_status != ProgramStatus::WindingDown {
+            return Err(BountyError::InvalidProgramStatus);
+        }
+
+        let outstanding = Self::get_outstanding_reports(&env, program_id);
+        if outstanding > 0 {
+            return Err(BountyError::OutstandingReportsRemain);
+        }
+
+        let prog_balance = Self::get_program_balance(&env, program_id);
+        if prog_balance > 0 {
+            let total_balance = Self::get_balance(&env)?;
+            if prog_balance > total_balance {
+                return Err(BountyError::InconsistentState);
+            }
+
+            let token = Self::get_token(&env)?;
+            token::Client::new(&env, &token).transfer(
+                &env.current_contract_address(),
+                &treasury,
+                &prog_balance,
+            );
+
+            let new_total = total_balance - prog_balance;
+            env.storage().instance().set(&DataKey::Balance, &new_total);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProgramBalance(program_id), &0i128);
+        }
+
+        // Set status to Terminated
+        env.storage().persistent().set(
+            &DataKey::ProgramStatus(program_id),
+            &ProgramStatus::Terminated,
+        );
+
+        // Revoke program manager role if configured
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ProgramManager(program_id));
+
+        // Publish final settlement accounting event on-chain
+        env.events().publish(
+            (Symbol::new(&env, "ProgramFinalSettlement"), program_id),
+            (admin, treasury, prog_balance),
+        );
+
+        Ok(prog_balance)
+    }
+
+    /// Submit a new report for a bounty program, tracking outstanding report count.
+    /// Fails if program is WindingDown or Terminated.
+    pub fn submit_report(env: Env, reporter: Address, program_id: u64) -> Result<u64, BountyError> {
+        reporter.require_auth();
+
+        let status = Self::get_program_status(&env, program_id);
+        if status == ProgramStatus::WindingDown {
+            return Err(BountyError::ProgramWindingDown);
+        }
+        if status == ProgramStatus::Terminated {
+            return Err(BountyError::ProgramTerminated);
+        }
+
+        let count = Self::get_outstanding_reports(&env, program_id);
+        let new_count = count.checked_add(1).ok_or(BountyError::InconsistentState)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutstandingReports(program_id), &new_count);
+
+        Ok(new_count)
+    }
+
+    /// Resolve an outstanding report for a bounty program (settled or expired/closed).
+    pub fn resolve_report(env: Env, caller: Address, program_id: u64) -> Result<u64, BountyError> {
+        caller.require_auth();
+        let governance = Self::get_governance(&env)?;
+        let manager_opt: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProgramManager(program_id));
+
+        let is_authorized = caller == governance || manager_opt.map_or(false, |m| caller == m);
+        if !is_authorized {
+            return Err(BountyError::Unauthorized);
+        }
+
+        let count = Self::get_outstanding_reports(&env, program_id);
+        if count == 0 {
+            return Ok(0);
+        }
+        let new_count = count - 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutstandingReports(program_id), &new_count);
+
+        Ok(new_count)
+    }
+
+    /// Configure a manager for a bounty program. Governance-only.
+    pub fn set_program_manager(
+        env: Env,
+        admin: Address,
+        program_id: u64,
+        manager: Address,
+    ) -> Result<(), BountyError> {
+        admin.require_auth();
+        let governance = Self::get_governance(&env)?;
+        if admin != governance {
+            return Err(BountyError::Unauthorized);
+        }
+
+        let status = Self::get_program_status(&env, program_id);
+        if status == ProgramStatus::Terminated {
+            return Err(BountyError::ProgramTerminated);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProgramManager(program_id), &manager);
+
+        Ok(())
+    }
+
+    /// Get configured manager for a bounty program.
+    pub fn get_program_manager(env: Env, program_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProgramManager(program_id))
+    }
+
+    /// Query current status of a bounty program (defaults to Active if unconfigured).
+    pub fn program_status(env: Env, program_id: u64) -> ProgramStatus {
+        Self::get_program_status(&env, program_id)
+    }
+
+    /// Query number of outstanding reports for a bounty program.
+    pub fn outstanding_reports(env: Env, program_id: u64) -> u64 {
+        Self::get_outstanding_reports(&env, program_id)
+    }
+
+    fn get_program_status(env: &Env, program_id: u64) -> ProgramStatus {
+        env.storage()
+            .persistent()
+            .get::<_, ProgramStatus>(&DataKey::ProgramStatus(program_id))
+            .unwrap_or(ProgramStatus::Active)
+    }
+
+    fn get_outstanding_reports(env: &Env, program_id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::OutstandingReports(program_id))
+            .unwrap_or(0u64)
     }
 
     fn get_program_balance(env: &Env, program_id: u64) -> i128 {
@@ -555,7 +820,9 @@ mod test {
 
         let governance = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         client.initialize(&governance, &token_id);
@@ -585,7 +852,9 @@ mod test {
 
         let governance = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         client.initialize(&governance, &token_id);
@@ -601,10 +870,18 @@ mod test {
 
         // Simulate inconsistency where contract recorded balance exceeds token reserves
         env.as_contract(&contract_id, || {
-            env.storage().instance().set(&DataKey::Balance, &200_000_000i128);
+            env.storage()
+                .instance()
+                .set(&DataKey::Balance, &200_000_000i128);
         });
-        assert_eq!(client.try_on_restore(), Err(Ok(BountyError::InconsistentState)));
-        assert_eq!(client.try_verify_integrity(), Err(Ok(BountyError::InconsistentState)));
+        assert_eq!(
+            client.try_on_restore(),
+            Err(Ok(BountyError::InconsistentState))
+        );
+        assert_eq!(
+            client.try_verify_integrity(),
+            Err(Ok(BountyError::InconsistentState))
+        );
     }
 
     #[test]
@@ -630,7 +907,9 @@ mod test {
 
         let governance = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         client.initialize(&governance, &token_id);
@@ -681,7 +960,9 @@ mod test {
 
         let governance = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
 
         client.initialize(&governance, &token_id);
 
@@ -690,12 +971,24 @@ mod test {
 
         // Stranger cannot configure refill rules
         assert_eq!(
-            client.try_configure_refill_rules(&stranger, &1, &100_000_000, &500_000_000, &treasury_source),
+            client.try_configure_refill_rules(
+                &stranger,
+                &1,
+                &100_000_000,
+                &500_000_000,
+                &treasury_source
+            ),
             Err(Ok(BountyError::Unauthorized))
         );
 
         // Governance configures rules when program balance is 0 (< 100_000_000) -> emits LowBalanceWarning
-        client.configure_refill_rules(&governance, &1, &100_000_000, &500_000_000, &treasury_source);
+        client.configure_refill_rules(
+            &governance,
+            &1,
+            &100_000_000,
+            &500_000_000,
+            &treasury_source,
+        );
 
         let rules = client.get_refill_rules(&1).expect("Rules should be saved");
         assert_eq!(rules.min_threshold, 100_000_000);
@@ -726,7 +1019,9 @@ mod test {
 
         let governance = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         client.initialize(&governance, &token_id);
@@ -784,7 +1079,9 @@ mod test {
 
         let governance = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         client.initialize(&governance, &token_id);
@@ -809,7 +1106,8 @@ mod test {
 
         // Next award must be BLOCKED because program balance is below threshold
         let report_hash2 = BytesN::from_array(&env, &[2u8; 32]);
-        let blocked = client.try_award_from_program(&governance, &1, &researcher, &10_000_000, &report_hash2);
+        let blocked =
+            client.try_award_from_program(&governance, &1, &researcher, &10_000_000, &report_hash2);
         assert_eq!(blocked, Err(Ok(BountyError::ProgramBelowThreshold)));
 
         // Keeper triggers auto_refill
@@ -825,5 +1123,123 @@ mod test {
         // Now award succeeds!
         client.award_from_program(&governance, &1, &researcher, &10_000_000, &report_hash2);
         assert_eq!(client.program_balance(&1), 380_000_000);
+    }
+
+    #[test]
+    fn test_program_wind_down_and_final_settlement_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+        let token_client = token::Client::new(&env, &token_id);
+
+        client.initialize(&governance, &token_id);
+
+        let sponsor = Address::generate(&env);
+        sac.mint(&sponsor, &1_000_000);
+        client.top_up_program(&sponsor, &42, &1_000_000);
+
+        let manager = Address::generate(&env);
+        client.set_program_manager(&governance, &42, &manager);
+        assert_eq!(client.get_program_manager(&42), Some(manager.clone()));
+        assert_eq!(client.program_status(&42), ProgramStatus::Active);
+
+        // Submit reports while active
+        let reporter = Address::generate(&env);
+        client.submit_report(&reporter, &42);
+        client.submit_report(&reporter, &42);
+        assert_eq!(client.outstanding_reports(&42), 2);
+
+        // 1. Non-governance cannot initiate wind-down
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_initiate_wind_down(&stranger, &42),
+            Err(Ok(BountyError::Unauthorized))
+        );
+
+        // 2. Governance initiates wind-down
+        client.initiate_wind_down(&governance, &42);
+        assert_eq!(client.program_status(&42), ProgramStatus::WindingDown);
+
+        // Event ProgramWindDownInitiated emitted
+        let events = env.events().all();
+        let winddown_found = events.iter().any(|(_, topics, _)| {
+            topics.iter().any(|t| {
+                Symbol::try_from_val(&env, &t)
+                    .map(|s| s == Symbol::new(&env, "ProgramWindDownInitiated"))
+                    .unwrap_or(false)
+            })
+        });
+        assert!(
+            winddown_found,
+            "ProgramWindDownInitiated event must be emitted"
+        );
+
+        // 3. New escrows and reports are blocked in WindingDown
+        assert_eq!(
+            client.try_top_up_program(&sponsor, &42, &500_000),
+            Err(Ok(BountyError::ProgramWindingDown))
+        );
+        assert_eq!(
+            client.try_submit_report(&reporter, &42),
+            Err(Ok(BountyError::ProgramWindingDown))
+        );
+
+        // 4. Final settlement fails while outstanding reports remain
+        let treasury = Address::generate(&env);
+        assert_eq!(
+            client.try_final_settlement(&governance, &42, &treasury),
+            Err(Ok(BountyError::OutstandingReportsRemain))
+        );
+
+        // 5. Manager and governance resolve outstanding reports
+        client.resolve_report(&manager, &42);
+        assert_eq!(client.outstanding_reports(&42), 1);
+        client.resolve_report(&governance, &42);
+        assert_eq!(client.outstanding_reports(&42), 0);
+
+        // 6. Final settlement succeeds: transfers program balance to treasury, clears balance, revokes manager
+        let refunded = client.final_settlement(&governance, &42, &treasury);
+        assert_eq!(refunded, 1_000_000);
+        assert_eq!(token_client.balance(&treasury), 1_000_000);
+        assert_eq!(client.program_balance(&42), 0);
+        assert_eq!(client.balance(), 0);
+        assert_eq!(client.program_status(&42), ProgramStatus::Terminated);
+        assert_eq!(client.get_program_manager(&42), None);
+
+        // Event ProgramFinalSettlement emitted
+        let events_after = env.events().all();
+        let settlement_found = events_after.iter().any(|(_, topics, _)| {
+            topics.iter().any(|t| {
+                Symbol::try_from_val(&env, &t)
+                    .map(|s| s == Symbol::new(&env, "ProgramFinalSettlement"))
+                    .unwrap_or(false)
+            })
+        });
+        assert!(
+            settlement_found,
+            "ProgramFinalSettlement event must be emitted"
+        );
+
+        // 7. Operations on Terminated program fail
+        assert_eq!(
+            client.try_top_up_program(&sponsor, &42, &100_000),
+            Err(Ok(BountyError::ProgramTerminated))
+        );
+        assert_eq!(
+            client.try_submit_report(&reporter, &42),
+            Err(Ok(BountyError::ProgramTerminated))
+        );
+        assert_eq!(
+            client.try_initiate_wind_down(&governance, &42),
+            Err(Ok(BountyError::InvalidProgramStatus))
+        );
     }
 }
