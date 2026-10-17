@@ -92,6 +92,10 @@ pub enum GrantsError {
     BudgetCategoryExceeded,
     /// Specified budget category was not found in the grant line items.
     CategoryNotFound,
+    /// Reward for reviewing this grant application was already accrued.
+    DuplicateReviewReward,
+    /// Reviewer compensation amount per review must be strictly positive.
+    InvalidCompensationAmount,
 }
 
 pub type GrantError = GrantsError;
@@ -102,6 +106,16 @@ pub struct LicensingAttestationRecord {
     pub spdx_license: String,
     pub deliverable_hash: [u8; 32],
     pub ip_attestation_signature: Option<Vec<u8>>,
+}
+
+/// Reviewer compensation record tracking accrued and claimed rewards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerCompensation {
+    pub reviewer: Address,
+    pub program_id: u64,
+    pub amount_per_review: i128,
+    pub total_earned: i128,
+    pub claimed: i128,
 }
 
 /// A line-item budget entry for granular expenditure tracking.
@@ -168,6 +182,12 @@ pub struct RefractGrants {
     licensings: BTreeMap<GrantId, LicensingAttestationRecord>,
     /// Stored line-item budgets keyed by grant id.
     budgets: BTreeMap<GrantId, Vec<BudgetItem>>,
+    /// Configured compensation amount per review keyed by program id.
+    program_review_rewards: BTreeMap<u64, i128>,
+    /// Stored reviewer compensation records keyed by reviewer address.
+    reviewer_compensations: BTreeMap<Address, ReviewerCompensation>,
+    /// Tracks which grants have already accrued reviewer reward: (grant_id) -> reviewer address.
+    reviewed_grants: BTreeMap<GrantId, Address>,
 }
 
 impl RefractGrants {
@@ -181,6 +201,9 @@ impl RefractGrants {
             programs: BTreeMap::new(),
             licensings: BTreeMap::new(),
             budgets: BTreeMap::new(),
+            program_review_rewards: BTreeMap::new(),
+            reviewer_compensations: BTreeMap::new(),
+            reviewed_grants: BTreeMap::new(),
         }
     }
 
@@ -862,6 +885,140 @@ impl RefractGrants {
             .map_err(|_| GrantsError::NormalizationError)
     }
 
+    /// Sets the review compensation reward per completed review for a program.
+    ///
+    /// Governance/timelock-gated.
+    pub fn configure_program_review_reward(
+        &mut self,
+        caller: Address,
+        program_id: u64,
+        amount_per_review: i128,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if !self.programs.contains_key(&program_id) {
+            return Err(GrantsError::ProgramNotFound);
+        }
+        if amount_per_review <= 0 {
+            return Err(GrantsError::InvalidCompensationAmount);
+        }
+        self.program_review_rewards.insert(program_id, amount_per_review);
+        Ok(())
+    }
+
+    /// Returns the configured reviewer compensation per review for a program.
+    pub fn get_program_review_reward(&self, program_id: u64) -> i128 {
+        self.program_review_rewards.get(&program_id).copied().unwrap_or(0)
+    }
+
+    /// Accrues reviewer reward upon confirmed review delivery of a grant application.
+    ///
+    /// Deducts the compensation amount from the program budget and credits the reviewer.
+    /// Fails with `DuplicateReviewReward` if reward for this grant has already been accrued.
+    pub fn accrue_review_reward(
+        &mut self,
+        governance: Address,
+        reviewer: Address,
+        grant_id: u64,
+    ) -> Result<i128, GrantsError> {
+        self.require_governance(governance)?;
+
+        let grant = self.grants.get(&grant_id).ok_or(GrantsError::GrantNotFound)?;
+        let program_id = grant.program_id.ok_or(GrantsError::ProgramNotFound)?;
+
+        if self.reviewed_grants.contains_key(&grant_id) {
+            return Err(GrantsError::DuplicateReviewReward);
+        }
+
+        let reward_amount = self.get_program_review_reward(program_id);
+        if reward_amount <= 0 {
+            return Err(GrantsError::InvalidCompensationAmount);
+        }
+
+        let program = self
+            .programs
+            .get_mut(&program_id)
+            .ok_or(GrantsError::ProgramNotFound)?;
+
+        if !program.is_active {
+            return Err(GrantsError::ProgramInactive);
+        }
+
+        let remaining_budget = program
+            .budget
+            .checked_sub(program.disbursed)
+            .ok_or(GrantsError::BudgetExceeded)?;
+        if reward_amount > remaining_budget {
+            return Err(GrantsError::BudgetExceeded);
+        }
+
+        program.disbursed = program
+            .disbursed
+            .checked_add(reward_amount)
+            .ok_or(GrantsError::BudgetExceeded)?;
+
+        // Update reviewer compensation record
+        let record = self
+            .reviewer_compensations
+            .entry(reviewer)
+            .or_insert_with(|| ReviewerCompensation {
+                reviewer,
+                program_id,
+                amount_per_review: reward_amount,
+                total_earned: 0,
+                claimed: 0,
+            });
+
+        record.amount_per_review = reward_amount;
+        record.program_id = program_id;
+        record.total_earned = record
+            .total_earned
+            .checked_add(reward_amount)
+            .ok_or(GrantsError::InconsistentState)?;
+
+        self.reviewed_grants.insert(grant_id, reviewer);
+        Ok(reward_amount)
+    }
+
+    /// Returns the reviewer compensation record for a reviewer.
+    pub fn get_reviewer_compensation(&self, reviewer: Address) -> Option<&ReviewerCompensation> {
+        self.reviewer_compensations.get(&reviewer)
+    }
+
+    /// Claims accrued-but-unclaimed review rewards for the reviewer.
+    pub fn claim_reviewer_rewards(&mut self, reviewer: Address) -> Result<i128, GrantsError> {
+        let record = self
+            .reviewer_compensations
+            .get_mut(&reviewer)
+            .ok_or(GrantsError::NothingToClaim)?;
+
+        let claimable = record
+            .total_earned
+            .checked_sub(record.claimed)
+            .ok_or(GrantsError::InconsistentState)?;
+
+        if claimable <= 0 {
+            return Err(GrantsError::NothingToClaim);
+        }
+
+        record.claimed = record
+            .claimed
+            .checked_add(claimable)
+            .ok_or(GrantsError::InconsistentState)?;
+
+        Ok(claimable)
+    }
+
+    /// Claims accrued review rewards converted to native token units based on `token_decimals`.
+    pub fn claim_reviewer_rewards_canonical(
+        &mut self,
+        reviewer: Address,
+        token_decimals: u32,
+    ) -> Result<i128, GrantsError> {
+        let protocol_amount = self.claim_reviewer_rewards(reviewer)?;
+        normalization::to_token_units(protocol_amount, token_decimals)
+            .map_err(|_| GrantsError::NormalizationError)
+    }
+
     /// Checks post-restore consistency across all grants and programs.
     /// Re-derives milestone sums, validates that grant_count and program_count match
     /// sequence counters, and confirms disbursements do not exceed committed budgets.
@@ -940,6 +1097,11 @@ impl RefractGrants {
                 return Err(GrantsError::InconsistentState);
             }
         }
+        for comp in self.reviewer_compensations.values() {
+            if comp.amount_per_review <= 0 || comp.total_earned < 0 || comp.claimed < 0 || comp.claimed > comp.total_earned {
+                return Err(GrantsError::InconsistentState);
+            }
+        }
         Ok(())
     }
 
@@ -969,6 +1131,9 @@ pub mod contract {
         GrantProgram(u64),
         Licensing(u64),
         Budget(u64),
+        ProgramReviewReward(u64),
+        ReviewerComp(Address),
+        ReviewedGrant(u64),
     }
 
     #[contracttype]
@@ -994,6 +1159,16 @@ pub mod contract {
         pub category: Symbol,
         pub allocated: i128,
         pub disbursed: i128,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ReviewerCompensation {
+        pub reviewer: Address,
+        pub program_id: u64,
+        pub amount_per_review: i128,
+        pub total_earned: i128,
+        pub claimed: i128,
     }
 
     #[contracttype]
@@ -1046,6 +1221,8 @@ pub mod contract {
         InconsistentState = 22,
         BudgetCategoryExceeded = 23,
         CategoryNotFound = 24,
+        DuplicateReviewReward = 25,
+        InvalidCompensationAmount = 26,
     }
 
     pub use self::GrantsContractError as GrantContractError;
@@ -1974,6 +2151,188 @@ pub mod contract {
                 .map_err(|_| GrantsContractError::NormalizationError)
         }
 
+        pub fn configure_program_review_reward(
+            env: Env,
+            caller: Address,
+            program_id: u64,
+            amount_per_review: i128,
+        ) -> Result<(), GrantsContractError> {
+            caller.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if caller != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if !env.storage().persistent().has(&GrantsDataKey::Program(program_id)) {
+                return Err(GrantsContractError::ProgramNotFound);
+            }
+            if amount_per_review <= 0 {
+                return Err(GrantsContractError::InvalidCompensationAmount);
+            }
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::ProgramReviewReward(program_id), &amount_per_review);
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("rev_cfg")),
+                (program_id, amount_per_review),
+            );
+            Ok(())
+        }
+
+        pub fn get_program_review_reward(env: Env, program_id: u64) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&GrantsDataKey::ProgramReviewReward(program_id))
+                .unwrap_or(0)
+        }
+
+        pub fn accrue_review_reward(
+            env: Env,
+            governance: Address,
+            reviewer: Address,
+            grant_id: u64,
+        ) -> Result<i128, GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if !env.storage().persistent().has(&GrantsDataKey::Grant(grant_id)) {
+                return Err(GrantsContractError::GrantNotFound);
+            }
+            let program_id: u64 = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::GrantProgram(grant_id))
+                .ok_or(GrantsContractError::ProgramNotFound)?;
+
+            if env.storage().persistent().has(&GrantsDataKey::ReviewedGrant(grant_id)) {
+                return Err(GrantsContractError::DuplicateReviewReward);
+            }
+
+            let reward_amount: i128 = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::ProgramReviewReward(program_id))
+                .unwrap_or(0);
+            if reward_amount <= 0 {
+                return Err(GrantsContractError::InvalidCompensationAmount);
+            }
+
+            let mut program: ProgramInfo = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Program(program_id))
+                .ok_or(GrantsContractError::ProgramNotFound)?;
+
+            if !program.is_active {
+                return Err(GrantsContractError::ProgramInactive);
+            }
+
+            let remaining_budget = program
+                .budget
+                .checked_sub(program.disbursed)
+                .ok_or(GrantsContractError::BudgetExceeded)?;
+            if reward_amount > remaining_budget {
+                return Err(GrantsContractError::BudgetExceeded);
+            }
+
+            program.disbursed = program
+                .disbursed
+                .checked_add(reward_amount)
+                .ok_or(GrantsContractError::BudgetExceeded)?;
+            env.storage().persistent().set(&GrantsDataKey::Program(program_id), &program);
+
+            let mut record: ReviewerCompensation = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::ReviewerComp(reviewer.clone()))
+                .unwrap_or(ReviewerCompensation {
+                    reviewer: reviewer.clone(),
+                    program_id,
+                    amount_per_review: reward_amount,
+                    total_earned: 0,
+                    claimed: 0,
+                });
+
+            record.amount_per_review = reward_amount;
+            record.program_id = program_id;
+            record.total_earned = record
+                .total_earned
+                .checked_add(reward_amount)
+                .ok_or(GrantsContractError::InconsistentState)?;
+
+            env.storage().persistent().set(&GrantsDataKey::ReviewerComp(reviewer.clone()), &record);
+            env.storage().persistent().set(&GrantsDataKey::ReviewedGrant(grant_id), &reviewer);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("rev_acc")),
+                (reviewer, program_id, grant_id, reward_amount),
+            );
+            Ok(reward_amount)
+        }
+
+        pub fn get_reviewer_compensation(
+            env: Env,
+            reviewer: Address,
+        ) -> Result<ReviewerCompensation, GrantsContractError> {
+            env.storage()
+                .persistent()
+                .get(&GrantsDataKey::ReviewerComp(reviewer))
+                .ok_or(GrantsContractError::NothingToClaim)
+        }
+
+        pub fn claim_reviewer_rewards(
+            env: Env,
+            reviewer: Address,
+        ) -> Result<i128, GrantsContractError> {
+            reviewer.require_auth();
+            let mut record: ReviewerCompensation = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::ReviewerComp(reviewer.clone()))
+                .ok_or(GrantsContractError::NothingToClaim)?;
+
+            let claimable = record
+                .total_earned
+                .checked_sub(record.claimed)
+                .ok_or(GrantsContractError::InconsistentState)?;
+
+            if claimable <= 0 {
+                return Err(GrantsContractError::NothingToClaim);
+            }
+
+            record.claimed = record
+                .claimed
+                .checked_add(claimable)
+                .ok_or(GrantsContractError::InconsistentState)?;
+
+            env.storage().persistent().set(&GrantsDataKey::ReviewerComp(reviewer.clone()), &record);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("rev_clm")),
+                (reviewer, claimable),
+            );
+            Ok(claimable)
+        }
+
+        pub fn claim_reviewer_rewards_canonical(
+            env: Env,
+            reviewer: Address,
+            token_decimals: u32,
+        ) -> Result<i128, GrantsContractError> {
+            let protocol_amount = Self::claim_reviewer_rewards(env, reviewer)?;
+            normalization::to_token_units(protocol_amount, token_decimals)
+                .map_err(|_| GrantsContractError::NormalizationError)
+        }
+
         /// Explicit post-restore consistency check and state integrity verification.
         /// Asserts that required instance storage entries are live (failing closed with
         /// `StateArchived` instead of reading zero/default values), verifies that
@@ -2080,6 +2439,7 @@ pub use contract::{
     BudgetItem as ContractBudgetItem, GrantContractError, GrantRecord, GrantsContractError,
     GrantsDataKey, LicensingAttestation, MilestoneRecord, ProgramInfo, ProgramRegistry,
     RefractGrantsContract, RefractGrantsContractClient,
+    ReviewerCompensation as ContractReviewerCompensation,
 };
 
 #[cfg(test)]
@@ -2440,6 +2800,93 @@ mod tests {
         assert_eq!(grants.claim(RECIPIENT, gid), Ok(1_000));
         assert!(grants.verify_integrity().is_ok());
     }
+
+    #[test]
+    fn test_reviewer_compensation_lifecycle() {
+        let mut grants = contract();
+        const REVIEWER: Address = 4;
+        const REVIEWER2: Address = 5;
+
+        let criteria_hash = [10u8; 32];
+        let pid = grants
+            .create_program(GOVERNANCE, 10_000, criteria_hash, 100, 500)
+            .unwrap();
+
+        // 1. Configure review reward
+        grants
+            .configure_program_review_reward(GOVERNANCE, pid, 150)
+            .unwrap();
+        assert_eq!(grants.get_program_review_reward(pid), 150);
+
+        // Unauthorized cannot configure
+        assert_eq!(
+            grants.configure_program_review_reward(STRANGER, pid, 150),
+            Err(GrantsError::Unauthorized)
+        );
+
+        // Invalid compensation amount
+        assert_eq!(
+            grants.configure_program_review_reward(GOVERNANCE, pid, 0),
+            Err(GrantsError::InvalidCompensationAmount)
+        );
+
+        // Create grants within program
+        let gid1 = grants
+            .apply_for_grant(GOVERNANCE, pid, RECIPIENT, 1_000, vec![1_000], 150)
+            .unwrap();
+        let gid2 = grants
+            .apply_for_grant(GOVERNANCE, pid, RECIPIENT, 1_000, vec![1_000], 160)
+            .unwrap();
+
+        // 2. Accrue review reward for grant 1
+        let accrued1 = grants
+            .accrue_review_reward(GOVERNANCE, REVIEWER, gid1)
+            .unwrap();
+        assert_eq!(accrued1, 150);
+
+        // Check compensation state
+        let comp1 = grants.get_reviewer_compensation(REVIEWER).unwrap();
+        assert_eq!(comp1.amount_per_review, 150);
+        assert_eq!(comp1.total_earned, 150);
+        assert_eq!(comp1.claimed, 0);
+
+        // Program disbursed increases by review reward
+        let prog = grants.get_program(pid).unwrap();
+        assert_eq!(prog.disbursed, 150);
+
+        // 3. Duplicate review reward on same grant must fail
+        assert_eq!(
+            grants.accrue_review_reward(GOVERNANCE, REVIEWER, gid1),
+            Err(GrantsError::DuplicateReviewReward)
+        );
+        assert_eq!(
+            grants.accrue_review_reward(GOVERNANCE, REVIEWER2, gid1),
+            Err(GrantsError::DuplicateReviewReward)
+        );
+
+        // 4. Accrue second grant review for the same reviewer
+        let accrued2 = grants
+            .accrue_review_reward(GOVERNANCE, REVIEWER, gid2)
+            .unwrap();
+        assert_eq!(accrued2, 150);
+
+        let comp2 = grants.get_reviewer_compensation(REVIEWER).unwrap();
+        assert_eq!(comp2.total_earned, 300);
+        assert_eq!(comp2.claimed, 0);
+
+        // 5. Claim review rewards
+        assert_eq!(grants.claim_reviewer_rewards(REVIEWER), Ok(300));
+        assert_eq!(
+            grants.claim_reviewer_rewards(REVIEWER),
+            Err(GrantsError::NothingToClaim)
+        );
+
+        let comp_after = grants.get_reviewer_compensation(REVIEWER).unwrap();
+        assert_eq!(comp_after.claimed, 300);
+
+        // Integrity verification succeeds
+        assert!(grants.verify_integrity().is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -2768,6 +3215,84 @@ mod soroban_grants_tests {
         assert!(client.verify_integrity());
         let (next_g, next_p) = client.on_restore();
         assert_eq!((next_g, next_p), (1, 0));
+    }
+
+    #[test]
+    fn test_soroban_reviewer_compensation() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RefractGrantsContract);
+        let client = RefractGrantsContractClient::new(&env, &contract_id);
+
+        let gov = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let reviewer2 = Address::generate(&env);
+
+        client.initialize(&gov);
+
+        let criteria = BytesN::from_array(&env, &[99u8; 32]);
+        let round_start = 1000u64;
+        let round_end = 2000u64;
+        let budget = 10_000i128;
+
+        let pid = client.create_program(&gov, &budget, &criteria, &round_start, &round_end);
+
+        // 1. Configure review reward
+        client.configure_program_review_reward(&gov, &pid, &250);
+        assert_eq!(client.get_program_review_reward(&pid), 250);
+
+        // Invalid review reward
+        let bad_amt_err = client.try_configure_program_review_reward(&gov, &pid, &0);
+        assert_eq!(bad_amt_err, Err(Ok(GrantsContractError::InvalidCompensationAmount)));
+
+        // Create grants
+        env.ledger().with_mut(|l| l.timestamp = 1500);
+        let milestones = Vec::from_array(&env, [500i128, 500i128]);
+        let gid0 = client.apply_for_grant(&gov, &pid, &recipient, &1000, &milestones);
+        let gid1 = client.apply_for_grant(&gov, &pid, &recipient, &1000, &milestones);
+
+        // 2. Accrue review reward
+        let reward0 = client.accrue_review_reward(&gov, &reviewer, &gid0);
+        assert_eq!(reward0, 250);
+
+        let comp = client.get_reviewer_compensation(&reviewer);
+        assert_eq!(comp.amount_per_review, 250);
+        assert_eq!(comp.total_earned, 250);
+        assert_eq!(comp.claimed, 0);
+
+        // Program disbursed increased
+        let prog = client.get_program(&pid);
+        assert_eq!(prog.disbursed, 250);
+
+        // 3. Duplicate review reward rejection
+        let dup_err = client.try_accrue_review_reward(&gov, &reviewer, &gid0);
+        assert_eq!(dup_err, Err(Ok(GrantsContractError::DuplicateReviewReward)));
+
+        let dup2_err = client.try_accrue_review_reward(&gov, &reviewer2, &gid0);
+        assert_eq!(dup2_err, Err(Ok(GrantsContractError::DuplicateReviewReward)));
+
+        // 4. Accrue second review for reviewer
+        let reward1 = client.accrue_review_reward(&gov, &reviewer, &gid1);
+        assert_eq!(reward1, 250);
+
+        let comp2 = client.get_reviewer_compensation(&reviewer);
+        assert_eq!(comp2.total_earned, 500);
+        assert_eq!(comp2.claimed, 0);
+
+        // 5. Claim review rewards
+        let claimed = client.claim_reviewer_rewards(&reviewer);
+        assert_eq!(claimed, 500);
+
+        let no_claim_err = client.try_claim_reviewer_rewards(&reviewer);
+        assert_eq!(no_claim_err, Err(Ok(GrantsContractError::NothingToClaim)));
+
+        let comp_final = client.get_reviewer_compensation(&reviewer);
+        assert_eq!(comp_final.claimed, 500);
+
+        // Verify integrity
+        assert!(client.verify_integrity());
     }
 }
 
