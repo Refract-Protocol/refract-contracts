@@ -18,3 +18,20 @@
 #
 # There are no accepted advisories at the moment.
 accepted = []
+
+# Machine-readable crate scope for security and dependency audits.
+[scope]
+contracts = [
+    "refract-pool",
+    "refract-policy",
+    "refract-oracle",
+    "refract-incident-response",
+    "refract-vetoken",
+    "refract-timelock",
+    "refract-multisig",
+    "refract-governance",
+    "refract-backstop",
+    "refract-bounty",
+    "refract-grants",
+    "refract-treasury",
+]

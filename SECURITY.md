@@ -34,9 +34,17 @@ ships.
 
 ## Scope
 
-In scope: the smart contracts, the backend services, and the web app in the
-Refract repositories. Out of scope: third-party dependencies (report upstream),
-testnet-only configuration, and theoretical issues without a practical impact.
+In scope: all Soroban smart contracts in this repository, the backend services,
+and the web app in the Refract repositories:
+
+- **Core Insurance Contracts**: [`pool/`](./pool) (`RefractPool`), [`policy/`](./policy) (`RefractPolicyRegistry`), and [`oracle/`](./oracle) (`RefractOracle`).
+- **Governance & Control Stack**: [`timelock/`](./timelock) (`RefractTimelock`), [`governance/`](./governance) (`RefractGovernance`), [`vetoken/`](./vetoken) (`RefractVeToken`), [`multisig/`](./multisig) (`RefractMultisig`), and [`incident_response/`](./incident_response) (`RefractIncidentResponse`).
+- **Governance-Adjacent Capital & Disbursement Contracts**: [`backstop/`](./backstop) (`RefractBackstop`), [`bounty/`](./bounty) (`RefractBountyEscrow`), [`grants/`](./grants) (`RefractGrants`), and [`treasury/`](./treasury) (`RefractTreasury`). See Section 6 of [`GRIEFING_ANALYSIS.md`](./GRIEFING_ANALYSIS.md) for the per-contract threat model and tracked mitigation gaps.
+
+**Deployed addresses policy.** Only contract instances whose deployed Wasm SHA-256 matches a release `manifest.json` artefact produced by CI (and whose administrative authority is wired to the canonical `RefractTimelock` / governance deployment) are covered as official deployments. Ad-hoc or unverified testnet deployments are out of scope for bounty payouts unless the vulnerability is reproducible against the canonical repository commit.
+
+Out of scope: third-party dependencies (report upstream), testnet-only
+configuration, and theoretical issues without a practical impact.
 
 ## Dependency advisories
 
