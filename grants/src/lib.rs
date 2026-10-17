@@ -136,6 +136,14 @@ pub enum GrantsError {
     DuplicateScore,
     /// Application does not meet the minimum review quorum for shortlisting.
     QuorumNotMet,
+    /// Invalid application bond amount.
+    InvalidBondAmount,
+    /// Application bond record not found.
+    BondNotFound,
+    /// Application bond is not in locked status.
+    BondNotLocked,
+    /// Caller is not the applicant authorized to receive the refund.
+    NotApplicant,
 }
 
 pub type GrantError = GrantsError;
@@ -1770,6 +1778,25 @@ pub mod contract {
     };
 
     #[contracttype]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+    #[repr(u32)]
+    pub enum BondStatus {
+        BondLocked = 0,
+        BondRefunded = 1,
+        BondForfeited = 2,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ApplicationBondRecord {
+        pub applicant: Address,
+        pub application_id: u64,
+        pub amount: i128,
+        pub status: BondStatus,
+        pub deposited_at: u64,
+    }
+
+    #[contracttype]
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum GrantsDataKey {
         Governance,
@@ -1793,6 +1820,8 @@ pub mod contract {
         TrimmingConfig(u64),
         ReviewQuorum(u64),
         ProgramApplicationList(u64),
+        ApplicationBondAmount,
+        ApplicationBond(u64),
     }
 
     #[contracttype]
@@ -1934,6 +1963,10 @@ pub mod contract {
         ScoreOutOfBounds = 40,
         DuplicateScore = 41,
         QuorumNotMet = 42,
+        InvalidBondAmount = 43,
+        BondNotFound = 44,
+        BondNotLocked = 45,
+        NotApplicant = 46,
     }
 
     pub use self::GrantsContractError as GrantContractError;
@@ -3920,6 +3953,279 @@ pub mod contract {
             Ok(list)
         }
 
+        /// Configure the required refundable application bond amount for grant applicants.
+        /// Strictly governance-only.
+        pub fn set_application_bond_amount(
+            env: Env,
+            governance: Address,
+            bond_amount: i128,
+        ) -> Result<(), GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if bond_amount < 0 {
+                return Err(GrantsContractError::InvalidBondAmount);
+            }
+
+            env.storage()
+                .instance()
+                .set(&GrantsDataKey::ApplicationBondAmount, &bond_amount);
+
+            env.events().publish(
+                (Symbol::new(&env, "BondAmountConfigured"),),
+                (governance, bond_amount),
+            );
+
+            Ok(())
+        }
+
+        /// Query the governance-set required application bond amount (defaults to 0 if unset).
+        pub fn get_application_bond_amount(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&GrantsDataKey::ApplicationBondAmount)
+                .unwrap_or(0i128)
+        }
+
+        /// Query an application bond record by application ID.
+        pub fn get_application_bond(
+            env: Env,
+            application_id: u64,
+        ) -> Result<ApplicationBondRecord, GrantsContractError> {
+            env.storage()
+                .persistent()
+                .get(&GrantsDataKey::ApplicationBond(application_id))
+                .ok_or(GrantsContractError::BondNotFound)
+        }
+
+        /// Submit a grant application accompanied by a refundable anti-spam application bond.
+        /// The applicant must authenticate and locks `application_bond_amount` with status `BondLocked`.
+        /// Emits `BondDeposited`.
+        pub fn submit_application_with_bond(
+            env: Env,
+            applicant: Address,
+            program_id: u64,
+            recipient: Address,
+            total_amount: i128,
+            milestones: Vec<i128>,
+        ) -> Result<u64, GrantsContractError> {
+            applicant.require_auth();
+
+            if total_amount <= 0 {
+                return Err(GrantsContractError::InvalidTotalAmount);
+            }
+            if milestones.is_empty() {
+                return Err(GrantsContractError::NoMilestones);
+            }
+
+            let mut program: ProgramInfo = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Program(program_id))
+                .ok_or(GrantsContractError::ProgramNotFound)?;
+
+            if !program.is_active {
+                return Err(GrantsContractError::ProgramInactive);
+            }
+
+            let now = env.ledger().timestamp();
+            if now < program.round_start || now > program.round_end {
+                return Err(GrantsContractError::RoundClosed);
+            }
+
+            let remaining_committed = program
+                .budget
+                .checked_sub(program.committed)
+                .ok_or(GrantsContractError::BudgetExceeded)?;
+            if total_amount > remaining_committed {
+                return Err(GrantsContractError::BudgetExceeded);
+            }
+
+            let mut sum: i128 = 0;
+            let mut stored_milestones = Vec::new(&env);
+            for i in 0..milestones.len() {
+                let amt = milestones.get(i).unwrap_or(0);
+                if amt <= 0 {
+                    return Err(GrantsContractError::InvalidMilestoneAmount);
+                }
+                sum = sum
+                    .checked_add(amt)
+                    .ok_or(GrantsContractError::MilestoneSumMismatch)?;
+                stored_milestones.push_back(MilestoneRecord {
+                    amount: amt,
+                    confirmed: false,
+                    claimed: false,
+                });
+            }
+            if sum != total_amount {
+                return Err(GrantsContractError::MilestoneSumMismatch);
+            }
+
+            program.committed = program
+                .committed
+                .checked_add(total_amount)
+                .ok_or(GrantsContractError::BudgetExceeded)?;
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Program(program_id), &program);
+
+            let next_id: u64 = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::NextGrantId)
+                .unwrap_or(0);
+            let grant_id = next_id;
+            env.storage()
+                .instance()
+                .set(&GrantsDataKey::NextGrantId, &(next_id + 1));
+
+            let record = GrantRecord {
+                recipient: recipient.clone(),
+                total_amount,
+                milestones: stored_milestones,
+                claimable: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(grant_id), &record);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::GrantProgram(grant_id), &program_id);
+
+            // Record application in program application list
+            let mut app_list: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::ProgramApplicationList(program_id))
+                .unwrap_or(Vec::new(&env));
+            app_list.push_back(grant_id);
+            env.storage().persistent().set(
+                &GrantsDataKey::ProgramApplicationList(program_id),
+                &app_list,
+            );
+
+            // Bond handling
+            let bond_amount = Self::get_application_bond_amount(env.clone());
+            let bond_record = ApplicationBondRecord {
+                applicant: applicant.clone(),
+                application_id: grant_id,
+                amount: bond_amount,
+                status: BondStatus::BondLocked,
+                deposited_at: now,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::ApplicationBond(grant_id), &bond_record);
+
+            env.events().publish(
+                (Symbol::new(&env, "BondDeposited"), grant_id),
+                (applicant, bond_amount),
+            );
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("apply")),
+                (grant_id, program_id, total_amount),
+            );
+
+            Ok(grant_id)
+        }
+
+        /// Refund application bond after good-faith review.
+        /// Callable by the original applicant or governance once review is completed.
+        /// Fails if bond is not locked.
+        /// Emits `BondRefunded`.
+        pub fn refund_bond(
+            env: Env,
+            caller: Address,
+            application_id: u64,
+        ) -> Result<i128, GrantsContractError> {
+            caller.require_auth();
+
+            let mut bond: ApplicationBondRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::ApplicationBond(application_id))
+                .ok_or(GrantsContractError::BondNotFound)?;
+
+            if bond.status != BondStatus::BondLocked {
+                return Err(GrantsContractError::BondNotLocked);
+            }
+
+            let gov_opt: Option<Address> = env.storage().instance().get(&GrantsDataKey::Governance);
+
+            let is_applicant = caller == bond.applicant;
+            let is_gov = gov_opt.map_or(false, |g| caller == g);
+
+            if !is_applicant && !is_gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+
+            bond.status = BondStatus::BondRefunded;
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::ApplicationBond(application_id), &bond);
+
+            let refund_amount = bond.amount;
+            env.events().publish(
+                (Symbol::new(&env, "BondRefunded"), application_id),
+                (bond.applicant, refund_amount),
+            );
+
+            Ok(refund_amount)
+        }
+
+        /// Forfeit application bond upon spam, duplication, abandonment, or frivolous submission.
+        /// Strictly governance-only.
+        /// Forfeited bond is redirected to treasury.
+        /// Fails if bond is not locked.
+        /// Emits `BondForfeited`.
+        pub fn forfeit_bond(
+            env: Env,
+            governance: Address,
+            application_id: u64,
+            treasury: Address,
+        ) -> Result<i128, GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+
+            let mut bond: ApplicationBondRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::ApplicationBond(application_id))
+                .ok_or(GrantsContractError::BondNotFound)?;
+
+            if bond.status != BondStatus::BondLocked {
+                return Err(GrantsContractError::BondNotLocked);
+            }
+
+            bond.status = BondStatus::BondForfeited;
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::ApplicationBond(application_id), &bond);
+
+            let forfeit_amount = bond.amount;
+            env.events().publish(
+                (Symbol::new(&env, "BondForfeited"), application_id),
+                (governance, treasury, forfeit_amount),
+            );
+
+            Ok(forfeit_amount)
+        }
+
         /// Explicit post-restore consistency check and state integrity verification.
         /// Asserts that required instance storage entries are live (failing closed with
         /// `StateArchived` instead of reading zero/default values), verifies that
@@ -4055,9 +4361,9 @@ pub mod contract {
 }
 
 pub use contract::{
-    BudgetItem as ContractBudgetItem, GrantContractError, GrantRecord, GrantsContractError,
-    GrantsDataKey, LicensingAttestation, MilestoneRecord, ProgramInfo, ProgramRegistry,
-    RefractGrantsContract, RefractGrantsContractClient,
+    ApplicationBondRecord, BondStatus, BudgetItem as ContractBudgetItem, GrantContractError,
+    GrantRecord, GrantsContractError, GrantsDataKey, LicensingAttestation, MilestoneRecord,
+    ProgramInfo, ProgramRegistry, RefractGrantsContract, RefractGrantsContractClient,
     ReviewEvaluation as ContractReviewEvaluation,
     ReviewerCompensation as ContractReviewerCompensation, ReviewerStake as ContractReviewerStake,
     Rubric as ContractRubric, TrimmingConfig as ContractTrimmingConfig,
@@ -5573,5 +5879,109 @@ mod soroban_grants_tests {
         assert_eq!(list_trimmed.get(1).unwrap(), (app1, 86));
 
         assert!(client.verify_integrity());
+    }
+
+    #[test]
+    fn test_application_bond_lifecycle_and_invariants() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractGrantsContract);
+        let client = RefractGrantsContractClient::new(&env, &contract_id);
+
+        let gov = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let applicant = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.initialize(&gov);
+
+        // 1. Configure bond amount
+        // Non-governance cannot set bond amount
+        assert_eq!(
+            client.try_set_application_bond_amount(&stranger, &50_000),
+            Err(Ok(GrantsContractError::Unauthorized))
+        );
+        // Negative bond amount rejected
+        assert_eq!(
+            client.try_set_application_bond_amount(&gov, &-10),
+            Err(Ok(GrantsContractError::InvalidBondAmount))
+        );
+        // Governance sets bond amount to 50_000
+        client.set_application_bond_amount(&gov, &50_000);
+        assert_eq!(client.get_application_bond_amount(), 50_000);
+
+        // 2. Setup program
+        let pid = client.create_program(
+            &gov,
+            &1_000_000,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &0,
+            &100_000,
+        );
+
+        // 3. Submit application with bond
+        let milestones = Vec::from_array(&env, [1000i128]);
+        let app_id =
+            client.submit_application_with_bond(&applicant, &pid, &recipient, &1000, &milestones);
+
+        let bond_rec = client.get_application_bond(&app_id);
+        assert_eq!(bond_rec.applicant, applicant);
+        assert_eq!(bond_rec.application_id, app_id);
+        assert_eq!(bond_rec.amount, 50_000);
+        assert_eq!(bond_rec.status, BondStatus::BondLocked);
+
+        // 4. Refund bond
+        // Stranger cannot refund
+        assert_eq!(
+            client.try_refund_bond(&stranger, &app_id),
+            Err(Ok(GrantsContractError::Unauthorized))
+        );
+
+        // Applicant triggers refund
+        let refunded = client.refund_bond(&applicant, &app_id);
+        assert_eq!(refunded, 50_000);
+
+        let bond_after_refund = client.get_application_bond(&app_id);
+        assert_eq!(bond_after_refund.status, BondStatus::BondRefunded);
+
+        // Subsequent refund fails (BondNotLocked)
+        assert_eq!(
+            client.try_refund_bond(&applicant, &app_id),
+            Err(Ok(GrantsContractError::BondNotLocked))
+        );
+
+        // Subsequent forfeit fails (BondNotLocked)
+        assert_eq!(
+            client.try_forfeit_bond(&gov, &app_id, &treasury),
+            Err(Ok(GrantsContractError::BondNotLocked))
+        );
+
+        // 5. Test Forfeiture flow on a second application
+        let app2 =
+            client.submit_application_with_bond(&applicant, &pid, &recipient, &1000, &milestones);
+
+        // Stranger cannot forfeit
+        assert_eq!(
+            client.try_forfeit_bond(&stranger, &app2, &treasury),
+            Err(Ok(GrantsContractError::Unauthorized))
+        );
+
+        // Governance forfeits bond to treasury
+        let forfeited = client.forfeit_bond(&gov, &app2, &treasury);
+        assert_eq!(forfeited, 50_000);
+
+        let bond2_after = client.get_application_bond(&app2);
+        assert_eq!(bond2_after.status, BondStatus::BondForfeited);
+
+        // Subsequent refund or forfeit fails
+        assert_eq!(
+            client.try_refund_bond(&applicant, &app2),
+            Err(Ok(GrantsContractError::BondNotLocked))
+        );
+        assert_eq!(
+            client.try_forfeit_bond(&gov, &app2, &treasury),
+            Err(Ok(GrantsContractError::BondNotLocked))
+        );
     }
 }
