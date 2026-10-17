@@ -1,415 +1,617 @@
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based ecosystem grant disbursement contract with deliverable
+//! SPDX licensing declarations, content-addressed deliverable hashes, and
+//! IP-assignment attestations.
 
-use std::collections::BTreeMap;
+#![no_std]
+#![allow(
+    clippy::disallowed_methods,
+    clippy::inconsistent_digit_grouping,
+    clippy::too_many_arguments
+)]
 
-/// Identifier for a grant.
-pub type GrantId = u64;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Symbol, Vec,
+};
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
-pub type Address = u64;
-
-/// Errors returned by [`RefractGrants`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum GrantsError {
-    /// Caller is not the configured governance/timelock authority.
-    Unauthorized,
-    /// No grant exists for the supplied id.
-    GrantNotFound,
-    /// A grant must declare at least one milestone.
-    NoMilestones,
-    /// Milestone amounts do not sum to the declared total amount.
-    MilestoneSumMismatch,
-    /// A milestone amount was zero or negative.
-    InvalidMilestoneAmount,
-    /// The total amount was zero or negative.
-    InvalidTotalAmount,
-    /// The milestone index is out of range for the grant.
-    InvalidMilestoneIndex,
-    /// The milestone has already been confirmed.
-    MilestoneAlreadyConfirmed,
-    /// Milestones must be confirmed in order; an earlier one is still pending.
-    MilestoneOutOfOrder,
-    /// The caller is not the grant recipient.
-    NotRecipient,
-    /// There is no confirmed-but-unclaimed amount to release.
-    NothingToClaim,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    InvalidConfig = 3,
+    InvalidGrant = 4,
+    GrantNotFound = 5,
+    MilestoneNotFound = 6,
+    MilestoneAlreadyReleased = 7,
+    GrantNotActive = 8,
+    DuplicateApproval = 9,
+    MalformedLicenseIdentifier = 10,
+    UnacceptableLicense = 11,
+    MissingRequiredLicense = 12,
+    DeliverableImmutable = 13,
 }
 
-/// A single milestone within a grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Config,
+    NextGrantId,
+    Grant(u64),
+    ProgramLicensePolicy(u64),
+    Deliverable(u64, u32),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub governance: Address,
+    pub reviewers: Vec<Address>,
+    pub approval_threshold: u32,
+    pub token: Address,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum GrantStatus {
+    Active = 0,
+    Completed = 1,
+    Cancelled = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Milestone {
-    /// Amount released when this milestone is confirmed.
+    pub description: Symbol,
     pub amount: i128,
-    /// Whether governance has confirmed delivery of this milestone.
-    pub confirmed: bool,
-    /// Whether the confirmed amount has already been claimed.
-    pub claimed: bool,
+    pub approvals: Vec<Address>,
+    pub released: bool,
 }
 
-/// A grant approved by governance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Grant {
-    /// Account that receives released funds.
+    pub id: u64,
+    pub program_id: u64,
     pub recipient: Address,
-    /// Total amount approved across all milestones.
     pub total_amount: i128,
-    /// Ordered milestones; index 0 is confirmed first.
+    pub released_amount: i128,
     pub milestones: Vec<Milestone>,
-    /// Sum of confirmed-but-unclaimed milestone amounts.
-    pub claimable: i128,
+    pub status: GrantStatus,
 }
 
-/// Milestone-based community grants disbursement contract.
-#[derive(Debug, Clone)]
-pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
-    governance: Address,
-    /// Monotonic counter used to allocate grant ids.
-    next_grant_id: GrantId,
-    /// Stored grants keyed by id.
-    grants: BTreeMap<GrantId, Grant>,
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramLicensePolicy {
+    pub program_id: u64,
+    pub license_required: bool,
+    pub require_ip_attestation: bool,
+    pub acceptable_licenses: Vec<Symbol>,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliverableDeclaration {
+    pub grant_id: u64,
+    pub milestone_idx: u32,
+    pub spdx_license: Symbol,
+    pub deliverable_hash: BytesN<32>,
+    pub has_ip_attestation: bool,
+    pub ip_attestation: BytesN<32>,
+    pub accepted: bool,
+    pub updated_at: u64,
+}
+
+const KNOWN_SPDX: &[&str] = &[
+    "MIT", "Apache2", "GPL3", "BSD3", "BSD2", "ISC", "MPL2", "LGPL3", "CC0", "Unlicens",
+];
+
+#[contract]
+pub struct RefractGrants;
+
+#[contractimpl]
 impl RefractGrants {
-    /// Creates a new grants contract governed by `governance` (the timelock).
-    pub fn new(governance: Address) -> Self {
-        Self {
+    pub fn initialize(
+        env: Env,
+        governance: Address,
+        reviewers: Vec<Address>,
+        approval_threshold: u32,
+        token: Address,
+    ) -> Result<(), GrantsError> {
+        if env.storage().instance().has(&DataKey::Config) {
+            return Err(GrantsError::AlreadyInitialized);
+        }
+        governance.require_auth();
+        if reviewers.is_empty() || approval_threshold == 0 || approval_threshold > reviewers.len() {
+            return Err(GrantsError::InvalidConfig);
+        }
+        let cfg = Config {
             governance,
-            next_grant_id: 0,
-            grants: BTreeMap::new(),
-        }
+            reviewers,
+            approval_threshold,
+            token,
+        };
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        env.storage().instance().set(&DataKey::NextGrantId, &0u64);
+        Ok(())
     }
 
-    /// Returns the configured governance/timelock authority.
-    pub fn governance(&self) -> Address {
-        self.governance
-    }
+    /// Configures per-program licensing policy.
+    pub fn set_program_license_policy(
+        env: Env,
+        program_id: u64,
+        license_required: bool,
+        require_ip_attestation: bool,
+        acceptable_licenses: Vec<Symbol>,
+    ) -> Result<ProgramLicensePolicy, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
 
-    /// Returns the grant for `grant_id`, if any.
-    pub fn get_grant(&self, grant_id: GrantId) -> Option<&Grant> {
-        self.grants.get(&grant_id)
-    }
-
-    /// Returns the confirmed-but-unclaimed amount for `grant_id`.
-    pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
-        self.grants.get(&grant_id).map(|grant| grant.claimable)
-    }
-
-    /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
-    pub fn create_grant(
-        &mut self,
-        caller: Address,
-        recipient: Address,
-        total_amount: i128,
-        milestones: Vec<i128>,
-    ) -> Result<GrantId, GrantsError> {
-        self.require_governance(caller)?;
-
-        if total_amount <= 0 {
-            return Err(GrantsError::InvalidTotalAmount);
-        }
-        if milestones.is_empty() {
-            return Err(GrantsError::NoMilestones);
-        }
-
-        let mut sum: i128 = 0;
-        for amount in &milestones {
-            if *amount <= 0 {
-                return Err(GrantsError::InvalidMilestoneAmount);
+        for lic in acceptable_licenses.iter() {
+            if !Self::is_valid_spdx(&env, &lic) {
+                return Err(GrantsError::MalformedLicenseIdentifier);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
         }
-        if sum != total_amount {
-            return Err(GrantsError::MilestoneSumMismatch);
+        if license_required && acceptable_licenses.is_empty() {
+            return Err(GrantsError::InvalidConfig);
         }
 
-        let grant_id = self.next_grant_id;
-        self.next_grant_id += 1;
+        let policy = ProgramLicensePolicy {
+            program_id,
+            license_required,
+            require_ip_attestation,
+            acceptable_licenses,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProgramLicensePolicy(program_id), &policy);
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("lic_pol")),
+            (program_id, license_required, require_ip_attestation),
+        );
+        Ok(policy)
+    }
 
-        let stored = milestones
-            .into_iter()
-            .map(|amount| Milestone {
+    pub fn create_grant(
+        env: Env,
+        recipient: Address,
+        milestones: Vec<(Symbol, i128)>,
+    ) -> Result<u64, GrantsError> {
+        Self::create_program_grant(env, 0, recipient, milestones)
+    }
+
+    pub fn create_program_grant(
+        env: Env,
+        program_id: u64,
+        recipient: Address,
+        milestones: Vec<(Symbol, i128)>,
+    ) -> Result<u64, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
+        if milestones.is_empty() {
+            return Err(GrantsError::InvalidGrant);
+        }
+
+        let mut total: i128 = 0;
+        let mut built: Vec<Milestone> = Vec::new(&env);
+        for (desc, amount) in milestones.iter() {
+            if amount <= 0 {
+                return Err(GrantsError::InvalidGrant);
+            }
+            total = total.checked_add(amount).ok_or(GrantsError::InvalidGrant)?;
+            built.push_back(Milestone {
+                description: desc,
                 amount,
-                confirmed: false,
-                claimed: false,
-            })
-            .collect();
+                approvals: Vec::new(&env),
+                released: false,
+            });
+        }
 
-        self.grants.insert(
-            grant_id,
-            Grant {
-                recipient,
-                total_amount,
-                milestones: stored,
-                claimable: 0,
-            },
+        token::Client::new(&env, &cfg.token).transfer(
+            &cfg.governance,
+            &env.current_contract_address(),
+            &total,
         );
 
-        Ok(grant_id)
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextGrantId)
+            .unwrap_or(0);
+        let grant = Grant {
+            id,
+            program_id,
+            recipient: recipient.clone(),
+            total_amount: total,
+            released_amount: 0,
+            milestones: built,
+            status: GrantStatus::Active,
+        };
+        env.storage().persistent().set(&DataKey::Grant(id), &grant);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextGrantId, &(id + 1));
+
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("create")),
+            (id, recipient, total),
+        );
+        Ok(id)
     }
 
-    /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
-    pub fn confirm_milestone(
-        &mut self,
-        caller: Address,
-        grant_id: GrantId,
-        milestone_index: usize,
+    /// Submits or amends deliverable evidence and SPDX licensing declaration for a milestone.
+    /// Immutable once the milestone has been released.
+    pub fn submit_deliverable(
+        env: Env,
+        grant_id: u64,
+        milestone_idx: u32,
+        spdx_license: Symbol,
+        deliverable_hash: BytesN<32>,
+        ip_attestation: Option<BytesN<32>>,
+    ) -> Result<DeliverableDeclaration, GrantsError> {
+        let _cfg = Self::read_config(&env)?;
+        let grant: Grant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Grant(grant_id))
+            .ok_or(GrantsError::GrantNotFound)?;
+        if grant.status != GrantStatus::Active {
+            return Err(GrantsError::GrantNotActive);
+        }
+        grant.recipient.require_auth();
+
+        let ms = grant
+            .milestones
+            .get(milestone_idx)
+            .ok_or(GrantsError::MilestoneNotFound)?;
+        if ms.released {
+            return Err(GrantsError::DeliverableImmutable);
+        }
+
+        if !Self::is_valid_spdx(&env, &spdx_license) {
+            return Err(GrantsError::MalformedLicenseIdentifier);
+        }
+        if deliverable_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(GrantsError::InvalidGrant);
+        }
+
+        let accepted =
+            Self::check_policy_acceptance(&env, grant.program_id, &spdx_license, &ip_attestation);
+
+        let (has_ip_attestation, ip_attestation_bytes) = match ip_attestation {
+            Some(att) => (true, att),
+            None => (false, BytesN::from_array(&env, &[0u8; 32])),
+        };
+
+        let decl = DeliverableDeclaration {
+            grant_id,
+            milestone_idx,
+            spdx_license: spdx_license.clone(),
+            deliverable_hash,
+            has_ip_attestation,
+            ip_attestation: ip_attestation_bytes,
+            accepted,
+            updated_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Deliverable(grant_id, milestone_idx), &decl);
+
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("deliv")),
+            (grant_id, milestone_idx, spdx_license, accepted),
+        );
+        Ok(decl)
+    }
+
+    pub fn approve_milestone(
+        env: Env,
+        reviewer: Address,
+        grant_id: u64,
+        milestone_idx: u32,
+    ) -> Result<bool, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        if !cfg.reviewers.contains(&reviewer) {
+            return Err(GrantsError::InvalidConfig);
+        }
+        reviewer.require_auth();
+
+        let mut grant: Grant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Grant(grant_id))
+            .ok_or(GrantsError::GrantNotFound)?;
+        if grant.status != GrantStatus::Active {
+            return Err(GrantsError::GrantNotActive);
+        }
+        let mut ms = grant
+            .milestones
+            .get(milestone_idx)
+            .ok_or(GrantsError::MilestoneNotFound)?;
+        if ms.released {
+            return Err(GrantsError::MilestoneAlreadyReleased);
+        }
+        if ms.approvals.contains(&reviewer) {
+            return Err(GrantsError::DuplicateApproval);
+        }
+
+        ms.approvals.push_back(reviewer);
+        let reached = ms.approvals.len() >= cfg.approval_threshold;
+
+        // Check whether releasing this milestone would complete the final unreleased milestone.
+        let mut remaining_unreleased = 0u32;
+        for (idx, m) in grant.milestones.iter().enumerate() {
+            if idx as u32 != milestone_idx && !m.released {
+                remaining_unreleased += 1;
+            }
+        }
+        let is_final_release = remaining_unreleased == 0;
+
+        if reached && is_final_release {
+            Self::enforce_final_milestone_license(&env, &grant, milestone_idx)?;
+        }
+
+        let mut released_now = false;
+        if reached {
+            ms.released = true;
+            grant.released_amount += ms.amount;
+            token::Client::new(&env, &cfg.token).transfer(
+                &env.current_contract_address(),
+                &grant.recipient,
+                &ms.amount,
+            );
+            released_now = true;
+            env.events().publish(
+                (symbol_short!("grants"), symbol_short!("release")),
+                (grant_id, milestone_idx, ms.amount),
+            );
+        }
+        grant.milestones.set(milestone_idx, ms);
+
+        let all_done = grant.milestones.iter().all(|m| m.released);
+        if all_done {
+            grant.status = GrantStatus::Completed;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Grant(grant_id), &grant);
+        Ok(released_now)
+    }
+
+    pub fn cancel_grant(env: Env, grant_id: u64) -> Result<i128, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
+        let mut grant: Grant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Grant(grant_id))
+            .ok_or(GrantsError::GrantNotFound)?;
+        if grant.status != GrantStatus::Active {
+            return Err(GrantsError::GrantNotActive);
+        }
+        let refund = grant.total_amount - grant.released_amount;
+        grant.status = GrantStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Grant(grant_id), &grant);
+        if refund > 0 {
+            token::Client::new(&env, &cfg.token).transfer(
+                &env.current_contract_address(),
+                &cfg.governance,
+                &refund,
+            );
+        }
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("cancel")),
+            (grant_id, refund),
+        );
+        Ok(refund)
+    }
+
+    pub fn get_grant(env: Env, grant_id: u64) -> Option<Grant> {
+        env.storage().persistent().get(&DataKey::Grant(grant_id))
+    }
+
+    pub fn program_license_policy(env: Env, program_id: u64) -> Option<ProgramLicensePolicy> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProgramLicensePolicy(program_id))
+    }
+
+    pub fn milestone_deliverable(
+        env: Env,
+        grant_id: u64,
+        milestone_idx: u32,
+    ) -> Option<DeliverableDeclaration> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Deliverable(grant_id, milestone_idx))
+    }
+
+    pub fn grant_deliverables(env: Env, grant_id: u64) -> Vec<DeliverableDeclaration> {
+        let mut out = Vec::new(&env);
+        if let Some(grant) = Self::get_grant(env.clone(), grant_id) {
+            for idx in 0..grant.milestones.len() {
+                if let Some(decl) = Self::milestone_deliverable(env.clone(), grant_id, idx) {
+                    out.push_back(decl);
+                }
+            }
+        }
+        out
+    }
+
+    fn is_valid_spdx(env: &Env, spdx: &Symbol) -> bool {
+        for &known in KNOWN_SPDX {
+            if *spdx == Symbol::new(env, known) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn check_policy_acceptance(
+        env: &Env,
+        program_id: u64,
+        spdx: &Symbol,
+        ip_attestation: &Option<BytesN<32>>,
+    ) -> bool {
+        if let Some(policy) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ProgramLicensePolicy>(&DataKey::ProgramLicensePolicy(program_id))
+        {
+            if policy.require_ip_attestation && ip_attestation.is_none() {
+                return false;
+            }
+            if !policy.acceptable_licenses.is_empty() && !policy.acceptable_licenses.contains(spdx)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn enforce_final_milestone_license(
+        env: &Env,
+        grant: &Grant,
+        milestone_idx: u32,
     ) -> Result<(), GrantsError> {
-        self.require_governance(caller)?;
+        let Some(policy) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ProgramLicensePolicy>(&DataKey::ProgramLicensePolicy(grant.program_id))
+        else {
+            return Ok(());
+        };
 
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
-
-        if milestone_index >= grant.milestones.len() {
-            return Err(GrantsError::InvalidMilestoneIndex);
+        if !policy.license_required {
+            return Ok(());
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
-        for earlier in &grant.milestones[..milestone_index] {
-            if !earlier.confirmed {
-                return Err(GrantsError::MilestoneOutOfOrder);
-            }
+        let decl: DeliverableDeclaration = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Deliverable(grant.id, milestone_idx))
+            .ok_or(GrantsError::MissingRequiredLicense)?;
+
+        if !policy.acceptable_licenses.contains(&decl.spdx_license) {
+            env.events().publish(
+                (symbol_short!("grants"), symbol_short!("lic_rej")),
+                (grant.id, milestone_idx, decl.spdx_license),
+            );
+            return Err(GrantsError::UnacceptableLicense);
+        }
+        if policy.require_ip_attestation && !decl.has_ip_attestation {
+            return Err(GrantsError::UnacceptableLicense);
         }
 
-        let milestone = &mut grant.milestones[milestone_index];
-        if milestone.confirmed {
-            return Err(GrantsError::MilestoneAlreadyConfirmed);
-        }
-
-        milestone.confirmed = true;
-        grant.claimable = grant
-            .claimable
-            .checked_add(milestone.amount)
-            .ok_or(GrantsError::MilestoneSumMismatch)?;
-
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("lic_acc")),
+            (grant.id, milestone_idx, decl.spdx_license),
+        );
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
-    pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
-
-        if grant.recipient != recipient {
-            return Err(GrantsError::NotRecipient);
-        }
-
-        let amount = grant.claimable;
-        if amount <= 0 {
-            return Err(GrantsError::NothingToClaim);
-        }
-
-        grant.claimable = 0;
-        for milestone in grant.milestones.iter_mut() {
-            if milestone.confirmed {
-                milestone.claimed = true;
-            }
-        }
-
-        Ok(amount)
-    }
-
-    fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
-        if caller != self.governance {
-            return Err(GrantsError::Unauthorized);
-        }
-        Ok(())
+    fn read_config(env: &Env) -> Result<Config, GrantsError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GrantsError::NotInitialized)
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
-
-    const GOVERNANCE: Address = 1;
-    const RECIPIENT: Address = 2;
-    const STRANGER: Address = 3;
-
-    fn contract() -> RefractGrants {
-        RefractGrants::new(GOVERNANCE)
-    }
+    use soroban_sdk::{testutils::Address as _, vec};
 
     #[test]
-    fn full_lifecycle_create_confirm_claim() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
+    fn deliverable_licensing_enforces_final_milestone_and_immutability() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-        // Nothing claimable before any confirmation.
-        assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        let gov = Address::generate(&env);
+        let r1 = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        token::StellarAssetClient::new(&env, &token_id).mint(&gov, &10_000);
 
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        assert_eq!(grants.claimable(id), Some(100));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-        assert_eq!(grants.claimable(id), Some(0));
+        let cid = env.register_contract(None, RefractGrants);
+        let client = RefractGrantsClient::new(&env, &cid);
 
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 2).unwrap();
-        assert_eq!(grants.claimable(id), Some(200));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
+        client.initialize(&gov, &vec![&env, r1.clone()], &1, &token_id);
 
-    #[test]
-    fn claim_releases_only_confirmed_amounts() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
-            .unwrap();
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn rejects_milestone_sum_mismatch() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_milestones() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![]),
-            Err(GrantsError::NoMilestones)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 0, vec![0]),
-            Err(GrantsError::InvalidTotalAmount)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![100, 0]),
-            Err(GrantsError::InvalidMilestoneAmount)
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_order_confirmation() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
+        client.set_program_license_policy(
+            &1,
+            &true,
+            &true,
+            &vec![&env, symbol_short!("MIT"), symbol_short!("Apache2")],
         );
 
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneAlreadyConfirmed)
-        );
-    }
-
-    #[test]
-    fn enforces_governance_gating() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
-            Err(GrantsError::Unauthorized)
+        let gid = client.create_program_grant(
+            &1,
+            &recipient,
+            &vec![
+                &env,
+                (symbol_short!("m1"), 1_000),
+                (symbol_short!("m2"), 2_000),
+            ],
         );
 
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
+        // First milestone is not the final one, so it can release without a deliverable
+        assert!(client.approve_milestone(&r1, &gid, &0));
+
+        // Second (final) milestone is blocked when required declaration is missing
+        let missing = client.try_approve_milestone(&r1, &gid, &1);
+        assert_eq!(missing, Err(Ok(GrantsError::MissingRequiredLicense)));
+
+        // Malformed SPDX is rejected
+        let bad_spdx = client.try_submit_deliverable(
+            &gid,
+            &1,
+            &symbol_short!("FAKE_LIC"),
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &Some(BytesN::from_array(&env, &[2u8; 32])),
         );
-    }
+        assert_eq!(bad_spdx, Err(Ok(GrantsError::MalformedLicenseIdentifier)));
 
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-
-        assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
+        // Submit valid SPDX (GPL3) that is not in program acceptable list
+        let decl = client.submit_deliverable(
+            &gid,
+            &1,
+            &symbol_short!("GPL3"),
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &Some(BytesN::from_array(&env, &[2u8; 32])),
         );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
+        assert!(!decl.accepted);
         assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
+            client.try_approve_milestone(&r1, &gid, &1),
+            Err(Ok(GrantsError::UnacceptableLicense))
         );
+
+        // Amend to acceptable MIT license + IP attestation before release
+        let decl2 = client.submit_deliverable(
+            &gid,
+            &1,
+            &symbol_short!("MIT"),
+            &BytesN::from_array(&env, &[3u8; 32]),
+            &Some(BytesN::from_array(&env, &[4u8; 32])),
+        );
+        assert!(decl2.accepted);
+
+        // Final milestone now releases cleanly
+        assert!(client.approve_milestone(&r1, &gid, &1));
+        assert_eq!(
+            client.get_grant(&gid).unwrap().status,
+            GrantStatus::Completed
+        );
+        assert_eq!(client.grant_deliverables(&gid).len(), 1);
     }
 }
