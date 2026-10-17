@@ -6,6 +6,7 @@ edition = "2021"
 [lib]
 name = "refract_grants"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = "21.0.0"
