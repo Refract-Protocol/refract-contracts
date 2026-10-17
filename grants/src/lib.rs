@@ -24,7 +24,14 @@
 //! mechanics once a milestone is confirmed on-chain.
 
 #![allow(clippy::too_many_arguments)]
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros, clippy::bool_assert_comparison))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_macros,
+        clippy::bool_assert_comparison
+    )
+)]
 
 pub mod normalization;
 pub use normalization::{
@@ -32,7 +39,7 @@ pub use normalization::{
     Rounding, PROTOCOL_DECIMALS, PROTOCOL_SCALE,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Identifier for a grant.
 pub type GrantId = u64;
@@ -107,6 +114,28 @@ pub enum GrantsError {
     ActiveReviewsPending,
     /// Reviewer stake record was not found for the specified program.
     ReviewerStakeNotFound,
+    /// Rubric criteria and weights length mismatch.
+    RubricLengthMismatch,
+    /// Rubric criteria list is empty.
+    InvalidRubricCriteria,
+    /// Rubric weights must sum to exactly 10,000 bps (100%).
+    InvalidRubricSum,
+    /// Rubric weight for a criterion must be strictly positive.
+    InvalidRubricWeight,
+    /// Specified rubric version was not found.
+    RubricNotFound,
+    /// Reviewer cannot score their own grant application.
+    SelfScoringBlocked,
+    /// Reviewer is recused from evaluating this application.
+    ReviewerRecused,
+    /// Reviewer is not assigned to evaluate this application.
+    ReviewerNotAssigned,
+    /// Criterion score must be bounded between 0 and 100 inclusive.
+    ScoreOutOfBounds,
+    /// Evaluation score for this application was already submitted by reviewer.
+    DuplicateScore,
+    /// Application does not meet the minimum review quorum for shortlisting.
+    QuorumNotMet,
 }
 
 pub type GrantError = GrantsError;
@@ -137,6 +166,32 @@ pub struct ReviewerStake {
     pub staked: i128,
     pub slashed: i128,
     pub active_reviews: u32,
+}
+
+/// Evaluation rubric with criteria and weights summing to 10,000 bps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rubric {
+    pub version: u32,
+    pub criteria: Vec<String>,
+    pub weights_bps: Vec<u32>,
+}
+
+/// Scored evaluation submitted by a reviewer for a grant application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewEvaluation {
+    pub reviewer: Address,
+    pub application_id: u64,
+    pub rubric_version: u32,
+    pub scores: Vec<u32>,
+    pub weighted_score: u32,
+    pub submitted_at: u64,
+}
+
+/// Trimming configuration for dropping highest and lowest scores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrimmingConfig {
+    pub enabled: bool,
+    pub min_threshold: u32,
 }
 
 /// A line-item budget entry for granular expenditure tracking.
@@ -211,6 +266,22 @@ pub struct RefractGrants {
     reviewed_grants: BTreeMap<GrantId, Address>,
     /// Stored reviewer stakes keyed by (reviewer address, program id).
     reviewer_stakes: BTreeMap<(Address, u64), ReviewerStake>,
+    /// Monotonic counter used to allocate rubric versions.
+    next_rubric_version: u32,
+    /// Stored evaluation rubrics keyed by version.
+    rubrics: BTreeMap<u32, Rubric>,
+    /// Stored evaluation scores keyed by (application id, reviewer address).
+    evaluations: BTreeMap<(u64, Address), ReviewEvaluation>,
+    /// Assigned reviewers keyed by (reviewer address, application id).
+    assigned_reviewers: BTreeSet<(Address, u64)>,
+    /// Recused reviewers keyed by (reviewer address, application id).
+    recused_reviewers: BTreeSet<(Address, u64)>,
+    /// Trimming configurations keyed by program/round id.
+    trimming_configs: BTreeMap<u64, TrimmingConfig>,
+    /// Review quorum thresholds keyed by program/round id.
+    review_quorums: BTreeMap<u64, u32>,
+    /// Monotonic block timestamp for deterministic tiebreak.
+    block_timestamp: u64,
 }
 
 impl RefractGrants {
@@ -228,6 +299,14 @@ impl RefractGrants {
             reviewer_compensations: BTreeMap::new(),
             reviewed_grants: BTreeMap::new(),
             reviewer_stakes: BTreeMap::new(),
+            next_rubric_version: 1,
+            rubrics: BTreeMap::new(),
+            evaluations: BTreeMap::new(),
+            assigned_reviewers: BTreeSet::new(),
+            recused_reviewers: BTreeSet::new(),
+            trimming_configs: BTreeMap::new(),
+            review_quorums: BTreeMap::new(),
+            block_timestamp: 0,
         }
     }
 
@@ -271,7 +350,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -352,7 +433,10 @@ impl RefractGrants {
         budget: Vec<BudgetItem>,
     ) -> Result<(), GrantsError> {
         self.require_governance(caller)?;
-        let grant = self.grants.get(&grant_id).ok_or(GrantsError::GrantNotFound)?;
+        let grant = self
+            .grants
+            .get(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
 
         if budget.is_empty() {
             return Err(GrantsError::NoMilestones);
@@ -389,7 +473,10 @@ impl RefractGrants {
         if !self.grants.contains_key(&grant_id) {
             return Err(GrantsError::GrantNotFound);
         }
-        let items = self.budgets.get(&grant_id).ok_or(GrantsError::CategoryNotFound)?;
+        let items = self
+            .budgets
+            .get(&grant_id)
+            .ok_or(GrantsError::CategoryNotFound)?;
         let item = items
             .iter()
             .find(|b| b.category == category)
@@ -534,7 +621,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -581,7 +670,14 @@ impl RefractGrants {
         milestones: Vec<i128>,
         current_time: u64,
     ) -> Result<GrantId, GrantsError> {
-        self.apply_for_grant(caller, program_id, recipient, total_amount, milestones, current_time)
+        self.apply_for_grant(
+            caller,
+            program_id,
+            recipient,
+            total_amount,
+            milestones,
+            current_time,
+        )
     }
 
     /// Releases a milestone, deducting its amount from the funding program budget.
@@ -925,13 +1021,17 @@ impl RefractGrants {
         if amount_per_review <= 0 {
             return Err(GrantsError::InvalidCompensationAmount);
         }
-        self.program_review_rewards.insert(program_id, amount_per_review);
+        self.program_review_rewards
+            .insert(program_id, amount_per_review);
         Ok(())
     }
 
     /// Returns the configured reviewer compensation per review for a program.
     pub fn get_program_review_reward(&self, program_id: u64) -> i128 {
-        self.program_review_rewards.get(&program_id).copied().unwrap_or(0)
+        self.program_review_rewards
+            .get(&program_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Accrues reviewer reward upon confirmed review delivery of a grant application.
@@ -946,7 +1046,10 @@ impl RefractGrants {
     ) -> Result<i128, GrantsError> {
         self.require_governance(governance)?;
 
-        let grant = self.grants.get(&grant_id).ok_or(GrantsError::GrantNotFound)?;
+        let grant = self
+            .grants
+            .get(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
         let program_id = grant.program_id.ok_or(GrantsError::ProgramNotFound)?;
 
         if self.reviewed_grants.contains_key(&grant_id) {
@@ -1059,7 +1162,10 @@ impl RefractGrants {
         if amount <= 0 {
             return Err(GrantsError::InvalidStakeAmount);
         }
-        let program = self.programs.get(&program_id).ok_or(GrantsError::ProgramNotFound)?;
+        let program = self
+            .programs
+            .get(&program_id)
+            .ok_or(GrantsError::ProgramNotFound)?;
         if !program.is_active {
             return Err(GrantsError::ProgramInactive);
         }
@@ -1225,9 +1331,312 @@ impl RefractGrants {
         slash_amount: i128,
         token_decimals: u32,
     ) -> Result<i128, GrantsError> {
-        let protocol_amount = self.slash_reviewer(governance, reviewer, program_id, slash_amount)?;
+        let protocol_amount =
+            self.slash_reviewer(governance, reviewer, program_id, slash_amount)?;
         normalization::to_token_units(protocol_amount, token_decimals)
             .map_err(|_| GrantsError::NormalizationError)
+    }
+
+    /// Defines an evaluation rubric with named criteria and weights summing to 10,000 bps (100%).
+    /// Stored immutably per version.
+    pub fn define_rubric(
+        &mut self,
+        criteria: Vec<String>,
+        weights_bps: Vec<u32>,
+    ) -> Result<u32, GrantsError> {
+        if criteria.is_empty() {
+            return Err(GrantsError::InvalidRubricCriteria);
+        }
+        if criteria.len() != weights_bps.len() {
+            return Err(GrantsError::RubricLengthMismatch);
+        }
+        for &w in &weights_bps {
+            if w == 0 {
+                return Err(GrantsError::InvalidRubricWeight);
+            }
+        }
+        let sum: u32 = weights_bps.iter().sum();
+        if sum != 10_000 {
+            return Err(GrantsError::InvalidRubricSum);
+        }
+
+        let version = self.next_rubric_version;
+        self.next_rubric_version += 1;
+
+        self.rubrics.insert(
+            version,
+            Rubric {
+                version,
+                criteria,
+                weights_bps,
+            },
+        );
+
+        Ok(version)
+    }
+
+    /// Governance-gated wrapper for defining a rubric.
+    pub fn define_rubric_governed(
+        &mut self,
+        caller: Address,
+        criteria: Vec<String>,
+        weights_bps: Vec<u32>,
+    ) -> Result<u32, GrantsError> {
+        self.require_governance(caller)?;
+        self.define_rubric(criteria, weights_bps)
+    }
+
+    /// Returns the rubric for `version`, if defined.
+    pub fn get_rubric(&self, version: u32) -> Option<&Rubric> {
+        self.rubrics.get(&version)
+    }
+
+    /// Assigns a reviewer to evaluate a specific grant application. Governance-gated.
+    pub fn assign_reviewer(
+        &mut self,
+        caller: Address,
+        reviewer: Address,
+        application_id: u64,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if !self.grants.contains_key(&application_id) {
+            return Err(GrantsError::GrantNotFound);
+        }
+        self.assigned_reviewers.insert((reviewer, application_id));
+        Ok(())
+    }
+
+    /// Recuses a reviewer from evaluating a specific grant application.
+    /// Can be invoked by governance or by the reviewer themselves.
+    pub fn recuse_reviewer(
+        &mut self,
+        caller: Address,
+        reviewer: Address,
+        application_id: u64,
+    ) -> Result<(), GrantsError> {
+        if caller != self.governance && caller != reviewer {
+            return Err(GrantsError::Unauthorized);
+        }
+        if !self.grants.contains_key(&application_id) {
+            return Err(GrantsError::GrantNotFound);
+        }
+        self.recused_reviewers.insert((reviewer, application_id));
+        Ok(())
+    }
+
+    /// Configures dropping highest and lowest scores when review count exceeds a threshold.
+    /// Governance-gated.
+    pub fn configure_trimming(
+        &mut self,
+        caller: Address,
+        program_id: u64,
+        enabled: bool,
+        min_threshold: u32,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if !self.programs.contains_key(&program_id) {
+            return Err(GrantsError::ProgramNotFound);
+        }
+        self.trimming_configs.insert(
+            program_id,
+            TrimmingConfig {
+                enabled,
+                min_threshold,
+            },
+        );
+        Ok(())
+    }
+
+    /// Configures the minimum review quorum required for an application to be shortlisted.
+    /// Governance-gated.
+    pub fn set_review_quorum(
+        &mut self,
+        caller: Address,
+        program_id: u64,
+        min_quorum: u32,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if !self.programs.contains_key(&program_id) {
+            return Err(GrantsError::ProgramNotFound);
+        }
+        self.review_quorums.insert(program_id, min_quorum);
+        Ok(())
+    }
+
+    /// Sets mock block timestamp for deterministic tiebreak in pure Rust tests.
+    pub fn set_block_timestamp(&mut self, timestamp: u64) {
+        self.block_timestamp = timestamp;
+    }
+
+    /// Submits a scored evaluation for a grant application against a versioned rubric.
+    ///
+    /// Validates reviewer assignment, blocks self-scoring, blocks recused reviewers,
+    /// and bounds each criterion score to [0, 100].
+    pub fn submit_score(
+        &mut self,
+        reviewer: Address,
+        application_id: u64,
+        rubric_version: u32,
+        scores: Vec<u32>,
+    ) -> Result<(), GrantsError> {
+        let grant = self
+            .grants
+            .get(&application_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+
+        if reviewer == grant.recipient {
+            return Err(GrantsError::SelfScoringBlocked);
+        }
+
+        if self.recused_reviewers.contains(&(reviewer, application_id)) {
+            return Err(GrantsError::ReviewerRecused);
+        }
+
+        let is_assigned = self
+            .assigned_reviewers
+            .contains(&(reviewer, application_id))
+            || grant
+                .program_id
+                .map(|pid| {
+                    self.reviewer_stakes
+                        .get(&(reviewer, pid))
+                        .map(|s| s.active_reviews > 0)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+
+        if !is_assigned {
+            return Err(GrantsError::ReviewerNotAssigned);
+        }
+
+        let rubric = self
+            .rubrics
+            .get(&rubric_version)
+            .ok_or(GrantsError::RubricNotFound)?;
+
+        if scores.len() != rubric.criteria.len() {
+            return Err(GrantsError::RubricLengthMismatch);
+        }
+
+        for &s in &scores {
+            if s > 100 {
+                return Err(GrantsError::ScoreOutOfBounds);
+            }
+        }
+
+        if self.evaluations.contains_key(&(application_id, reviewer)) {
+            return Err(GrantsError::DuplicateScore);
+        }
+
+        let mut weighted_sum: u64 = 0;
+        for (i, &score) in scores.iter().enumerate() {
+            weighted_sum = weighted_sum
+                .checked_add((score as u64) * (rubric.weights_bps[i] as u64))
+                .ok_or(GrantsError::InconsistentState)?;
+        }
+        let weighted_score = (weighted_sum / 10_000) as u32;
+
+        self.evaluations.insert(
+            (application_id, reviewer),
+            ReviewEvaluation {
+                reviewer,
+                application_id,
+                rubric_version,
+                scores,
+                weighted_score,
+                submitted_at: self.block_timestamp,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Returns the evaluation for `(application_id, reviewer)`, if submitted.
+    pub fn get_evaluation(
+        &self,
+        application_id: u64,
+        reviewer: Address,
+    ) -> Option<&ReviewEvaluation> {
+        self.evaluations.get(&(application_id, reviewer))
+    }
+
+    /// Computes the ranked shortlist of grant applications for a round/program.
+    ///
+    /// Sorts by aggregate weighted score descending with deterministic tiebreaks:
+    /// earlier submission first, then application_id ascending.
+    /// Drops highest and lowest score if trimming is configured and count exceeds threshold.
+    /// Enforces minimum review quorum.
+    pub fn ranked_shortlist(&self, round: u64) -> Vec<(u64, u32)> {
+        let mut candidates: Vec<(u64, u32, u64)> = Vec::new();
+        let min_quorum = self.review_quorums.get(&round).copied().unwrap_or(1);
+        let trim = self
+            .trimming_configs
+            .get(&round)
+            .cloned()
+            .unwrap_or(TrimmingConfig {
+                enabled: false,
+                min_threshold: 0,
+            });
+
+        for (&gid, grant) in &self.grants {
+            if grant.program_id != Some(round) {
+                continue;
+            }
+
+            let mut evals: Vec<&ReviewEvaluation> = Vec::new();
+            for ((app_id, reviewer), eval) in &self.evaluations {
+                if *app_id == gid && !self.recused_reviewers.contains(&(*reviewer, gid)) {
+                    evals.push(eval);
+                }
+            }
+
+            if (evals.len() as u32) < min_quorum || evals.is_empty() {
+                continue;
+            }
+
+            let earliest_sub = evals.iter().map(|e| e.submitted_at).min().unwrap_or(0);
+            let mut scores: Vec<u32> = evals.iter().map(|e| e.weighted_score).collect();
+
+            if trim.enabled && (scores.len() as u32) > trim.min_threshold && scores.len() >= 3 {
+                scores.sort();
+                scores.remove(0);
+                scores.pop();
+            }
+
+            let agg_score: u32 = scores.iter().sum::<u32>() / (scores.len() as u32);
+            candidates.push((gid, agg_score, earliest_sub));
+        }
+
+        candidates.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        candidates
+            .into_iter()
+            .map(|(id, score, _)| (id, score))
+            .collect()
+    }
+
+    /// Finalises and returns the ranked shortlist of applications for a round. Governance-gated.
+    pub fn finalise_shortlist(
+        &mut self,
+        caller: Address,
+        round: u64,
+    ) -> Result<Vec<(u64, u32)>, GrantsError> {
+        self.require_governance(caller)?;
+        let list = self.ranked_shortlist(round);
+        let mut app_count = 0;
+        for grant in self.grants.values() {
+            if grant.program_id == Some(round) {
+                app_count += 1;
+            }
+        }
+        if app_count > 0 && list.len() < app_count {
+            return Err(GrantsError::QuorumNotMet);
+        }
+        Ok(list)
     }
 
     /// Checks post-restore consistency across all grants and programs.
@@ -1285,7 +1694,8 @@ impl RefractGrants {
                 let mut budget_sum: i128 = 0;
                 let mut budget_disbursed: i128 = 0;
                 for item in items {
-                    if item.allocated <= 0 || item.disbursed < 0 || item.disbursed > item.allocated {
+                    if item.allocated <= 0 || item.disbursed < 0 || item.disbursed > item.allocated
+                    {
                         return Err(GrantsError::InconsistentState);
                     }
                     budget_sum = budget_sum
@@ -1309,13 +1719,36 @@ impl RefractGrants {
             }
         }
         for comp in self.reviewer_compensations.values() {
-            if comp.amount_per_review <= 0 || comp.total_earned < 0 || comp.claimed < 0 || comp.claimed > comp.total_earned {
+            if comp.amount_per_review <= 0
+                || comp.total_earned < 0
+                || comp.claimed < 0
+                || comp.claimed > comp.total_earned
+            {
                 return Err(GrantsError::InconsistentState);
             }
         }
         for stake in self.reviewer_stakes.values() {
             if stake.staked < 0 || stake.slashed < 0 || stake.slashed > stake.staked {
                 return Err(GrantsError::InconsistentState);
+            }
+        }
+        for rubric in self.rubrics.values() {
+            if rubric.criteria.is_empty() || rubric.criteria.len() != rubric.weights_bps.len() {
+                return Err(GrantsError::InconsistentState);
+            }
+            let sum: u32 = rubric.weights_bps.iter().sum();
+            if sum != 10_000 {
+                return Err(GrantsError::InconsistentState);
+            }
+        }
+        for eval in self.evaluations.values() {
+            if eval.weighted_score > 100 {
+                return Err(GrantsError::InconsistentState);
+            }
+            for &s in &eval.scores {
+                if s > 100 {
+                    return Err(GrantsError::InconsistentState);
+                }
             }
         }
         Ok(())
@@ -1333,7 +1766,7 @@ pub mod contract {
     use super::*;
     use soroban_sdk::{
         contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
-        Env, Symbol, Vec,
+        Env, String as SorobanString, Symbol, Vec,
     };
 
     #[contracttype]
@@ -1351,6 +1784,15 @@ pub mod contract {
         ReviewerComp(Address),
         ReviewedGrant(u64),
         ReviewerStake(Address, u64),
+        NextRubricVersion,
+        Rubric(u32),
+        Evaluation(u64, Address),
+        EvaluationList(u64),
+        AssignedReviewer(u64, Address),
+        RecusedReviewer(u64, Address),
+        TrimmingConfig(u64),
+        ReviewQuorum(u64),
+        ProgramApplicationList(u64),
     }
 
     #[contracttype]
@@ -1396,6 +1838,32 @@ pub mod contract {
         pub staked: i128,
         pub slashed: i128,
         pub active_reviews: u32,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Rubric {
+        pub version: u32,
+        pub criteria: Vec<SorobanString>,
+        pub weights_bps: Vec<u32>,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ReviewEvaluation {
+        pub reviewer: Address,
+        pub application_id: u64,
+        pub rubric_version: u32,
+        pub scores: Vec<u32>,
+        pub weighted_score: u32,
+        pub submitted_at: u64,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct TrimmingConfig {
+        pub enabled: bool,
+        pub min_threshold: u32,
     }
 
     #[contracttype]
@@ -1455,6 +1923,17 @@ pub mod contract {
         InsufficientStake = 29,
         ActiveReviewsPending = 30,
         ReviewerStakeNotFound = 31,
+        InvalidRubricCriteria = 32,
+        RubricLengthMismatch = 33,
+        InvalidRubricSum = 34,
+        InvalidRubricWeight = 35,
+        RubricNotFound = 36,
+        SelfScoringBlocked = 37,
+        ReviewerRecused = 38,
+        ReviewerNotAssigned = 39,
+        ScoreOutOfBounds = 40,
+        DuplicateScore = 41,
+        QuorumNotMet = 42,
     }
 
     pub use self::GrantsContractError as GrantContractError;
@@ -1468,10 +1947,19 @@ pub mod contract {
             if env.storage().instance().has(&GrantsDataKey::Governance) {
                 return Err(GrantsContractError::Unauthorized);
             }
-            env.storage().instance().set(&GrantsDataKey::Governance, &governance);
-            env.storage().instance().set(&GrantsDataKey::NextGrantId, &0u64);
-            env.storage().instance().set(&GrantsDataKey::NextProgramId, &0u64);
-            env.events().publish((symbol_short!("grant"), symbol_short!("init")), (governance,));
+            env.storage()
+                .instance()
+                .set(&GrantsDataKey::Governance, &governance);
+            env.storage()
+                .instance()
+                .set(&GrantsDataKey::NextGrantId, &0u64);
+            env.storage()
+                .instance()
+                .set(&GrantsDataKey::NextProgramId, &0u64);
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("init")),
+                (governance,),
+            );
             Ok(())
         }
 
@@ -1584,7 +2072,10 @@ pub mod contract {
                 .ok_or(GrantsContractError::ProgramNotFound)
         }
 
-        pub fn get_program_remaining_budget(env: Env, id: u64) -> Result<i128, GrantsContractError> {
+        pub fn get_program_remaining_budget(
+            env: Env,
+            id: u64,
+        ) -> Result<i128, GrantsContractError> {
             let program: ProgramInfo = env
                 .storage()
                 .persistent()
@@ -1648,7 +2139,9 @@ pub mod contract {
                 if amt <= 0 {
                     return Err(GrantsContractError::InvalidMilestoneAmount);
                 }
-                sum = sum.checked_add(amt).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+                sum = sum
+                    .checked_add(amt)
+                    .ok_or(GrantsContractError::MilestoneSumMismatch)?;
                 stored_milestones.push_back(MilestoneRecord {
                     amount: amt,
                     confirmed: false,
@@ -1737,7 +2230,9 @@ pub mod contract {
                 if amt <= 0 {
                     return Err(GrantsContractError::InvalidMilestoneAmount);
                 }
-                sum = sum.checked_add(amt).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+                sum = sum
+                    .checked_add(amt)
+                    .ok_or(GrantsContractError::MilestoneSumMismatch)?;
                 stored_milestones.push_back(MilestoneRecord {
                     amount: amt,
                     confirmed: false,
@@ -1747,9 +2242,15 @@ pub mod contract {
             if sum != total_amount {
                 return Err(GrantsContractError::MilestoneSumMismatch);
             }
-            let next_id: u64 = env.storage().instance().get(&GrantsDataKey::NextGrantId).unwrap_or(0);
+            let next_id: u64 = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::NextGrantId)
+                .unwrap_or(0);
             let grant_id = next_id;
-            env.storage().instance().set(&GrantsDataKey::NextGrantId, &(next_id + 1));
+            env.storage()
+                .instance()
+                .set(&GrantsDataKey::NextGrantId, &(next_id + 1));
 
             let record = GrantRecord {
                 recipient: recipient.clone(),
@@ -1757,7 +2258,9 @@ pub mod contract {
                 milestones: stored_milestones,
                 claimable: 0,
             };
-            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &record);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(grant_id), &record);
 
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("create")),
@@ -1796,7 +2299,9 @@ pub mod contract {
                 if amt <= 0 {
                     return Err(GrantsContractError::InvalidMilestoneAmount);
                 }
-                sum = sum.checked_add(amt).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+                sum = sum
+                    .checked_add(amt)
+                    .ok_or(GrantsContractError::MilestoneSumMismatch)?;
                 stored_milestones.push_back(MilestoneRecord {
                     amount: amt,
                     confirmed: false,
@@ -1812,7 +2317,9 @@ pub mod contract {
             }
             let mut budget_sum: i128 = 0;
             for i in 0..budget.len() {
-                let item = budget.get(i).ok_or(GrantsContractError::InvalidMilestoneAmount)?;
+                let item = budget
+                    .get(i)
+                    .ok_or(GrantsContractError::InvalidMilestoneAmount)?;
                 if item.allocated <= 0 || item.disbursed != 0 {
                     return Err(GrantsContractError::InvalidMilestoneAmount);
                 }
@@ -1824,9 +2331,15 @@ pub mod contract {
                 return Err(GrantsContractError::MilestoneSumMismatch);
             }
 
-            let next_id: u64 = env.storage().instance().get(&GrantsDataKey::NextGrantId).unwrap_or(0);
+            let next_id: u64 = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::NextGrantId)
+                .unwrap_or(0);
             let grant_id = next_id;
-            env.storage().instance().set(&GrantsDataKey::NextGrantId, &(next_id + 1));
+            env.storage()
+                .instance()
+                .set(&GrantsDataKey::NextGrantId, &(next_id + 1));
 
             let record = GrantRecord {
                 recipient: recipient.clone(),
@@ -1834,8 +2347,12 @@ pub mod contract {
                 milestones: stored_milestones,
                 claimable: 0,
             };
-            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &record);
-            env.storage().persistent().set(&GrantsDataKey::Budget(grant_id), &budget);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(grant_id), &record);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Budget(grant_id), &budget);
 
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("create")),
@@ -1870,7 +2387,9 @@ pub mod contract {
             }
             let mut budget_sum: i128 = 0;
             for i in 0..budget.len() {
-                let item = budget.get(i).ok_or(GrantsContractError::InvalidMilestoneAmount)?;
+                let item = budget
+                    .get(i)
+                    .ok_or(GrantsContractError::InvalidMilestoneAmount)?;
                 if item.allocated <= 0 || item.disbursed < 0 || item.disbursed > item.allocated {
                     return Err(GrantsContractError::InvalidMilestoneAmount);
                 }
@@ -1882,7 +2401,9 @@ pub mod contract {
                 return Err(GrantsContractError::MilestoneSumMismatch);
             }
 
-            env.storage().persistent().set(&GrantsDataKey::Budget(grant_id), &budget);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Budget(grant_id), &budget);
             Ok(())
         }
 
@@ -1890,7 +2411,11 @@ pub mod contract {
             env: Env,
             grant_id: u64,
         ) -> Result<Vec<BudgetItem>, GrantsContractError> {
-            if !env.storage().persistent().has(&GrantsDataKey::Grant(grant_id)) {
+            if !env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::Grant(grant_id))
+            {
                 return Err(GrantsContractError::GrantNotFound);
             }
             env.storage()
@@ -1904,7 +2429,11 @@ pub mod contract {
             grant_id: u64,
             category: Symbol,
         ) -> Result<(i128, i128, i128), GrantsContractError> {
-            if !env.storage().persistent().has(&GrantsDataKey::Grant(grant_id)) {
+            if !env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::Grant(grant_id))
+            {
                 return Err(GrantsContractError::GrantNotFound);
             }
             let budget: Vec<BudgetItem> = env
@@ -1951,12 +2480,18 @@ pub mod contract {
                 return Err(GrantsContractError::InvalidMilestoneIndex);
             }
             for i in 0..idx {
-                let m = grant.milestones.get(i).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+                let m = grant
+                    .milestones
+                    .get(i)
+                    .ok_or(GrantsContractError::InvalidMilestoneIndex)?;
                 if !m.confirmed {
                     return Err(GrantsContractError::MilestoneOutOfOrder);
                 }
             }
-            let mut target_m = grant.milestones.get(idx).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+            let mut target_m = grant
+                .milestones
+                .get(idx)
+                .ok_or(GrantsContractError::InvalidMilestoneIndex)?;
             if target_m.confirmed {
                 return Err(GrantsContractError::MilestoneAlreadyConfirmed);
             }
@@ -1973,24 +2508,41 @@ pub mod contract {
                 }
             }
 
-            if let Some(program_id) = env.storage().persistent().get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id)) {
+            if let Some(program_id) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id))
+            {
                 let mut program: ProgramInfo = env
                     .storage()
                     .persistent()
                     .get(&GrantsDataKey::Program(program_id))
                     .ok_or(GrantsContractError::ProgramNotFound)?;
-                let remaining = program.budget.checked_sub(program.disbursed).ok_or(GrantsContractError::BudgetExceeded)?;
+                let remaining = program
+                    .budget
+                    .checked_sub(program.disbursed)
+                    .ok_or(GrantsContractError::BudgetExceeded)?;
                 if target_m.amount > remaining {
                     return Err(GrantsContractError::BudgetExceeded);
                 }
-                program.disbursed = program.disbursed.checked_add(target_m.amount).ok_or(GrantsContractError::BudgetExceeded)?;
-                env.storage().persistent().set(&GrantsDataKey::Program(program_id), &program);
+                program.disbursed = program
+                    .disbursed
+                    .checked_add(target_m.amount)
+                    .ok_or(GrantsContractError::BudgetExceeded)?;
+                env.storage()
+                    .persistent()
+                    .set(&GrantsDataKey::Program(program_id), &program);
             }
 
             target_m.confirmed = true;
-            grant.claimable = grant.claimable.checked_add(target_m.amount).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            grant.claimable = grant
+                .claimable
+                .checked_add(target_m.amount)
+                .ok_or(GrantsContractError::MilestoneSumMismatch)?;
             grant.milestones.set(idx, target_m.clone());
-            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(grant_id), &grant);
 
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("release")),
@@ -2026,12 +2578,18 @@ pub mod contract {
                 return Err(GrantsContractError::InvalidMilestoneIndex);
             }
             for i in 0..idx {
-                let m = grant.milestones.get(i).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+                let m = grant
+                    .milestones
+                    .get(i)
+                    .ok_or(GrantsContractError::InvalidMilestoneIndex)?;
                 if !m.confirmed {
                     return Err(GrantsContractError::MilestoneOutOfOrder);
                 }
             }
-            let mut target_m = grant.milestones.get(idx).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+            let mut target_m = grant
+                .milestones
+                .get(idx)
+                .ok_or(GrantsContractError::InvalidMilestoneIndex)?;
             if target_m.confirmed {
                 return Err(GrantsContractError::MilestoneAlreadyConfirmed);
             }
@@ -2076,25 +2634,44 @@ pub mod contract {
                 return Err(GrantsContractError::CategoryNotFound);
             }
 
-            if let Some(program_id) = env.storage().persistent().get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id)) {
+            if let Some(program_id) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id))
+            {
                 let mut program: ProgramInfo = env
                     .storage()
                     .persistent()
                     .get(&GrantsDataKey::Program(program_id))
                     .ok_or(GrantsContractError::ProgramNotFound)?;
-                let remaining = program.budget.checked_sub(program.disbursed).ok_or(GrantsContractError::BudgetExceeded)?;
+                let remaining = program
+                    .budget
+                    .checked_sub(program.disbursed)
+                    .ok_or(GrantsContractError::BudgetExceeded)?;
                 if target_m.amount > remaining {
                     return Err(GrantsContractError::BudgetExceeded);
                 }
-                program.disbursed = program.disbursed.checked_add(target_m.amount).ok_or(GrantsContractError::BudgetExceeded)?;
-                env.storage().persistent().set(&GrantsDataKey::Program(program_id), &program);
+                program.disbursed = program
+                    .disbursed
+                    .checked_add(target_m.amount)
+                    .ok_or(GrantsContractError::BudgetExceeded)?;
+                env.storage()
+                    .persistent()
+                    .set(&GrantsDataKey::Program(program_id), &program);
             }
 
             target_m.confirmed = true;
-            grant.claimable = grant.claimable.checked_add(target_m.amount).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            grant.claimable = grant
+                .claimable
+                .checked_add(target_m.amount)
+                .ok_or(GrantsContractError::MilestoneSumMismatch)?;
             grant.milestones.set(idx, target_m.clone());
-            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
-            env.storage().persistent().set(&GrantsDataKey::Budget(grant_id), &budget);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(grant_id), &grant);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Budget(grant_id), &budget);
 
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("release")),
@@ -2130,12 +2707,18 @@ pub mod contract {
                 return Err(GrantsContractError::InvalidMilestoneIndex);
             }
             for i in 0..idx {
-                let m = grant.milestones.get(i).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+                let m = grant
+                    .milestones
+                    .get(i)
+                    .ok_or(GrantsContractError::InvalidMilestoneIndex)?;
                 if !m.confirmed {
                     return Err(GrantsContractError::MilestoneOutOfOrder);
                 }
             }
-            let mut target_m = grant.milestones.get(idx).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+            let mut target_m = grant
+                .milestones
+                .get(idx)
+                .ok_or(GrantsContractError::InvalidMilestoneIndex)?;
             if target_m.confirmed {
                 return Err(GrantsContractError::MilestoneAlreadyConfirmed);
             }
@@ -2180,25 +2763,44 @@ pub mod contract {
                 return Err(GrantsContractError::CategoryNotFound);
             }
 
-            if let Some(program_id) = env.storage().persistent().get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id)) {
+            if let Some(program_id) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id))
+            {
                 let mut program: ProgramInfo = env
                     .storage()
                     .persistent()
                     .get(&GrantsDataKey::Program(program_id))
                     .ok_or(GrantsContractError::ProgramNotFound)?;
-                let remaining = program.budget.checked_sub(program.disbursed).ok_or(GrantsContractError::BudgetExceeded)?;
+                let remaining = program
+                    .budget
+                    .checked_sub(program.disbursed)
+                    .ok_or(GrantsContractError::BudgetExceeded)?;
                 if target_m.amount > remaining {
                     return Err(GrantsContractError::BudgetExceeded);
                 }
-                program.disbursed = program.disbursed.checked_add(target_m.amount).ok_or(GrantsContractError::BudgetExceeded)?;
-                env.storage().persistent().set(&GrantsDataKey::Program(program_id), &program);
+                program.disbursed = program
+                    .disbursed
+                    .checked_add(target_m.amount)
+                    .ok_or(GrantsContractError::BudgetExceeded)?;
+                env.storage()
+                    .persistent()
+                    .set(&GrantsDataKey::Program(program_id), &program);
             }
 
             target_m.confirmed = true;
-            grant.claimable = grant.claimable.checked_add(target_m.amount).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            grant.claimable = grant
+                .claimable
+                .checked_add(target_m.amount)
+                .ok_or(GrantsContractError::MilestoneSumMismatch)?;
             grant.milestones.set(idx, target_m);
-            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
-            env.storage().persistent().set(&GrantsDataKey::Budget(grant_id), &budget);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(grant_id), &grant);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Budget(grant_id), &budget);
 
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("confirm")),
@@ -2232,12 +2834,18 @@ pub mod contract {
                 return Err(GrantsContractError::InvalidMilestoneIndex);
             }
             for i in 0..idx {
-                let m = grant.milestones.get(i).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+                let m = grant
+                    .milestones
+                    .get(i)
+                    .ok_or(GrantsContractError::InvalidMilestoneIndex)?;
                 if !m.confirmed {
                     return Err(GrantsContractError::MilestoneOutOfOrder);
                 }
             }
-            let mut target_m = grant.milestones.get(idx).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+            let mut target_m = grant
+                .milestones
+                .get(idx)
+                .ok_or(GrantsContractError::InvalidMilestoneIndex)?;
             if target_m.confirmed {
                 return Err(GrantsContractError::MilestoneAlreadyConfirmed);
             }
@@ -2254,24 +2862,41 @@ pub mod contract {
                 }
             }
 
-            if let Some(program_id) = env.storage().persistent().get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id)) {
+            if let Some(program_id) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id))
+            {
                 let mut program: ProgramInfo = env
                     .storage()
                     .persistent()
                     .get(&GrantsDataKey::Program(program_id))
                     .ok_or(GrantsContractError::ProgramNotFound)?;
-                let remaining = program.budget.checked_sub(program.disbursed).ok_or(GrantsContractError::BudgetExceeded)?;
+                let remaining = program
+                    .budget
+                    .checked_sub(program.disbursed)
+                    .ok_or(GrantsContractError::BudgetExceeded)?;
                 if target_m.amount > remaining {
                     return Err(GrantsContractError::BudgetExceeded);
                 }
-                program.disbursed = program.disbursed.checked_add(target_m.amount).ok_or(GrantsContractError::BudgetExceeded)?;
-                env.storage().persistent().set(&GrantsDataKey::Program(program_id), &program);
+                program.disbursed = program
+                    .disbursed
+                    .checked_add(target_m.amount)
+                    .ok_or(GrantsContractError::BudgetExceeded)?;
+                env.storage()
+                    .persistent()
+                    .set(&GrantsDataKey::Program(program_id), &program);
             }
 
             target_m.confirmed = true;
-            grant.claimable = grant.claimable.checked_add(target_m.amount).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            grant.claimable = grant
+                .claimable
+                .checked_add(target_m.amount)
+                .ok_or(GrantsContractError::MilestoneSumMismatch)?;
             grant.milestones.set(idx, target_m);
-            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(grant_id), &grant);
 
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("confirm")),
@@ -2357,13 +2982,18 @@ pub mod contract {
             }
             grant.claimable = 0;
             for i in 0..grant.milestones.len() {
-                let mut m = grant.milestones.get(i).ok_or(GrantsContractError::GrantNotFound)?;
+                let mut m = grant
+                    .milestones
+                    .get(i)
+                    .ok_or(GrantsContractError::GrantNotFound)?;
                 if m.confirmed {
                     m.claimed = true;
                     grant.milestones.set(i, m);
                 }
             }
-            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(grant_id), &grant);
 
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("claim")),
@@ -2398,15 +3028,20 @@ pub mod contract {
             if caller != gov {
                 return Err(GrantsContractError::Unauthorized);
             }
-            if !env.storage().persistent().has(&GrantsDataKey::Program(program_id)) {
+            if !env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::Program(program_id))
+            {
                 return Err(GrantsContractError::ProgramNotFound);
             }
             if amount_per_review <= 0 {
                 return Err(GrantsContractError::InvalidCompensationAmount);
             }
-            env.storage()
-                .persistent()
-                .set(&GrantsDataKey::ProgramReviewReward(program_id), &amount_per_review);
+            env.storage().persistent().set(
+                &GrantsDataKey::ProgramReviewReward(program_id),
+                &amount_per_review,
+            );
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("rev_cfg")),
                 (program_id, amount_per_review),
@@ -2436,7 +3071,11 @@ pub mod contract {
             if governance != gov {
                 return Err(GrantsContractError::Unauthorized);
             }
-            if !env.storage().persistent().has(&GrantsDataKey::Grant(grant_id)) {
+            if !env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::Grant(grant_id))
+            {
                 return Err(GrantsContractError::GrantNotFound);
             }
             let program_id: u64 = env
@@ -2445,7 +3084,11 @@ pub mod contract {
                 .get(&GrantsDataKey::GrantProgram(grant_id))
                 .ok_or(GrantsContractError::ProgramNotFound)?;
 
-            if env.storage().persistent().has(&GrantsDataKey::ReviewedGrant(grant_id)) {
+            if env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::ReviewedGrant(grant_id))
+            {
                 return Err(GrantsContractError::DuplicateReviewReward);
             }
 
@@ -2480,7 +3123,9 @@ pub mod contract {
                 .disbursed
                 .checked_add(reward_amount)
                 .ok_or(GrantsContractError::BudgetExceeded)?;
-            env.storage().persistent().set(&GrantsDataKey::Program(program_id), &program);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Program(program_id), &program);
 
             let mut record: ReviewerCompensation = env
                 .storage()
@@ -2501,11 +3146,19 @@ pub mod contract {
                 .checked_add(reward_amount)
                 .ok_or(GrantsContractError::InconsistentState)?;
 
-            env.storage().persistent().set(&GrantsDataKey::ReviewerComp(reviewer.clone()), &record);
-            env.storage().persistent().set(&GrantsDataKey::ReviewedGrant(grant_id), &reviewer);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::ReviewerComp(reviewer.clone()), &record);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::ReviewedGrant(grant_id), &reviewer);
 
             let stake_key = GrantsDataKey::ReviewerStake(reviewer.clone(), program_id);
-            if let Some(mut stake) = env.storage().persistent().get::<_, ReviewerStake>(&stake_key) {
+            if let Some(mut stake) = env
+                .storage()
+                .persistent()
+                .get::<_, ReviewerStake>(&stake_key)
+            {
                 if stake.active_reviews > 0 {
                     stake.active_reviews -= 1;
                     env.storage().persistent().set(&stake_key, &stake);
@@ -2554,7 +3207,9 @@ pub mod contract {
                 .checked_add(claimable)
                 .ok_or(GrantsContractError::InconsistentState)?;
 
-            env.storage().persistent().set(&GrantsDataKey::ReviewerComp(reviewer.clone()), &record);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::ReviewerComp(reviewer.clone()), &record);
 
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("rev_clm")),
@@ -2593,17 +3248,17 @@ pub mod contract {
             }
 
             let key = GrantsDataKey::ReviewerStake(reviewer.clone(), program_id);
-            let mut stake: ReviewerStake = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or(ReviewerStake {
-                    reviewer: reviewer.clone(),
-                    program_id,
-                    staked: 0,
-                    slashed: 0,
-                    active_reviews: 0,
-                });
+            let mut stake: ReviewerStake =
+                env.storage()
+                    .persistent()
+                    .get(&key)
+                    .unwrap_or(ReviewerStake {
+                        reviewer: reviewer.clone(),
+                        program_id,
+                        staked: 0,
+                        slashed: 0,
+                        active_reviews: 0,
+                    });
 
             stake.staked = stake
                 .staked
@@ -2809,9 +3464,460 @@ pub mod contract {
             slash_amount: i128,
             token_decimals: u32,
         ) -> Result<i128, GrantsContractError> {
-            let protocol_amount = Self::slash_reviewer(env, governance, reviewer, program_id, slash_amount)?;
+            let protocol_amount =
+                Self::slash_reviewer(env, governance, reviewer, program_id, slash_amount)?;
             normalization::to_token_units(protocol_amount, token_decimals)
                 .map_err(|_| GrantsContractError::NormalizationError)
+        }
+
+        pub fn define_rubric(
+            env: Env,
+            governance: Address,
+            criteria: Vec<SorobanString>,
+            weights_bps: Vec<u32>,
+        ) -> Result<u32, GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if criteria.is_empty() {
+                return Err(GrantsContractError::InvalidRubricCriteria);
+            }
+            if criteria.len() != weights_bps.len() {
+                return Err(GrantsContractError::RubricLengthMismatch);
+            }
+            let mut sum: u32 = 0;
+            for i in 0..weights_bps.len() {
+                let w = weights_bps.get(i).unwrap_or(0);
+                if w == 0 {
+                    return Err(GrantsContractError::InvalidRubricWeight);
+                }
+                sum = sum
+                    .checked_add(w)
+                    .ok_or(GrantsContractError::InconsistentState)?;
+            }
+            if sum != 10_000 {
+                return Err(GrantsContractError::InvalidRubricSum);
+            }
+
+            let version: u32 = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::NextRubricVersion)
+                .unwrap_or(1);
+            env.storage()
+                .instance()
+                .set(&GrantsDataKey::NextRubricVersion, &(version + 1));
+
+            let rubric = Rubric {
+                version,
+                criteria,
+                weights_bps,
+            };
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Rubric(version), &rubric);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("rubric")),
+                (version,),
+            );
+            Ok(version)
+        }
+
+        pub fn get_rubric(env: Env, version: u32) -> Result<Rubric, GrantsContractError> {
+            env.storage()
+                .persistent()
+                .get(&GrantsDataKey::Rubric(version))
+                .ok_or(GrantsContractError::RubricNotFound)
+        }
+
+        pub fn assign_reviewer(
+            env: Env,
+            governance: Address,
+            reviewer: Address,
+            application_id: u64,
+        ) -> Result<(), GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if !env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::Grant(application_id))
+            {
+                return Err(GrantsContractError::GrantNotFound);
+            }
+            env.storage().persistent().set(
+                &GrantsDataKey::AssignedReviewer(application_id, reviewer.clone()),
+                &true,
+            );
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("assign")),
+                (reviewer, application_id),
+            );
+            Ok(())
+        }
+
+        pub fn recuse_reviewer(
+            env: Env,
+            caller: Address,
+            reviewer: Address,
+            application_id: u64,
+        ) -> Result<(), GrantsContractError> {
+            caller.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if caller != gov && caller != reviewer {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if !env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::Grant(application_id))
+            {
+                return Err(GrantsContractError::GrantNotFound);
+            }
+            env.storage().persistent().set(
+                &GrantsDataKey::RecusedReviewer(application_id, reviewer.clone()),
+                &true,
+            );
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("recuse")),
+                (reviewer, application_id),
+            );
+            Ok(())
+        }
+
+        pub fn configure_trimming(
+            env: Env,
+            governance: Address,
+            program_id: u64,
+            enabled: bool,
+            min_threshold: u32,
+        ) -> Result<(), GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if !env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::Program(program_id))
+            {
+                return Err(GrantsContractError::ProgramNotFound);
+            }
+            let config = TrimmingConfig {
+                enabled,
+                min_threshold,
+            };
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::TrimmingConfig(program_id), &config);
+            Ok(())
+        }
+
+        pub fn set_review_quorum(
+            env: Env,
+            governance: Address,
+            program_id: u64,
+            min_quorum: u32,
+        ) -> Result<(), GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if !env
+                .storage()
+                .persistent()
+                .has(&GrantsDataKey::Program(program_id))
+            {
+                return Err(GrantsContractError::ProgramNotFound);
+            }
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::ReviewQuorum(program_id), &min_quorum);
+            Ok(())
+        }
+
+        pub fn submit_score(
+            env: Env,
+            reviewer: Address,
+            application_id: u64,
+            rubric_version: u32,
+            scores: Vec<u32>,
+        ) -> Result<(), GrantsContractError> {
+            reviewer.require_auth();
+            let grant: GrantRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Grant(application_id))
+                .ok_or(GrantsContractError::GrantNotFound)?;
+
+            if reviewer == grant.recipient {
+                return Err(GrantsContractError::SelfScoringBlocked);
+            }
+
+            let is_recused: bool = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::RecusedReviewer(
+                    application_id,
+                    reviewer.clone(),
+                ))
+                .unwrap_or(false);
+            if is_recused {
+                return Err(GrantsContractError::ReviewerRecused);
+            }
+
+            let is_assigned: bool = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::AssignedReviewer(
+                    application_id,
+                    reviewer.clone(),
+                ))
+                .unwrap_or(false);
+
+            let has_program_review: bool = if let Some(pid) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&GrantsDataKey::GrantProgram(application_id))
+            {
+                env.storage()
+                    .persistent()
+                    .get::<_, ReviewerStake>(&GrantsDataKey::ReviewerStake(reviewer.clone(), pid))
+                    .map(|s| s.active_reviews > 0)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            if !is_assigned && !has_program_review {
+                return Err(GrantsContractError::ReviewerNotAssigned);
+            }
+
+            let rubric: Rubric = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Rubric(rubric_version))
+                .ok_or(GrantsContractError::RubricNotFound)?;
+
+            if scores.len() != rubric.criteria.len() {
+                return Err(GrantsContractError::RubricLengthMismatch);
+            }
+
+            for i in 0..scores.len() {
+                let s = scores.get(i).unwrap_or(0);
+                if s > 100 {
+                    return Err(GrantsContractError::ScoreOutOfBounds);
+                }
+            }
+
+            let eval_key = GrantsDataKey::Evaluation(application_id, reviewer.clone());
+            if env.storage().persistent().has(&eval_key) {
+                return Err(GrantsContractError::DuplicateScore);
+            }
+
+            let mut weighted_sum: u64 = 0;
+            for i in 0..scores.len() {
+                let s = scores.get(i).unwrap_or(0) as u64;
+                let w = rubric.weights_bps.get(i).unwrap_or(0) as u64;
+                weighted_sum = weighted_sum
+                    .checked_add(s * w)
+                    .ok_or(GrantsContractError::InconsistentState)?;
+            }
+            let weighted_score = (weighted_sum / 10_000) as u32;
+
+            let eval_record = ReviewEvaluation {
+                reviewer: reviewer.clone(),
+                application_id,
+                rubric_version,
+                scores,
+                weighted_score,
+                submitted_at: env.ledger().timestamp(),
+            };
+            env.storage().persistent().set(&eval_key, &eval_record);
+
+            let mut eval_list: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::EvaluationList(application_id))
+                .unwrap_or(Vec::new(&env));
+            eval_list.push_back(reviewer.clone());
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::EvaluationList(application_id), &eval_list);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("score_sub")),
+                (reviewer, application_id, rubric_version, weighted_score),
+            );
+            Ok(())
+        }
+
+        pub fn ranked_shortlist(env: Env, round: u64) -> Vec<(u64, u32)> {
+            let next_grant_id: u64 = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::NextGrantId)
+                .unwrap_or(0);
+
+            let min_quorum: u32 = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::ReviewQuorum(round))
+                .unwrap_or(1);
+
+            let trim: TrimmingConfig = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::TrimmingConfig(round))
+                .unwrap_or(TrimmingConfig {
+                    enabled: false,
+                    min_threshold: 0,
+                });
+
+            let mut candidates: std::vec::Vec<(u64, u32, u64)> = std::vec::Vec::new();
+
+            for gid in 0..next_grant_id {
+                let prog_opt: Option<u64> = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::GrantProgram(gid));
+                if prog_opt != Some(round) {
+                    continue;
+                }
+
+                let eval_reviewers: Vec<Address> = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::EvaluationList(gid))
+                    .unwrap_or(Vec::new(&env));
+
+                let mut scores: std::vec::Vec<u32> = std::vec::Vec::new();
+                let mut earliest_sub: u64 = u64::MAX;
+
+                for i in 0..eval_reviewers.len() {
+                    let rev = match eval_reviewers.get(i) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let is_recused: bool = env
+                        .storage()
+                        .persistent()
+                        .get(&GrantsDataKey::RecusedReviewer(gid, rev.clone()))
+                        .unwrap_or(false);
+                    if is_recused {
+                        continue;
+                    }
+                    if let Some(eval) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, ReviewEvaluation>(&GrantsDataKey::Evaluation(gid, rev))
+                    {
+                        scores.push(eval.weighted_score);
+                        if eval.submitted_at < earliest_sub {
+                            earliest_sub = eval.submitted_at;
+                        }
+                    }
+                }
+
+                if (scores.len() as u32) < min_quorum || scores.is_empty() {
+                    continue;
+                }
+                if earliest_sub == u64::MAX {
+                    earliest_sub = 0;
+                }
+
+                if trim.enabled && (scores.len() as u32) > trim.min_threshold && scores.len() >= 3 {
+                    scores.sort();
+                    scores.remove(0);
+                    scores.pop();
+                }
+
+                let agg_score: u32 = scores.iter().sum::<u32>() / (scores.len() as u32);
+                candidates.push((gid, agg_score, earliest_sub));
+            }
+
+            candidates.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("shortlist")),
+                (round, candidates.len() as u32),
+            );
+
+            let mut out = Vec::new(&env);
+            for (id, score, _) in candidates {
+                out.push_back((id, score));
+            }
+            out
+        }
+
+        pub fn finalise_shortlist(
+            env: Env,
+            governance: Address,
+            round: u64,
+        ) -> Result<Vec<(u64, u32)>, GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+
+            let next_grant_id: u64 = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::NextGrantId)
+                .unwrap_or(0);
+            let mut app_count: u32 = 0;
+            for gid in 0..next_grant_id {
+                let prog_opt: Option<u64> = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::GrantProgram(gid));
+                if prog_opt == Some(round) {
+                    app_count += 1;
+                }
+            }
+
+            let list = Self::ranked_shortlist(env, round);
+            if app_count > 0 && list.len() < app_count {
+                return Err(GrantsContractError::QuorumNotMet);
+            }
+            Ok(list)
         }
 
         /// Explicit post-restore consistency check and state integrity verification.
@@ -2850,7 +3956,11 @@ pub mod contract {
 
             // Reconcile all live grants up to next_grant_id
             for gid in 0..next_grant_id {
-                if let Some(grant) = env.storage().persistent().get::<_, GrantRecord>(&GrantsDataKey::Grant(gid)) {
+                if let Some(grant) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, GrantRecord>(&GrantsDataKey::Grant(gid))
+                {
                     if grant.total_amount <= 0 || grant.claimable < 0 {
                         return Err(GrantsContractError::InconsistentState);
                     }
@@ -2858,39 +3968,63 @@ pub mod contract {
                     let mut confirmed_sum: i128 = 0;
                     let mut claimed_sum: i128 = 0;
                     for i in 0..grant.milestones.len() {
-                        let m = grant.milestones.get(i).ok_or(GrantsContractError::InconsistentState)?;
+                        let m = grant
+                            .milestones
+                            .get(i)
+                            .ok_or(GrantsContractError::InconsistentState)?;
                         if m.amount <= 0 {
                             return Err(GrantsContractError::InconsistentState);
                         }
-                        sum = sum.checked_add(m.amount).ok_or(GrantsContractError::InconsistentState)?;
+                        sum = sum
+                            .checked_add(m.amount)
+                            .ok_or(GrantsContractError::InconsistentState)?;
                         if m.confirmed {
-                            confirmed_sum = confirmed_sum.checked_add(m.amount).ok_or(GrantsContractError::InconsistentState)?;
+                            confirmed_sum = confirmed_sum
+                                .checked_add(m.amount)
+                                .ok_or(GrantsContractError::InconsistentState)?;
                         }
                         if m.claimed {
                             if !m.confirmed {
                                 return Err(GrantsContractError::InconsistentState);
                             }
-                            claimed_sum = claimed_sum.checked_add(m.amount).ok_or(GrantsContractError::InconsistentState)?;
+                            claimed_sum = claimed_sum
+                                .checked_add(m.amount)
+                                .ok_or(GrantsContractError::InconsistentState)?;
                         }
                     }
                     if sum != grant.total_amount {
                         return Err(GrantsContractError::InconsistentState);
                     }
-                    let expected_claimable = confirmed_sum.checked_sub(claimed_sum).ok_or(GrantsContractError::InconsistentState)?;
+                    let expected_claimable = confirmed_sum
+                        .checked_sub(claimed_sum)
+                        .ok_or(GrantsContractError::InconsistentState)?;
                     if grant.claimable != expected_claimable {
                         return Err(GrantsContractError::InconsistentState);
                     }
 
-                    if let Some(budget) = env.storage().persistent().get::<_, Vec<BudgetItem>>(&GrantsDataKey::Budget(gid)) {
+                    if let Some(budget) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, Vec<BudgetItem>>(&GrantsDataKey::Budget(gid))
+                    {
                         let mut b_sum: i128 = 0;
                         let mut b_disbursed: i128 = 0;
                         for i in 0..budget.len() {
-                            let item = budget.get(i).ok_or(GrantsContractError::InconsistentState)?;
-                            if item.allocated <= 0 || item.disbursed < 0 || item.disbursed > item.allocated {
+                            let item = budget
+                                .get(i)
+                                .ok_or(GrantsContractError::InconsistentState)?;
+                            if item.allocated <= 0
+                                || item.disbursed < 0
+                                || item.disbursed > item.allocated
+                            {
                                 return Err(GrantsContractError::InconsistentState);
                             }
-                            b_sum = b_sum.checked_add(item.allocated).ok_or(GrantsContractError::InconsistentState)?;
-                            b_disbursed = b_disbursed.checked_add(item.disbursed).ok_or(GrantsContractError::InconsistentState)?;
+                            b_sum = b_sum
+                                .checked_add(item.allocated)
+                                .ok_or(GrantsContractError::InconsistentState)?;
+                            b_disbursed = b_disbursed
+                                .checked_add(item.disbursed)
+                                .ok_or(GrantsContractError::InconsistentState)?;
                         }
                         if b_sum != grant.total_amount || b_disbursed > confirmed_sum {
                             return Err(GrantsContractError::InconsistentState);
@@ -2901,7 +4035,11 @@ pub mod contract {
 
             // Reconcile all live programs up to next_program_id
             for pid in 0..next_program_id {
-                if let Some(prog) = env.storage().persistent().get::<_, ProgramInfo>(&GrantsDataKey::Program(pid)) {
+                if let Some(prog) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, ProgramInfo>(&GrantsDataKey::Program(pid))
+                {
                     if prog.budget <= 0 || prog.committed < 0 || prog.disbursed < 0 {
                         return Err(GrantsContractError::InconsistentState);
                     }
@@ -2920,8 +4058,9 @@ pub use contract::{
     BudgetItem as ContractBudgetItem, GrantContractError, GrantRecord, GrantsContractError,
     GrantsDataKey, LicensingAttestation, MilestoneRecord, ProgramInfo, ProgramRegistry,
     RefractGrantsContract, RefractGrantsContractClient,
-    ReviewerCompensation as ContractReviewerCompensation,
-    ReviewerStake as ContractReviewerStake,
+    ReviewEvaluation as ContractReviewEvaluation,
+    ReviewerCompensation as ContractReviewerCompensation, ReviewerStake as ContractReviewerStake,
+    Rubric as ContractRubric, TrimmingConfig as ContractTrimmingConfig,
 };
 
 #[cfg(test)]
@@ -2945,7 +4084,10 @@ mod tests {
 
         // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -3169,12 +4311,19 @@ mod tests {
         assert_eq!(missing_lic, Err(GrantsError::MissingLicensingAttestation));
 
         // Attest with empty license fails
-        let empty_lic = grants.attest_licensing(RECIPIENT, gid, "".to_string(), criteria_hash, None);
+        let empty_lic =
+            grants.attest_licensing(RECIPIENT, gid, "".to_string(), criteria_hash, None);
         assert_eq!(empty_lic, Err(GrantsError::InvalidLicense));
 
         // Valid attestation
         grants
-            .attest_licensing(RECIPIENT, gid, "MIT".to_string(), criteria_hash, Some(vec![1, 2, 3]))
+            .attest_licensing(
+                RECIPIENT,
+                gid,
+                "MIT".to_string(),
+                criteria_hash,
+                Some(vec![1, 2, 3]),
+            )
             .unwrap();
 
         let att = grants.get_licensing_attestation(gid).unwrap();
@@ -3197,15 +4346,29 @@ mod tests {
     fn test_pure_rust_budget_line_items_lifecycle() {
         let mut grants = contract();
         let budget = vec![
-            BudgetItem { category: "development".to_string(), allocated: 600, disbursed: 0 },
-            BudgetItem { category: "audit".to_string(), allocated: 300, disbursed: 0 },
-            BudgetItem { category: "marketing".to_string(), allocated: 100, disbursed: 0 },
+            BudgetItem {
+                category: "development".to_string(),
+                allocated: 600,
+                disbursed: 0,
+            },
+            BudgetItem {
+                category: "audit".to_string(),
+                allocated: 300,
+                disbursed: 0,
+            },
+            BudgetItem {
+                category: "marketing".to_string(),
+                allocated: 100,
+                disbursed: 0,
+            },
         ];
 
         // 1. Budget sum mismatch rejection
-        let invalid_budget = vec![
-            BudgetItem { category: "development".to_string(), allocated: 500, disbursed: 0 },
-        ];
+        let invalid_budget = vec![BudgetItem {
+            category: "development".to_string(),
+            allocated: 500,
+            disbursed: 0,
+        }];
         let mismatch_err = grants.create_grant_with_budget(
             GOVERNANCE,
             RECIPIENT,
@@ -3217,19 +4380,19 @@ mod tests {
 
         // 2. Successful creation with budget
         let gid = grants
-            .create_grant_with_budget(
-                GOVERNANCE,
-                RECIPIENT,
-                1_000,
-                vec![400, 300, 300],
-                budget,
-            )
+            .create_grant_with_budget(GOVERNANCE, RECIPIENT, 1_000, vec![400, 300, 300], budget)
             .unwrap();
 
         // Check variance initially
-        assert_eq!(grants.get_budget_variance(gid, "development"), Ok((600, 0, 600)));
+        assert_eq!(
+            grants.get_budget_variance(gid, "development"),
+            Ok((600, 0, 600))
+        );
         assert_eq!(grants.get_budget_variance(gid, "audit"), Ok((300, 0, 300)));
-        assert_eq!(grants.get_budget_variance(gid, "marketing"), Ok((100, 0, 100)));
+        assert_eq!(
+            grants.get_budget_variance(gid, "marketing"),
+            Ok((100, 0, 100))
+        );
 
         // Category not found
         assert_eq!(
@@ -3238,8 +4401,13 @@ mod tests {
         );
 
         // 3. Disbursement of milestone 0 (400) under "development" category
-        grants.confirm_milestone_with_category(GOVERNANCE, gid, 0, "development").unwrap();
-        assert_eq!(grants.get_budget_variance(gid, "development"), Ok((600, 400, 200)));
+        grants
+            .confirm_milestone_with_category(GOVERNANCE, gid, 0, "development")
+            .unwrap();
+        assert_eq!(
+            grants.get_budget_variance(gid, "development"),
+            Ok((600, 400, 200))
+        );
 
         // 4. Milestone 1 (300) under non-existent category fails
         assert_eq!(
@@ -3254,7 +4422,9 @@ mod tests {
         );
 
         // 6. Milestone 1 (300) under "audit" category succeeds
-        grants.confirm_milestone_with_category(GOVERNANCE, gid, 1, "audit").unwrap();
+        grants
+            .confirm_milestone_with_category(GOVERNANCE, gid, 1, "audit")
+            .unwrap();
         assert_eq!(grants.get_budget_variance(gid, "audit"), Ok((300, 300, 0)));
 
         // 7. Milestone 2 (300) exceeds "marketing" (allocated 100) -> BudgetCategoryExceeded
@@ -3265,15 +4435,34 @@ mod tests {
 
         // 8. Reconfigure budget with governance approval
         let updated_budget = vec![
-            BudgetItem { category: "development".to_string(), allocated: 400, disbursed: 400 },
-            BudgetItem { category: "audit".to_string(), allocated: 300, disbursed: 300 },
-            BudgetItem { category: "marketing".to_string(), allocated: 300, disbursed: 0 },
+            BudgetItem {
+                category: "development".to_string(),
+                allocated: 400,
+                disbursed: 400,
+            },
+            BudgetItem {
+                category: "audit".to_string(),
+                allocated: 300,
+                disbursed: 300,
+            },
+            BudgetItem {
+                category: "marketing".to_string(),
+                allocated: 300,
+                disbursed: 0,
+            },
         ];
-        grants.configure_budget(GOVERNANCE, gid, updated_budget).unwrap();
+        grants
+            .configure_budget(GOVERNANCE, gid, updated_budget)
+            .unwrap();
 
         // Now milestone 2 under "marketing" succeeds
-        grants.confirm_milestone_with_category(GOVERNANCE, gid, 2, "marketing").unwrap();
-        assert_eq!(grants.get_budget_variance(gid, "marketing"), Ok((300, 300, 0)));
+        grants
+            .confirm_milestone_with_category(GOVERNANCE, gid, 2, "marketing")
+            .unwrap();
+        assert_eq!(
+            grants.get_budget_variance(gid, "marketing"),
+            Ok((300, 300, 0))
+        );
 
         // Integrity verification passes
         assert!(grants.verify_integrity().is_ok());
@@ -3452,7 +4641,9 @@ mod tests {
         );
 
         // Valid slash: slash 300
-        let slashed = grants.slash_reviewer(GOVERNANCE, REVIEWER, pid, 300).unwrap();
+        let slashed = grants
+            .slash_reviewer(GOVERNANCE, REVIEWER, pid, 300)
+            .unwrap();
         assert_eq!(slashed, 300);
 
         let stake = grants.get_reviewer_stake(REVIEWER, pid).unwrap();
@@ -3478,6 +4669,188 @@ mod tests {
         );
 
         // Verify integrity
+        assert!(grants.verify_integrity().is_ok());
+    }
+
+    #[test]
+    fn test_rubric_scoring_and_shortlisting_lifecycle() {
+        let mut grants = contract();
+        const REVIEWER1: Address = 10;
+        const REVIEWER2: Address = 11;
+        const REVIEWER3: Address = 12;
+        const APPLICANT1: Address = 20;
+        const APPLICANT2: Address = 21;
+
+        let pid = grants
+            .create_program(GOVERNANCE, 50_000, [1u8; 32], 0, 10_000)
+            .unwrap();
+        let app1 = grants
+            .apply_for_grant(GOVERNANCE, pid, APPLICANT1, 10_000, vec![10_000], 100)
+            .unwrap();
+        let app2 = grants
+            .apply_for_grant(GOVERNANCE, pid, APPLICANT2, 10_000, vec![10_000], 100)
+            .unwrap();
+
+        // 1. Rubric definition validation
+        let empty_crit: Vec<String> = vec![];
+        let empty_w: Vec<u32> = vec![];
+        assert_eq!(
+            grants.define_rubric_governed(GOVERNANCE, empty_crit, empty_w),
+            Err(GrantsError::InvalidRubricCriteria)
+        );
+
+        let crit = vec!["Feasibility".to_string(), "Impact".to_string()];
+        let bad_w_len = vec![5000];
+        assert_eq!(
+            grants.define_rubric_governed(GOVERNANCE, crit.clone(), bad_w_len),
+            Err(GrantsError::RubricLengthMismatch)
+        );
+
+        let zero_w = vec![0, 10_000];
+        assert_eq!(
+            grants.define_rubric_governed(GOVERNANCE, crit.clone(), zero_w),
+            Err(GrantsError::InvalidRubricWeight)
+        );
+
+        let bad_sum = vec![4000, 5000];
+        assert_eq!(
+            grants.define_rubric_governed(GOVERNANCE, crit.clone(), bad_sum),
+            Err(GrantsError::InvalidRubricSum)
+        );
+
+        // Unauthorized define rubric
+        assert_eq!(
+            grants.define_rubric_governed(STRANGER, crit.clone(), vec![4000, 6000]),
+            Err(GrantsError::Unauthorized)
+        );
+
+        // Success define rubric v1
+        let r_v1 = grants
+            .define_rubric_governed(GOVERNANCE, crit.clone(), vec![4000, 6000])
+            .unwrap();
+        assert_eq!(r_v1, 1);
+        let rubric = grants.get_rubric(r_v1).unwrap();
+        assert_eq!(rubric.version, 1);
+        assert_eq!(rubric.criteria, crit);
+        assert_eq!(rubric.weights_bps, vec![4000, 6000]);
+
+        // 2. Assign & Recuse reviewers
+        assert_eq!(
+            grants.assign_reviewer(STRANGER, REVIEWER1, app1),
+            Err(GrantsError::Unauthorized)
+        );
+        grants.assign_reviewer(GOVERNANCE, REVIEWER1, app1).unwrap();
+        grants.assign_reviewer(GOVERNANCE, REVIEWER2, app1).unwrap();
+        grants.assign_reviewer(GOVERNANCE, REVIEWER3, app1).unwrap();
+        grants
+            .assign_reviewer(GOVERNANCE, APPLICANT1, app1)
+            .unwrap(); // self-applicant assigned
+
+        grants.assign_reviewer(GOVERNANCE, REVIEWER1, app2).unwrap();
+        grants.assign_reviewer(GOVERNANCE, REVIEWER2, app2).unwrap();
+
+        // 3. Submit score validations
+        // Unknown rubric
+        assert_eq!(
+            grants.submit_score(REVIEWER1, app1, 999, vec![80, 90]),
+            Err(GrantsError::RubricNotFound)
+        );
+        // Self scoring blocked
+        assert_eq!(
+            grants.submit_score(APPLICANT1, app1, r_v1, vec![100, 100]),
+            Err(GrantsError::SelfScoringBlocked)
+        );
+        // Reviewer not assigned
+        assert_eq!(
+            grants.submit_score(REVIEWER3, app2, r_v1, vec![80, 90]),
+            Err(GrantsError::ReviewerNotAssigned)
+        );
+        // Score length mismatch
+        assert_eq!(
+            grants.submit_score(REVIEWER1, app1, r_v1, vec![80]),
+            Err(GrantsError::RubricLengthMismatch)
+        );
+        // Score out of bounds (> 100)
+        assert_eq!(
+            grants.submit_score(REVIEWER1, app1, r_v1, vec![80, 101]),
+            Err(GrantsError::ScoreOutOfBounds)
+        );
+
+        // Recusal
+        grants.recuse_reviewer(GOVERNANCE, REVIEWER3, app1).unwrap();
+        assert_eq!(
+            grants.submit_score(REVIEWER3, app1, r_v1, vec![80, 90]),
+            Err(GrantsError::ReviewerRecused)
+        );
+
+        // Valid score submission:
+        // REVIEWER1 scores app1: [80, 90] => (80*4000 + 90*6000)/10000 = (320000 + 540000)/10000 = 86
+        grants
+            .submit_score(REVIEWER1, app1, r_v1, vec![80, 90])
+            .unwrap();
+        let eval = grants.get_evaluation(app1, REVIEWER1).unwrap();
+        assert_eq!(eval.weighted_score, 86);
+
+        // Duplicate score blocked
+        assert_eq!(
+            grants.submit_score(REVIEWER1, app1, r_v1, vec![85, 95]),
+            Err(GrantsError::DuplicateScore)
+        );
+
+        // REVIEWER2 scores app1: [70, 80] => (70*4000 + 80*6000)/10000 = (280000 + 480000)/10000 = 76
+        grants
+            .submit_score(REVIEWER2, app1, r_v1, vec![70, 80])
+            .unwrap();
+
+        // 4. Quorum checking
+        grants.set_review_quorum(GOVERNANCE, pid, 3).unwrap();
+        // app1 has only 2 valid reviews (REVIEWER1, REVIEWER2), quorum is 3 => QuorumNotMet
+        assert_eq!(
+            grants.finalise_shortlist(GOVERNANCE, pid),
+            Err(GrantsError::QuorumNotMet)
+        );
+
+        // Lower quorum to 2
+        grants.set_review_quorum(GOVERNANCE, pid, 2).unwrap();
+
+        // REVIEWER1 and REVIEWER2 score app2:
+        // REVIEWER1 scores app2: [90, 90] => 90
+        grants
+            .submit_score(REVIEWER1, app2, r_v1, vec![90, 90])
+            .unwrap();
+        // REVIEWER2 scores app2: [90, 100] => (90*4000 + 100*6000)/10000 = (360000 + 600000)/10000 = 96
+        grants
+            .submit_score(REVIEWER2, app2, r_v1, vec![90, 100])
+            .unwrap();
+
+        // Shortlist: app2 avg = (90 + 96)/2 = 93; app1 avg = (86 + 76)/2 = 81
+        let shortlist = grants.ranked_shortlist(pid);
+        assert_eq!(shortlist.len(), 2);
+        assert_eq!(shortlist[0], (app2, 93));
+        assert_eq!(shortlist[1], (app1, 81));
+
+        let final_list = grants.finalise_shortlist(GOVERNANCE, pid).unwrap();
+        assert_eq!(final_list, shortlist);
+
+        // 5. Trimming config test
+        // Add a 3rd reviewer for app1
+        const REVIEWER4: Address = 13;
+        grants.assign_reviewer(GOVERNANCE, REVIEWER4, app1).unwrap();
+        // REVIEWER4 scores app1: [100, 100] => 100
+        grants
+            .submit_score(REVIEWER4, app1, r_v1, vec![100, 100])
+            .unwrap();
+        // Scores for app1: [76, 86, 100]
+        // Without trimming: (76 + 86 + 100)/3 = 262/3 = 87
+        let list_no_trim = grants.ranked_shortlist(pid);
+        assert_eq!(list_no_trim[1], (app1, 87));
+
+        // Enable trimming with min_threshold = 2
+        grants.configure_trimming(GOVERNANCE, pid, true, 2).unwrap();
+        // With trimming on 3 scores: lowest (76) and highest (100) dropped => only [86] left => avg = 86
+        let list_trimmed = grants.ranked_shortlist(pid);
+        assert_eq!(list_trimmed[1], (app1, 86));
+
         assert!(grants.verify_integrity().is_ok());
     }
 }
@@ -3513,7 +4886,15 @@ mod soroban_grants_tests {
         assert_eq!(client.get_program_remaining_budget(&pid), 1000);
 
         // 1. Inactive program rejection
-        client.update_program(&gov, &pid, &budget, &criteria, &round_start, &round_end, &false);
+        client.update_program(
+            &gov,
+            &pid,
+            &budget,
+            &criteria,
+            &round_start,
+            &round_end,
+            &false,
+        );
         env.ledger().with_mut(|l| l.timestamp = 1500);
 
         let milestones = Vec::from_array(&env, [300i128, 300i128]);
@@ -3521,7 +4902,15 @@ mod soroban_grants_tests {
         assert_eq!(inactive_err, Err(Ok(GrantsContractError::ProgramInactive)));
 
         // Reactivate
-        client.update_program(&gov, &pid, &budget, &criteria, &round_start, &round_end, &true);
+        client.update_program(
+            &gov,
+            &pid,
+            &budget,
+            &criteria,
+            &round_start,
+            &round_end,
+            &true,
+        );
 
         // 2. Round time boundary rejection
         // Before round
@@ -3541,7 +4930,8 @@ mod soroban_grants_tests {
 
         // 3. Overspend / BudgetExceeded rejection
         let overspend_milestones = Vec::from_array(&env, [500i128]);
-        let overcommit_err = client.try_apply_for_grant(&gov, &pid, &recipient, &500, &overspend_milestones);
+        let overcommit_err =
+            client.try_apply_for_grant(&gov, &pid, &recipient, &500, &overspend_milestones);
         assert_eq!(overcommit_err, Err(Ok(GrantsContractError::BudgetExceeded)));
 
         // Initial remaining budget is 1000 (0 disbursed)
@@ -3554,11 +4944,15 @@ mod soroban_grants_tests {
 
         // Final milestone 1 (300) without licensing attestation must fail
         let missing_lic_err = client.try_confirm_milestone(&gov, &gid, &1);
-        assert_eq!(missing_lic_err, Err(Ok(GrantsContractError::MissingLicensingAttestation)));
+        assert_eq!(
+            missing_lic_err,
+            Err(Ok(GrantsContractError::MissingLicensingAttestation))
+        );
 
         // Attesting with empty license must fail
         let empty_sym = Symbol::new(&env, "");
-        let empty_lic_err = client.try_attest_licensing(&recipient, &gid, &empty_sym, &criteria, &None);
+        let empty_lic_err =
+            client.try_attest_licensing(&recipient, &gid, &empty_sym, &criteria, &None);
         assert_eq!(empty_lic_err, Err(Ok(GrantsContractError::InvalidLicense)));
 
         // Attest with valid SPDX license
@@ -3619,7 +5013,10 @@ mod soroban_grants_tests {
 
         // Final milestone 1 fails before attestation
         let final_err = client.try_release_milestone(&gov, &gid, &1);
-        assert_eq!(final_err, Err(Ok(GrantsContractError::MissingLicensingAttestation)));
+        assert_eq!(
+            final_err,
+            Err(Ok(GrantsContractError::MissingLicensingAttestation))
+        );
 
         // Recipient attests licensing
         client.attest_licensing(
@@ -3652,13 +5049,25 @@ mod soroban_grants_tests {
 
         // Simulate desynchronization: tampering with grant claimable
         env.as_contract(&contract_id, || {
-            let mut g: GrantRecord = env.storage().persistent().get(&GrantsDataKey::Grant(gid)).unwrap();
+            let mut g: GrantRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Grant(gid))
+                .unwrap();
             g.claimable = 999;
-            env.storage().persistent().set(&GrantsDataKey::Grant(gid), &g);
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Grant(gid), &g);
         });
 
-        assert_eq!(client.try_on_restore(), Err(Ok(GrantsContractError::InconsistentState)));
-        assert_eq!(client.try_verify_integrity(), Err(Ok(GrantsContractError::InconsistentState)));
+        assert_eq!(
+            client.try_on_restore(),
+            Err(Ok(GrantsContractError::InconsistentState))
+        );
+        assert_eq!(
+            client.try_verify_integrity(),
+            Err(Ok(GrantsContractError::InconsistentState))
+        );
     }
 
     #[test]
@@ -3669,8 +5078,14 @@ mod soroban_grants_tests {
         let contract_id = env.register_contract(None, RefractGrantsContract);
         let client = RefractGrantsContractClient::new(&env, &contract_id);
 
-        assert_eq!(client.try_on_restore(), Err(Ok(GrantsContractError::StateArchived)));
-        assert_eq!(client.try_verify_integrity(), Err(Ok(GrantsContractError::StateArchived)));
+        assert_eq!(
+            client.try_on_restore(),
+            Err(Ok(GrantsContractError::StateArchived))
+        );
+        assert_eq!(
+            client.try_verify_integrity(),
+            Err(Ok(GrantsContractError::StateArchived))
+        );
     }
 
     #[test]
@@ -3729,23 +5144,15 @@ mod soroban_grants_tests {
             allocated: 400,
             disbursed: 0,
         });
-        let mismatch_err = client.try_create_grant_with_budget(
-            &gov,
-            &recipient,
-            &1000,
-            &milestones,
-            &bad_budget,
+        let mismatch_err =
+            client.try_create_grant_with_budget(&gov, &recipient, &1000, &milestones, &bad_budget);
+        assert_eq!(
+            mismatch_err,
+            Err(Ok(GrantsContractError::MilestoneSumMismatch))
         );
-        assert_eq!(mismatch_err, Err(Ok(GrantsContractError::MilestoneSumMismatch)));
 
         // 2. Successful creation
-        let gid = client.create_grant_with_budget(
-            &gov,
-            &recipient,
-            &1000,
-            &milestones,
-            &budget,
-        );
+        let gid = client.create_grant_with_budget(&gov, &recipient, &1000, &milestones, &budget);
         assert_eq!(gid, 0);
 
         // Check variance initially
@@ -3757,7 +5164,10 @@ mod soroban_grants_tests {
 
         // CategoryNotFound on querying unknown category
         let not_found_err = client.try_get_budget_variance(&gid, &bogus_sym);
-        assert_eq!(not_found_err, Err(Ok(GrantsContractError::CategoryNotFound)));
+        assert_eq!(
+            not_found_err,
+            Err(Ok(GrantsContractError::CategoryNotFound))
+        );
 
         // 3. Confirm milestone 0 (300) under category "dev"
         client.confirm_milestone_with_category(&gov, &gid, &0, &dev_sym);
@@ -3766,15 +5176,25 @@ mod soroban_grants_tests {
 
         // 4. Confirm milestone 1 (400) under category "bogus" -> CategoryNotFound
         let cat_not_found = client.try_confirm_milestone_with_category(&gov, &gid, &1, &bogus_sym);
-        assert_eq!(cat_not_found, Err(Ok(GrantsContractError::CategoryNotFound)));
+        assert_eq!(
+            cat_not_found,
+            Err(Ok(GrantsContractError::CategoryNotFound))
+        );
 
         // 5. Confirm milestone 1 (400) under category "dev" (remaining only 200) -> BudgetCategoryExceeded
         let overspend_err = client.try_confirm_milestone_with_category(&gov, &gid, &1, &dev_sym);
-        assert_eq!(overspend_err, Err(Ok(GrantsContractError::BudgetCategoryExceeded)));
+        assert_eq!(
+            overspend_err,
+            Err(Ok(GrantsContractError::BudgetCategoryExceeded))
+        );
 
         // 6. Confirm milestone 1 (400) under category "audit" (allocated only 300) -> BudgetCategoryExceeded
-        let audit_overspend = client.try_confirm_milestone_with_category(&gov, &gid, &1, &audit_sym);
-        assert_eq!(audit_overspend, Err(Ok(GrantsContractError::BudgetCategoryExceeded)));
+        let audit_overspend =
+            client.try_confirm_milestone_with_category(&gov, &gid, &1, &audit_sym);
+        assert_eq!(
+            audit_overspend,
+            Err(Ok(GrantsContractError::BudgetCategoryExceeded))
+        );
 
         // 7. Reconfigure budget with governance
         let mut reconfigured = Vec::new(&env);
@@ -3838,7 +5258,10 @@ mod soroban_grants_tests {
 
         // Invalid review reward
         let bad_amt_err = client.try_configure_program_review_reward(&gov, &pid, &0);
-        assert_eq!(bad_amt_err, Err(Ok(GrantsContractError::InvalidCompensationAmount)));
+        assert_eq!(
+            bad_amt_err,
+            Err(Ok(GrantsContractError::InvalidCompensationAmount))
+        );
 
         // Create grants
         env.ledger().with_mut(|l| l.timestamp = 1500);
@@ -3864,7 +5287,10 @@ mod soroban_grants_tests {
         assert_eq!(dup_err, Err(Ok(GrantsContractError::DuplicateReviewReward)));
 
         let dup2_err = client.try_accrue_review_reward(&gov, &reviewer2, &gid0);
-        assert_eq!(dup2_err, Err(Ok(GrantsContractError::DuplicateReviewReward)));
+        assert_eq!(
+            dup2_err,
+            Err(Ok(GrantsContractError::DuplicateReviewReward))
+        );
 
         // 4. Accrue second review for reviewer
         let reward1 = client.accrue_review_reward(&gov, &reviewer, &gid1);
@@ -3914,7 +5340,10 @@ mod soroban_grants_tests {
         assert_eq!(bad_stake, Err(Ok(GrantsContractError::InvalidStakeAmount)));
 
         let bad_stake_neg = client.try_stake_for_review(&reviewer, &pid, &-500);
-        assert_eq!(bad_stake_neg, Err(Ok(GrantsContractError::InvalidStakeAmount)));
+        assert_eq!(
+            bad_stake_neg,
+            Err(Ok(GrantsContractError::InvalidStakeAmount))
+        );
 
         let bad_prog = client.try_stake_for_review(&reviewer, &999, &1000);
         assert_eq!(bad_prog, Err(Ok(GrantsContractError::ProgramNotFound)));
@@ -3938,7 +5367,10 @@ mod soroban_grants_tests {
 
         // 4. Invariant: Cannot unstake while active reviews are pending
         let unstk_err = client.try_unstake_review(&reviewer, &pid);
-        assert_eq!(unstk_err, Err(Ok(GrantsContractError::ActiveReviewsPending)));
+        assert_eq!(
+            unstk_err,
+            Err(Ok(GrantsContractError::ActiveReviewsPending))
+        );
 
         // Complete review
         client.complete_review(&gov, &reviewer, &pid);
@@ -3974,10 +5406,172 @@ mod soroban_grants_tests {
         assert!(stake.slashed <= stake.staked);
 
         let no_stake_err = client.try_unstake_review(&reviewer, &pid);
-        assert_eq!(no_stake_err, Err(Ok(GrantsContractError::InsufficientStake)));
+        assert_eq!(
+            no_stake_err,
+            Err(Ok(GrantsContractError::InsufficientStake))
+        );
 
         // Integrity verification succeeds
         assert!(client.verify_integrity());
     }
-}
 
+    #[test]
+    fn test_soroban_rubric_scoring_and_shortlisting() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RefractGrantsContract);
+        let client = RefractGrantsContractClient::new(&env, &contract_id);
+
+        let gov = Address::generate(&env);
+        let applicant1 = Address::generate(&env);
+        let applicant2 = Address::generate(&env);
+        let reviewer1 = Address::generate(&env);
+        let reviewer2 = Address::generate(&env);
+        let reviewer3 = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        client.initialize(&gov);
+
+        let pid = client.create_program(
+            &gov,
+            &100_000,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &0,
+            &100_000,
+        );
+
+        let milestones = Vec::from_array(&env, [1000i128]);
+        let app1 = client.apply_for_grant(&gov, &pid, &applicant1, &1000, &milestones);
+        let app2 = client.apply_for_grant(&gov, &pid, &applicant2, &1000, &milestones);
+
+        // 1. Rubric definition
+        let mut criteria = Vec::new(&env);
+        criteria.push_back(soroban_sdk::String::from_str(&env, "Feasibility"));
+        criteria.push_back(soroban_sdk::String::from_str(&env, "Impact"));
+
+        let mut weights_bps = Vec::new(&env);
+        weights_bps.push_back(4000);
+        weights_bps.push_back(6000);
+
+        // Unauthorized rubric definition
+        let unauth_err = client.try_define_rubric(&stranger, &criteria, &weights_bps);
+        assert_eq!(unauth_err, Err(Ok(GrantsContractError::Unauthorized)));
+
+        // Invalid weights sum
+        let mut bad_weights = Vec::new(&env);
+        bad_weights.push_back(3000);
+        bad_weights.push_back(3000);
+        let bad_sum_err = client.try_define_rubric(&gov, &criteria, &bad_weights);
+        assert_eq!(bad_sum_err, Err(Ok(GrantsContractError::InvalidRubricSum)));
+
+        // Success define rubric v1
+        let r_v1 = client.define_rubric(&gov, &criteria, &weights_bps);
+        assert_eq!(r_v1, 1);
+        let rubric = client.get_rubric(&r_v1);
+        assert_eq!(rubric.version, 1);
+        assert_eq!(rubric.weights_bps.len(), 2);
+
+        // 2. Assign reviewers
+        client.assign_reviewer(&gov, &reviewer1, &app1);
+        client.assign_reviewer(&gov, &reviewer2, &app1);
+        client.assign_reviewer(&gov, &reviewer3, &app1);
+        client.assign_reviewer(&gov, &applicant1, &app1);
+
+        client.assign_reviewer(&gov, &reviewer1, &app2);
+        client.assign_reviewer(&gov, &reviewer2, &app2);
+
+        // 3. Score submissions and validations
+        let mut scores_rev1_app1 = Vec::new(&env);
+        scores_rev1_app1.push_back(80);
+        scores_rev1_app1.push_back(90);
+
+        // Self-scoring blocked
+        let self_err = client.try_submit_score(&applicant1, &app1, &r_v1, &scores_rev1_app1);
+        assert_eq!(self_err, Err(Ok(GrantsContractError::SelfScoringBlocked)));
+
+        // Reviewer not assigned
+        let not_assigned_err = client.try_submit_score(&reviewer3, &app2, &r_v1, &scores_rev1_app1);
+        assert_eq!(
+            not_assigned_err,
+            Err(Ok(GrantsContractError::ReviewerNotAssigned))
+        );
+
+        // Score out of bounds
+        let mut bad_scores = Vec::new(&env);
+        bad_scores.push_back(80);
+        bad_scores.push_back(101);
+        let bounds_err = client.try_submit_score(&reviewer1, &app1, &r_v1, &bad_scores);
+        assert_eq!(bounds_err, Err(Ok(GrantsContractError::ScoreOutOfBounds)));
+
+        // Recusal
+        client.recuse_reviewer(&gov, &reviewer3, &app1);
+        let recused_err = client.try_submit_score(&reviewer3, &app1, &r_v1, &scores_rev1_app1);
+        assert_eq!(recused_err, Err(Ok(GrantsContractError::ReviewerRecused)));
+
+        // Valid score submission
+        // rev1 -> app1: [80, 90] => (80*4000 + 90*6000)/10000 = 86
+        client.submit_score(&reviewer1, &app1, &r_v1, &scores_rev1_app1);
+
+        // Duplicate score blocked
+        let dup_err = client.try_submit_score(&reviewer1, &app1, &r_v1, &scores_rev1_app1);
+        assert_eq!(dup_err, Err(Ok(GrantsContractError::DuplicateScore)));
+
+        // rev2 -> app1: [70, 80] => (70*4000 + 80*6000)/10000 = 76
+        let mut scores_rev2_app1 = Vec::new(&env);
+        scores_rev2_app1.push_back(70);
+        scores_rev2_app1.push_back(80);
+        client.submit_score(&reviewer2, &app1, &r_v1, &scores_rev2_app1);
+
+        // 4. Quorum checking
+        client.set_review_quorum(&gov, &pid, &3);
+        let quorum_err = client.try_finalise_shortlist(&gov, &pid);
+        assert_eq!(quorum_err, Err(Ok(GrantsContractError::QuorumNotMet)));
+
+        // Lower quorum to 2
+        client.set_review_quorum(&gov, &pid, &2);
+
+        // Scores for app2:
+        // rev1 -> app2: [90, 90] => 90
+        let mut scores_rev1_app2 = Vec::new(&env);
+        scores_rev1_app2.push_back(90);
+        scores_rev1_app2.push_back(90);
+        client.submit_score(&reviewer1, &app2, &r_v1, &scores_rev1_app2);
+
+        // rev2 -> app2: [90, 100] => 96
+        let mut scores_rev2_app2 = Vec::new(&env);
+        scores_rev2_app2.push_back(90);
+        scores_rev2_app2.push_back(100);
+        client.submit_score(&reviewer2, &app2, &r_v1, &scores_rev2_app2);
+
+        // Shortlist view & finalisation
+        // app2 avg = 93; app1 avg = 81
+        let shortlist = client.ranked_shortlist(&pid);
+        assert_eq!(shortlist.len(), 2);
+        assert_eq!(shortlist.get(0).unwrap(), (app2, 93));
+        assert_eq!(shortlist.get(1).unwrap(), (app1, 81));
+
+        let finalised = client.finalise_shortlist(&gov, &pid);
+        assert_eq!(finalised, shortlist);
+
+        // 5. Trimming config in Soroban
+        let reviewer4 = Address::generate(&env);
+        client.assign_reviewer(&gov, &reviewer4, &app1);
+        let mut scores_rev4_app1 = Vec::new(&env);
+        scores_rev4_app1.push_back(100);
+        scores_rev4_app1.push_back(100);
+        client.submit_score(&reviewer4, &app1, &r_v1, &scores_rev4_app1);
+
+        // Untrimmed app1 avg: (76 + 86 + 100)/3 = 87
+        let list_no_trim = client.ranked_shortlist(&pid);
+        assert_eq!(list_no_trim.get(1).unwrap(), (app1, 87));
+
+        // Enable trimming with min_threshold = 2
+        client.configure_trimming(&gov, &pid, &true, &2);
+        // Trimmed app1 avg: middle score 86
+        let list_trimmed = client.ranked_shortlist(&pid);
+        assert_eq!(list_trimmed.get(1).unwrap(), (app1, 86));
+
+        assert!(client.verify_integrity());
+    }
+}
