@@ -247,6 +247,18 @@ fn generate_treasury_snapshot() -> String {
                     .get::<_, refract_treasury::KeeperDelegation>(&k)
                     .expect("keeper delegation")
                     .into_val(&env),
+                TreasuryDataKey::ExpectedVersion(_) => env
+                    .storage()
+                    .persistent()
+                    .get::<_, refract_treasury::ContractVersion>(&k)
+                    .expect("expected version")
+                    .into_val(&env),
+                TreasuryDataKey::CounterpartVerified(_) => env
+                    .storage()
+                    .persistent()
+                    .get::<_, bool>(&k)
+                    .expect("counterpart verified")
+                    .into_val(&env),
             };
             out.push_str(&format!("storage[{}].val = {:?}\n", i, v_val));
             out.push_str(&format!(

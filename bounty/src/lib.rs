@@ -43,6 +43,20 @@ pub enum DataKey {
     OutstandingReports(u64),
     /// Configured manager role for a bounty program.
     ProgramManager(u64),
+    /// Expected version for a counterpart contract address.
+    ExpectedVersion(Address),
+    /// Cached verification flag for a counterpart contract address.
+    CounterpartVerified(Address),
+}
+
+/// Semantic contract version and ABI identifier for cross-contract handshake.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub abi_id: Symbol,
 }
 
 /// Immutable, timestamped record that a specific disclosure was rewarded.
@@ -87,6 +101,7 @@ pub enum BountyError {
     ProgramTerminated = 15,
     InvalidProgramStatus = 16,
     OutstandingReportsRemain = 17,
+    InterfaceMismatch = 18,
 }
 
 /// Governance-controlled bug bounty escrow.
@@ -599,6 +614,12 @@ impl RefractBountyEscrow {
             return Err(BountyError::OutstandingReportsRemain);
         }
 
+        // Verify counterpart treasury compatibility if expected version is configured
+        let exp_key = DataKey::ExpectedVersion(treasury.clone());
+        if env.storage().persistent().has(&exp_key) {
+            Self::probe_counterpart(env.clone(), admin.clone(), treasury.clone())?;
+        }
+
         let prog_balance = Self::get_program_balance(&env, program_id);
         if prog_balance > 0 {
             let total_balance = Self::get_balance(&env)?;
@@ -671,7 +692,7 @@ impl RefractBountyEscrow {
             .persistent()
             .get(&DataKey::ProgramManager(program_id));
 
-        let is_authorized = caller == governance || manager_opt.map_or(false, |m| caller == m);
+        let is_authorized = caller == governance || manager_opt.is_some_and(|m| caller == m);
         if !is_authorized {
             return Err(BountyError::Unauthorized);
         }
@@ -723,6 +744,110 @@ impl RefractBountyEscrow {
     /// Query current status of a bounty program (defaults to Active if unconfigured).
     pub fn program_status(env: Env, program_id: u64) -> ProgramStatus {
         Self::get_program_status(&env, program_id)
+    }
+
+    /// Query semantic version of this contract.
+    pub fn version(env: Env) -> ContractVersion {
+        ContractVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+            abi_id: Symbol::new(&env, "bounty"),
+        }
+    }
+
+    /// Set the expected counterpart version for a given contract address.
+    /// Governance/admin only.
+    pub fn set_expected_counterpart_version(
+        env: Env,
+        governance: Address,
+        counterpart: Address,
+        expected: ContractVersion,
+    ) -> Result<(), BountyError> {
+        governance.require_auth();
+        let gov = Self::get_governance(&env)?;
+        if governance != gov {
+            return Err(BountyError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpectedVersion(counterpart.clone()), &expected);
+
+        // Reset verification flag on counterpart reconfiguration
+        env.storage()
+            .persistent()
+            .set(&DataKey::CounterpartVerified(counterpart.clone()), &false);
+
+        env.events().publish(
+            (Symbol::new(&env, "CounterpartConfigured"), counterpart),
+            (expected.major, expected.minor, expected.patch),
+        );
+        Ok(())
+    }
+
+    /// Check whether a counterpart contract has been verified.
+    pub fn is_counterpart_verified(env: Env, counterpart: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CounterpartVerified(counterpart))
+            .unwrap_or(false)
+    }
+
+    /// Probe counterpart contract compatibility.
+    /// Checks cached verification first. If not verified, queries counterpart's `version()` entrypoint.
+    /// Enforces compatibility rule: major == expected.major, (minor, patch) >= (expected.minor, expected.patch).
+    /// If incompatible or probe fails, returns InterfaceMismatch.
+    pub fn probe_counterpart(
+        env: Env,
+        _caller: Address,
+        counterpart: Address,
+    ) -> Result<bool, BountyError> {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::CounterpartVerified(counterpart.clone()))
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+
+        let expected: ContractVersion = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExpectedVersion(counterpart.clone()))
+            .ok_or(BountyError::InterfaceMismatch)?;
+
+        // Probe counterpart version using contract invocation
+        let version_sym = Symbol::new(&env, "version");
+        let remote_version = env.try_invoke_contract::<ContractVersion, soroban_sdk::InvokeError>(
+            &counterpart,
+            &version_sym,
+            soroban_sdk::vec![&env],
+        );
+
+        let actual = match remote_version {
+            Ok(Ok(ver)) => ver,
+            _ => return Err(BountyError::InterfaceMismatch),
+        };
+
+        if actual.major != expected.major {
+            return Err(BountyError::InterfaceMismatch);
+        }
+        if actual.minor < expected.minor
+            || (actual.minor == expected.minor && actual.patch < expected.patch)
+        {
+            return Err(BountyError::InterfaceMismatch);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CounterpartVerified(counterpart.clone()), &true);
+        env.events().publish(
+            (Symbol::new(&env, "CounterpartProbed"), counterpart),
+            (actual.major, actual.minor, actual.patch),
+        );
+        Ok(true)
     }
 
     /// Query number of outstanding reports for a bounty program.
@@ -1240,6 +1365,143 @@ mod test {
         assert_eq!(
             client.try_initiate_wind_down(&governance, &42),
             Err(Ok(BountyError::InvalidProgramStatus))
+        );
+    }
+
+    #[test]
+    fn test_version_handshake_and_compatibility_probe() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let bounty_id = env.register_contract(None, RefractBountyEscrow);
+        let bounty_client = RefractBountyEscrowClient::new(&env, &bounty_id);
+
+        let governance = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+
+        bounty_client.initialize(&governance, &token_id);
+
+        // 1. Check version entrypoint
+        let ver = bounty_client.version();
+        assert_eq!(ver.major, 1);
+        assert_eq!(ver.minor, 0);
+        assert_eq!(ver.patch, 0);
+        assert_eq!(ver.abi_id, Symbol::new(&env, "bounty"));
+
+        // Register a fake counterpart contract that exposes `version() -> ContractVersion`
+        // We can register another instance of RefractBountyEscrow or another contract
+        let counterpart_id = env.register_contract(None, RefractBountyEscrow);
+        let counterpart_client = RefractBountyEscrowClient::new(&env, &counterpart_id);
+        counterpart_client.initialize(&governance, &token_id);
+
+        let stranger = Address::generate(&env);
+
+        // 2. Stranger cannot set expected version
+        assert_eq!(
+            bounty_client.try_set_expected_counterpart_version(
+                &stranger,
+                &counterpart_id,
+                &ContractVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    abi_id: Symbol::new(&env, "bounty"),
+                }
+            ),
+            Err(Ok(BountyError::Unauthorized))
+        );
+
+        // Probe before expected version set returns InterfaceMismatch
+        assert_eq!(
+            bounty_client.try_probe_counterpart(&governance, &counterpart_id),
+            Err(Ok(BountyError::InterfaceMismatch))
+        );
+        assert_eq!(
+            bounty_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+
+        // 3. Expected version compatible (exact match 1.0.0)
+        bounty_client.set_expected_counterpart_version(
+            &governance,
+            &counterpart_id,
+            &ContractVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                abi_id: Symbol::new(&env, "bounty"),
+            },
+        );
+        assert_eq!(
+            bounty_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+
+        let res = bounty_client.probe_counterpart(&governance, &counterpart_id);
+        assert_eq!(res, true);
+        assert_eq!(bounty_client.is_counterpart_verified(&counterpart_id), true);
+
+        // Second probe call returns cached true immediately
+        let res_cached = bounty_client.probe_counterpart(&governance, &counterpart_id);
+        assert_eq!(res_cached, true);
+
+        // 4. Expected version incompatible major (expected 2.0.0, actual 1.0.0)
+        bounty_client.set_expected_counterpart_version(
+            &governance,
+            &counterpart_id,
+            &ContractVersion {
+                major: 2,
+                minor: 0,
+                patch: 0,
+                abi_id: Symbol::new(&env, "bounty"),
+            },
+        );
+        assert_eq!(
+            bounty_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+        assert_eq!(
+            bounty_client.try_probe_counterpart(&governance, &counterpart_id),
+            Err(Ok(BountyError::InterfaceMismatch))
+        );
+        assert_eq!(
+            bounty_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+
+        // 5. Expected version requires newer minor (expected 1.1.0, actual 1.0.0) -> fails
+        bounty_client.set_expected_counterpart_version(
+            &governance,
+            &counterpart_id,
+            &ContractVersion {
+                major: 1,
+                minor: 1,
+                patch: 0,
+                abi_id: Symbol::new(&env, "bounty"),
+            },
+        );
+        assert_eq!(
+            bounty_client.try_probe_counterpart(&governance, &counterpart_id),
+            Err(Ok(BountyError::InterfaceMismatch))
+        );
+
+        // 6. Non-contract address or invalid contract probe returns InterfaceMismatch
+        let invalid_counterpart = Address::generate(&env);
+        bounty_client.set_expected_counterpart_version(
+            &governance,
+            &invalid_counterpart,
+            &ContractVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                abi_id: Symbol::new(&env, "bounty"),
+            },
+        );
+        assert_eq!(
+            bounty_client.try_probe_counterpart(&governance, &invalid_counterpart),
+            Err(Ok(BountyError::InterfaceMismatch))
         );
     }
 }

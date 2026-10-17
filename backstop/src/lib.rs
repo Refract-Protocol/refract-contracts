@@ -6,7 +6,9 @@ pub use normalization::{
     Rounding, PROTOCOL_DECIMALS, PROTOCOL_SCALE,
 };
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+};
 
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
@@ -25,6 +27,17 @@ pub enum BackstopError {
     NormalizationError = 8,
     StateArchived = 9,
     InconsistentState = 10,
+    InterfaceMismatch = 11,
+}
+
+/// Semantic contract version and ABI identifier for cross-contract handshake.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub abi_id: soroban_sdk::Symbol,
 }
 
 #[contracttype]
@@ -268,6 +281,106 @@ impl RefractBackstop {
             .unwrap_or(0)
     }
 
+    /// Query semantic version of this contract.
+    pub fn version(env: Env) -> ContractVersion {
+        ContractVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+            abi_id: soroban_sdk::Symbol::new(&env, "backstop"),
+        }
+    }
+
+    /// Set the expected counterpart version for a given contract address.
+    /// Governance/admin only.
+    pub fn set_expected_counterpart_version(
+        env: Env,
+        governance: Address,
+        counterpart: Address,
+        expected: ContractVersion,
+    ) -> Result<(), BackstopError> {
+        governance.require_auth();
+        let config = Self::get_config(&env)?;
+        if governance != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        let exp_key = ("exp_ver", counterpart.clone());
+        env.storage().persistent().set(&exp_key, &expected);
+
+        // Reset verification flag on counterpart reconfiguration
+        let ver_key = ("ver_ok", counterpart.clone());
+        env.storage().persistent().set(&ver_key, &false);
+
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(&env, "CounterpartConfigured"),
+                counterpart,
+            ),
+            (expected.major, expected.minor, expected.patch),
+        );
+        Ok(())
+    }
+
+    /// Check whether a counterpart contract has been verified.
+    pub fn is_counterpart_verified(env: Env, counterpart: Address) -> bool {
+        let ver_key = ("ver_ok", counterpart);
+        env.storage().persistent().get(&ver_key).unwrap_or(false)
+    }
+
+    /// Probe counterpart contract compatibility.
+    /// Checks cached verification first. If not verified, queries counterpart's `version()` entrypoint.
+    /// Enforces compatibility rule: major == expected.major, (minor, patch) >= (expected.minor, expected.patch).
+    /// If incompatible or probe fails, returns InterfaceMismatch.
+    pub fn probe_counterpart(
+        env: Env,
+        _caller: Address,
+        counterpart: Address,
+    ) -> Result<bool, BackstopError> {
+        let ver_key = ("ver_ok", counterpart.clone());
+        if env.storage().persistent().get(&ver_key).unwrap_or(false) {
+            return Ok(true);
+        }
+
+        let exp_key = ("exp_ver", counterpart.clone());
+        let expected: ContractVersion = env
+            .storage()
+            .persistent()
+            .get(&exp_key)
+            .ok_or(BackstopError::InterfaceMismatch)?;
+
+        // Probe counterpart version using contract client invocation
+        let version_sym = soroban_sdk::Symbol::new(&env, "version");
+        let remote_version = env.try_invoke_contract::<ContractVersion, soroban_sdk::InvokeError>(
+            &counterpart,
+            &version_sym,
+            soroban_sdk::vec![&env],
+        );
+
+        let actual = match remote_version {
+            Ok(Ok(ver)) => ver,
+            _ => return Err(BackstopError::InterfaceMismatch),
+        };
+
+        if actual.major != expected.major {
+            return Err(BackstopError::InterfaceMismatch);
+        }
+        if actual.minor < expected.minor
+            || (actual.minor == expected.minor && actual.patch < expected.patch)
+        {
+            return Err(BackstopError::InterfaceMismatch);
+        }
+
+        env.storage().persistent().set(&ver_key, &true);
+        env.events().publish(
+            (
+                soroban_sdk::Symbol::new(&env, "CounterpartProbed"),
+                counterpart,
+            ),
+            (actual.major, actual.minor, actual.patch),
+        );
+        Ok(true)
+    }
+
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
         Self::get_state(&env)
     }
@@ -296,7 +409,9 @@ impl RefractBackstop {
         }
     }
 
-    fn assert_live_and_consistent(env: &Env) -> Result<(BackstopConfig, BackstopState), BackstopError> {
+    fn assert_live_and_consistent(
+        env: &Env,
+    ) -> Result<(BackstopConfig, BackstopState), BackstopError> {
         if !env.storage().instance().has(&"config") || !env.storage().instance().has(&"state") {
             return Err(BackstopError::StateArchived);
         }
@@ -315,7 +430,8 @@ impl RefractBackstop {
             return Err(BackstopError::InconsistentState);
         }
 
-        let real_balance = token::Client::new(env, &config.token).balance(&env.current_contract_address());
+        let real_balance =
+            token::Client::new(env, &config.token).balance(&env.current_contract_address());
         if real_balance < state.total_capital {
             return Err(BackstopError::InconsistentState);
         }
@@ -359,7 +475,9 @@ mod test {
         let pool = Address::generate(&env);
         let admin = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         client.initialize(&pool, &admin, &token_id, &1000);
@@ -386,7 +504,9 @@ mod test {
         let pool = Address::generate(&env);
         let admin = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         client.initialize(&pool, &admin, &token_id, &1000);
@@ -407,8 +527,14 @@ mod test {
             env.storage().instance().set(&"state", &state);
         });
 
-        assert_eq!(client.try_on_restore(), Err(Ok(BackstopError::InconsistentState)));
-        assert_eq!(client.try_verify_integrity(), Err(Ok(BackstopError::InconsistentState)));
+        assert_eq!(
+            client.try_on_restore(),
+            Err(Ok(BackstopError::InconsistentState))
+        );
+        assert_eq!(
+            client.try_verify_integrity(),
+            Err(Ok(BackstopError::InconsistentState))
+        );
     }
 
     #[test]
@@ -418,9 +544,106 @@ mod test {
         let contract_id = env.register_contract(None, RefractBackstop);
         let client = RefractBackstopClient::new(&env, &contract_id);
 
-        assert_eq!(client.try_on_restore(), Err(Ok(BackstopError::StateArchived)));
+        assert_eq!(
+            client.try_on_restore(),
+            Err(Ok(BackstopError::StateArchived))
+        );
         assert_eq!(client.try_state(), Err(Ok(BackstopError::StateArchived)));
         assert_eq!(client.try_config(), Err(Ok(BackstopError::StateArchived)));
     }
-}
 
+    #[test]
+    fn test_version_handshake_and_compatibility_probe() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let backstop_id = env.register_contract(None, RefractBackstop);
+        let backstop_client = RefractBackstopClient::new(&env, &backstop_id);
+
+        let pool = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+
+        backstop_client.initialize(&pool, &admin, &token_id, &1000);
+
+        // 1. Version entrypoint
+        let ver = backstop_client.version();
+        assert_eq!(ver.major, 1);
+        assert_eq!(ver.minor, 0);
+        assert_eq!(ver.patch, 0);
+        assert_eq!(ver.abi_id, soroban_sdk::Symbol::new(&env, "backstop"));
+
+        let counterpart_id = env.register_contract(None, RefractBackstop);
+        let counterpart_client = RefractBackstopClient::new(&env, &counterpart_id);
+        counterpart_client.initialize(&pool, &admin, &token_id, &1000);
+
+        let stranger = Address::generate(&env);
+
+        // 2. Stranger cannot set expected version
+        assert_eq!(
+            backstop_client.try_set_expected_counterpart_version(
+                &stranger,
+                &counterpart_id,
+                &ContractVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    abi_id: soroban_sdk::Symbol::new(&env, "backstop"),
+                }
+            ),
+            Err(Ok(BackstopError::Unauthorized))
+        );
+
+        // 3. Unconfigured counterpart probe returns InterfaceMismatch
+        assert_eq!(
+            backstop_client.try_probe_counterpart(&admin, &counterpart_id),
+            Err(Ok(BackstopError::InterfaceMismatch))
+        );
+        assert_eq!(
+            backstop_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+
+        // 4. Compatible expected version probe succeeds and caches
+        backstop_client.set_expected_counterpart_version(
+            &admin,
+            &counterpart_id,
+            &ContractVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                abi_id: soroban_sdk::Symbol::new(&env, "backstop"),
+            },
+        );
+        assert_eq!(
+            backstop_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+        assert_eq!(
+            backstop_client.probe_counterpart(&admin, &counterpart_id),
+            true
+        );
+        assert_eq!(
+            backstop_client.is_counterpart_verified(&counterpart_id),
+            true
+        );
+
+        // 5. Incompatible major fails
+        backstop_client.set_expected_counterpart_version(
+            &admin,
+            &counterpart_id,
+            &ContractVersion {
+                major: 2,
+                minor: 0,
+                patch: 0,
+                abi_id: soroban_sdk::Symbol::new(&env, "backstop"),
+            },
+        );
+        assert_eq!(
+            backstop_client.try_probe_counterpart(&admin, &counterpart_id),
+            Err(Ok(BackstopError::InterfaceMismatch))
+        );
+    }
+}

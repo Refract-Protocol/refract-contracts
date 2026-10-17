@@ -144,6 +144,8 @@ pub enum GrantsError {
     BondNotLocked,
     /// Caller is not the applicant authorized to receive the refund.
     NotApplicant,
+    /// Counterpart contract interface mismatch or incompatible version.
+    InterfaceMismatch,
 }
 
 pub type GrantError = GrantsError;
@@ -1822,6 +1824,18 @@ pub mod contract {
         ProgramApplicationList(u64),
         ApplicationBondAmount,
         ApplicationBond(u64),
+        ExpectedVersion(Address),
+        CounterpartVerified(Address),
+    }
+
+    /// Semantic contract versioning metadata for cross-contract compatibility handshake.
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ContractVersion {
+        pub major: u32,
+        pub minor: u32,
+        pub patch: u32,
+        pub abi_id: Symbol,
     }
 
     #[contracttype]
@@ -1967,6 +1981,7 @@ pub mod contract {
         BondNotFound = 44,
         BondNotLocked = 45,
         NotApplicant = 46,
+        InterfaceMismatch = 47,
     }
 
     pub use self::GrantsContractError as GrantContractError;
@@ -4161,7 +4176,7 @@ pub mod contract {
             let gov_opt: Option<Address> = env.storage().instance().get(&GrantsDataKey::Governance);
 
             let is_applicant = caller == bond.applicant;
-            let is_gov = gov_opt.map_or(false, |g| caller == g);
+            let is_gov = gov_opt.is_some_and(|g| caller == g);
 
             if !is_applicant && !is_gov {
                 return Err(GrantsContractError::Unauthorized);
@@ -4357,14 +4372,125 @@ pub mod contract {
 
             Ok((next_grant_id, next_program_id))
         }
+
+        /// Query semantic version of this contract.
+        pub fn version(env: Env) -> ContractVersion {
+            ContractVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                abi_id: Symbol::new(&env, "grants"),
+            }
+        }
+
+        /// Set the expected counterpart version for a given contract address.
+        /// Governance-only.
+        pub fn set_expected_counterpart_version(
+            env: Env,
+            governance: Address,
+            counterpart: Address,
+            expected: ContractVersion,
+        ) -> Result<(), GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+
+            env.storage().persistent().set(
+                &GrantsDataKey::ExpectedVersion(counterpart.clone()),
+                &expected,
+            );
+
+            // Reset verification flag on counterpart reconfiguration
+            env.storage().persistent().set(
+                &GrantsDataKey::CounterpartVerified(counterpart.clone()),
+                &false,
+            );
+
+            env.events().publish(
+                (Symbol::new(&env, "CounterpartConfigured"), counterpart),
+                (expected.major, expected.minor, expected.patch),
+            );
+            Ok(())
+        }
+
+        /// Check whether a counterpart contract has been verified.
+        pub fn is_counterpart_verified(env: Env, counterpart: Address) -> bool {
+            env.storage()
+                .persistent()
+                .get(&GrantsDataKey::CounterpartVerified(counterpart))
+                .unwrap_or(false)
+        }
+
+        /// Probe counterpart contract compatibility.
+        /// Checks cached verification first. If not verified, queries counterpart's `version()` entrypoint.
+        /// Enforces compatibility rule: major == expected.major, (minor, patch) >= (expected.minor, expected.patch).
+        /// If incompatible or probe fails, returns InterfaceMismatch.
+        pub fn probe_counterpart(
+            env: Env,
+            _caller: Address,
+            counterpart: Address,
+        ) -> Result<bool, GrantsContractError> {
+            if env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::CounterpartVerified(counterpart.clone()))
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+
+            let expected: ContractVersion = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::ExpectedVersion(counterpart.clone()))
+                .ok_or(GrantsContractError::InterfaceMismatch)?;
+
+            let version_sym = Symbol::new(&env, "version");
+            let remote_version = env
+                .try_invoke_contract::<ContractVersion, soroban_sdk::InvokeError>(
+                    &counterpart,
+                    &version_sym,
+                    soroban_sdk::vec![&env],
+                );
+
+            let actual = match remote_version {
+                Ok(Ok(ver)) => ver,
+                _ => return Err(GrantsContractError::InterfaceMismatch),
+            };
+
+            if actual.major != expected.major {
+                return Err(GrantsContractError::InterfaceMismatch);
+            }
+            if actual.minor < expected.minor
+                || (actual.minor == expected.minor && actual.patch < expected.patch)
+            {
+                return Err(GrantsContractError::InterfaceMismatch);
+            }
+
+            env.storage().persistent().set(
+                &GrantsDataKey::CounterpartVerified(counterpart.clone()),
+                &true,
+            );
+            env.events().publish(
+                (Symbol::new(&env, "CounterpartProbed"), counterpart),
+                (actual.major, actual.minor, actual.patch),
+            );
+            Ok(true)
+        }
     }
 }
 
 pub use contract::{
-    ApplicationBondRecord, BondStatus, BudgetItem as ContractBudgetItem, GrantContractError,
-    GrantRecord, GrantsContractError, GrantsDataKey, LicensingAttestation, MilestoneRecord,
-    ProgramInfo, ProgramRegistry, RefractGrantsContract, RefractGrantsContractClient,
-    ReviewEvaluation as ContractReviewEvaluation,
+    ApplicationBondRecord, BondStatus, BudgetItem as ContractBudgetItem, ContractVersion,
+    GrantContractError, GrantRecord, GrantsContractError, GrantsDataKey, LicensingAttestation,
+    MilestoneRecord, ProgramInfo, ProgramRegistry, RefractGrantsContract,
+    RefractGrantsContractClient, ReviewEvaluation as ContractReviewEvaluation,
     ReviewerCompensation as ContractReviewerCompensation, ReviewerStake as ContractReviewerStake,
     Rubric as ContractRubric, TrimmingConfig as ContractTrimmingConfig,
 };
@@ -5982,6 +6108,92 @@ mod soroban_grants_tests {
         assert_eq!(
             client.try_forfeit_bond(&gov, &app2, &treasury),
             Err(Ok(GrantsContractError::BondNotLocked))
+        );
+    }
+
+    #[test]
+    fn test_version_handshake_and_compatibility_probe() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let grants_id = env.register_contract(None, RefractGrantsContract);
+        let grants_client = RefractGrantsContractClient::new(&env, &grants_id);
+
+        let gov = Address::generate(&env);
+        grants_client.initialize(&gov);
+
+        // 1. Version entrypoint
+        let ver = grants_client.version();
+        assert_eq!(ver.major, 1);
+        assert_eq!(ver.minor, 0);
+        assert_eq!(ver.patch, 0);
+        assert_eq!(ver.abi_id, Symbol::new(&env, "grants"));
+
+        let counterpart_id = env.register_contract(None, RefractGrantsContract);
+        let counterpart_client = RefractGrantsContractClient::new(&env, &counterpart_id);
+        counterpart_client.initialize(&gov);
+
+        let stranger = Address::generate(&env);
+
+        // 2. Stranger cannot set expected version
+        assert_eq!(
+            grants_client.try_set_expected_counterpart_version(
+                &stranger,
+                &counterpart_id,
+                &ContractVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    abi_id: Symbol::new(&env, "grants"),
+                }
+            ),
+            Err(Ok(GrantsContractError::Unauthorized))
+        );
+
+        // 3. Unconfigured counterpart probe returns InterfaceMismatch
+        assert_eq!(
+            grants_client.try_probe_counterpart(&gov, &counterpart_id),
+            Err(Ok(GrantsContractError::InterfaceMismatch))
+        );
+        assert_eq!(
+            grants_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+
+        // 4. Compatible expected version probe succeeds and caches
+        grants_client.set_expected_counterpart_version(
+            &gov,
+            &counterpart_id,
+            &ContractVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                abi_id: Symbol::new(&env, "grants"),
+            },
+        );
+        assert_eq!(
+            grants_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+        assert_eq!(grants_client.probe_counterpart(&gov, &counterpart_id), true);
+        assert_eq!(grants_client.is_counterpart_verified(&counterpart_id), true);
+
+        // Cached call
+        assert_eq!(grants_client.probe_counterpart(&gov, &counterpart_id), true);
+
+        // 5. Incompatible major fails
+        grants_client.set_expected_counterpart_version(
+            &gov,
+            &counterpart_id,
+            &ContractVersion {
+                major: 2,
+                minor: 0,
+                patch: 0,
+                abi_id: Symbol::new(&env, "grants"),
+            },
+        );
+        assert_eq!(
+            grants_client.try_probe_counterpart(&gov, &counterpart_id),
+            Err(Ok(GrantsContractError::InterfaceMismatch))
         );
     }
 }

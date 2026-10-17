@@ -71,6 +71,18 @@ pub enum DataKey {
     NextWithdrawalId,                  // u64
     Withdrawal(u64),                   // u64 -> WithdrawalRecord
     KeeperDelegation(Address, Symbol), // (keeper, allowed_action) -> KeeperDelegation
+    ExpectedVersion(Address),          // counterpart -> ContractVersion
+    CounterpartVerified(Address),      // counterpart -> bool
+}
+
+/// Semantic contract version and ABI identifier for cross-contract handshake.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub abi_id: Symbol,
 }
 
 #[contracterror]
@@ -98,6 +110,7 @@ pub enum TreasuryError {
     DelegationExpired = 19,
     DelegationRevoked = 20,
     InvalidTtl = 21,
+    InterfaceMismatch = 22,
 }
 
 /// `RefractTreasury` is a token-custody vault with a segregated emergency reserve pool
@@ -858,6 +871,110 @@ impl RefractTreasury {
 
         Ok(())
     }
+
+    /// Query semantic version of this contract.
+    pub fn version(env: Env) -> ContractVersion {
+        ContractVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+            abi_id: Symbol::new(&env, "treasury"),
+        }
+    }
+
+    /// Set the expected counterpart version for a given contract address.
+    /// Governance/admin only.
+    pub fn set_expected_counterpart_version(
+        env: Env,
+        governance: Address,
+        counterpart: Address,
+        expected: ContractVersion,
+    ) -> Result<(), TreasuryError> {
+        governance.require_auth();
+        let admin = Self::admin(env.clone())?;
+        if governance != admin {
+            return Err(TreasuryError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpectedVersion(counterpart.clone()), &expected);
+
+        // Reset verification flag on counterpart reconfiguration
+        env.storage()
+            .persistent()
+            .set(&DataKey::CounterpartVerified(counterpart.clone()), &false);
+
+        env.events().publish(
+            (Symbol::new(&env, "CounterpartConfigured"), counterpart),
+            (expected.major, expected.minor, expected.patch),
+        );
+        Ok(())
+    }
+
+    /// Check whether a counterpart contract has been verified.
+    pub fn is_counterpart_verified(env: Env, counterpart: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CounterpartVerified(counterpart))
+            .unwrap_or(false)
+    }
+
+    /// Probe counterpart contract compatibility.
+    /// Checks cached verification first. If not verified, queries counterpart's `version()` entrypoint.
+    /// Enforces compatibility rule: major == expected.major, (minor, patch) >= (expected.minor, expected.patch).
+    /// If incompatible or probe fails, returns InterfaceMismatch.
+    pub fn probe_counterpart(
+        env: Env,
+        _caller: Address,
+        counterpart: Address,
+    ) -> Result<bool, TreasuryError> {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::CounterpartVerified(counterpart.clone()))
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+
+        let expected: ContractVersion = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExpectedVersion(counterpart.clone()))
+            .ok_or(TreasuryError::InterfaceMismatch)?;
+
+        // Probe counterpart version using contract invocation
+        let version_sym = Symbol::new(&env, "version");
+        let remote_version = env.try_invoke_contract::<ContractVersion, soroban_sdk::InvokeError>(
+            &counterpart,
+            &version_sym,
+            soroban_sdk::vec![&env],
+        );
+
+        let actual = match remote_version {
+            Ok(Ok(ver)) => ver,
+            _ => return Err(TreasuryError::InterfaceMismatch),
+        };
+
+        if actual.major != expected.major {
+            return Err(TreasuryError::InterfaceMismatch);
+        }
+        if actual.minor < expected.minor
+            || (actual.minor == expected.minor && actual.patch < expected.patch)
+        {
+            return Err(TreasuryError::InterfaceMismatch);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CounterpartVerified(counterpart.clone()), &true);
+        env.events().publish(
+            (Symbol::new(&env, "CounterpartProbed"), counterpart),
+            (actual.major, actual.minor, actual.patch),
+        );
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -1532,6 +1649,101 @@ mod test {
         assert_eq!(
             client.try_verify_keeper_delegation(&keeper, &action_extend),
             Err(Ok(TreasuryError::DelegationRevoked))
+        );
+    }
+
+    #[test]
+    fn test_version_handshake_and_compatibility_probe() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let treasury_id = env.register_contract(None, RefractTreasury);
+        let treasury_client = RefractTreasuryClient::new(&env, &treasury_id);
+
+        let admin = Address::generate(&env);
+        treasury_client.initialize(&admin);
+
+        // 1. Version entrypoint
+        let ver = treasury_client.version();
+        assert_eq!(ver.major, 1);
+        assert_eq!(ver.minor, 0);
+        assert_eq!(ver.patch, 0);
+        assert_eq!(ver.abi_id, Symbol::new(&env, "treasury"));
+
+        let counterpart_id = env.register_contract(None, RefractTreasury);
+        let counterpart_client = RefractTreasuryClient::new(&env, &counterpart_id);
+        counterpart_client.initialize(&admin);
+
+        let stranger = Address::generate(&env);
+
+        // 2. Stranger cannot set expected version
+        assert_eq!(
+            treasury_client.try_set_expected_counterpart_version(
+                &stranger,
+                &counterpart_id,
+                &ContractVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                    abi_id: Symbol::new(&env, "treasury"),
+                }
+            ),
+            Err(Ok(TreasuryError::Unauthorized))
+        );
+
+        // 3. Unconfigured counterpart probe returns InterfaceMismatch
+        assert_eq!(
+            treasury_client.try_probe_counterpart(&admin, &counterpart_id),
+            Err(Ok(TreasuryError::InterfaceMismatch))
+        );
+        assert_eq!(
+            treasury_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+
+        // 4. Compatible expected version probe succeeds and caches
+        treasury_client.set_expected_counterpart_version(
+            &admin,
+            &counterpart_id,
+            &ContractVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                abi_id: Symbol::new(&env, "treasury"),
+            },
+        );
+        assert_eq!(
+            treasury_client.is_counterpart_verified(&counterpart_id),
+            false
+        );
+        assert_eq!(
+            treasury_client.probe_counterpart(&admin, &counterpart_id),
+            true
+        );
+        assert_eq!(
+            treasury_client.is_counterpart_verified(&counterpart_id),
+            true
+        );
+
+        // Cached call
+        assert_eq!(
+            treasury_client.probe_counterpart(&admin, &counterpart_id),
+            true
+        );
+
+        // 5. Incompatible major fails
+        treasury_client.set_expected_counterpart_version(
+            &admin,
+            &counterpart_id,
+            &ContractVersion {
+                major: 2,
+                minor: 0,
+                patch: 0,
+                abi_id: Symbol::new(&env, "treasury"),
+            },
+        );
+        assert_eq!(
+            treasury_client.try_probe_counterpart(&admin, &counterpart_id),
+            Err(Ok(TreasuryError::InterfaceMismatch))
         );
     }
 }
