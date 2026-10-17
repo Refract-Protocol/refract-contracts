@@ -1,0 +1,25 @@
+# cargo-mutants configuration for Refract Protocol critical accounting paths (#288).
+# Scopes mutation testing to the four governance-adjacent financial contracts
+# (backstop, bounty, grants, treasury) while excluding test modules and pure getters.
+
+examine_globs = [
+    "backstop/src/**/*.rs",
+    "bounty/src/**/*.rs",
+    "grants/src/**/*.rs",
+    "treasury/src/**/*.rs",
+]
+
+exclude_globs = [
+    "**/tests/**",
+]
+
+exclude_re = [
+    "impl .*::governance",
+    "impl .*::get_grant",
+    "impl .*::config",
+    "impl .*::state",
+]
+
+timeout_multiplier = 3.0
+minimum_test_timeout = 20
+output = "target/mutants"
