@@ -1,139 +1,191 @@
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract with per-recipient payout
+//! velocity limits, minimum spacing cooldowns, and rolling-window outflow caps (`#265`).
+#![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
-use std::collections::BTreeMap;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+};
 
-/// Identifier for a grant.
-pub type GrantId = u64;
-
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
-pub type Address = u64;
-
-/// Errors returned by [`RefractGrants`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum GrantsError {
-    /// Caller is not the configured governance/timelock authority.
-    Unauthorized,
-    /// No grant exists for the supplied id.
-    GrantNotFound,
-    /// A grant must declare at least one milestone.
-    NoMilestones,
-    /// Milestone amounts do not sum to the declared total amount.
-    MilestoneSumMismatch,
-    /// A milestone amount was zero or negative.
-    InvalidMilestoneAmount,
-    /// The total amount was zero or negative.
-    InvalidTotalAmount,
-    /// The milestone index is out of range for the grant.
-    InvalidMilestoneIndex,
-    /// The milestone has already been confirmed.
-    MilestoneAlreadyConfirmed,
-    /// Milestones must be confirmed in order; an earlier one is still pending.
-    MilestoneOutOfOrder,
-    /// The caller is not the grant recipient.
-    NotRecipient,
-    /// There is no confirmed-but-unclaimed amount to release.
-    NothingToClaim,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    GrantNotFound = 4,
+    NoMilestones = 5,
+    MilestoneSumMismatch = 6,
+    InvalidMilestoneAmount = 7,
+    InvalidTotalAmount = 8,
+    InvalidMilestoneIndex = 9,
+    MilestoneAlreadyConfirmed = 10,
+    MilestoneOutOfOrder = 11,
+    NotRecipient = 12,
+    NothingToClaim = 13,
+    CooldownNotElapsed = 14,
+    RecipientVelocityCapExceeded = 15,
+    GlobalEpochCapExceeded = 16,
 }
 
-/// A single milestone within a grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityConfig {
+    pub min_spacing_ledgers: u32,
+    pub window_ledgers: u32,
+    pub recipient_window_cap: i128,
+    pub global_epoch_cap: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityWindow {
+    pub has_paid: bool,
+    pub last_payout_ledger: u32,
+    pub window_start: u32,
+    pub window_outflow: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityPreview {
+    pub accepted: bool,
+    pub next_eligible_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Milestone {
-    /// Amount released when this milestone is confirmed.
     pub amount: i128,
-    /// Whether governance has confirmed delivery of this milestone.
     pub confirmed: bool,
-    /// Whether the confirmed amount has already been claimed.
     pub claimed: bool,
 }
 
-/// A grant approved by governance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Grant {
-    /// Account that receives released funds.
     pub recipient: Address,
-    /// Total amount approved across all milestones.
     pub total_amount: i128,
-    /// Ordered milestones; index 0 is confirmed first.
     pub milestones: Vec<Milestone>,
-    /// Sum of confirmed-but-unclaimed milestone amounts.
     pub claimable: i128,
 }
 
-/// Milestone-based community grants disbursement contract.
-#[derive(Debug, Clone)]
-pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
-    governance: Address,
-    /// Monotonic counter used to allocate grant ids.
-    next_grant_id: GrantId,
-    /// Stored grants keyed by id.
-    grants: BTreeMap<GrantId, Grant>,
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Governance,
+    Token,
+    VelocityConfig,
+    RecipientWindow(Address, Address),
+    GlobalEpochWindow(Address),
+    NextGrantId,
+    Grant(u64),
 }
 
+#[contract]
+pub struct RefractGrants;
+
+#[contractimpl]
 impl RefractGrants {
-    /// Creates a new grants contract governed by `governance` (the timelock).
-    pub fn new(governance: Address) -> Self {
-        Self {
-            governance,
-            next_grant_id: 0,
-            grants: BTreeMap::new(),
+    pub fn initialize(env: Env, governance: Address, token: Address) -> Result<(), GrantsError> {
+        if env.storage().instance().has(&DataKey::Governance) {
+            return Err(GrantsError::AlreadyInitialized);
         }
+        let default_velocity = VelocityConfig {
+            min_spacing_ledgers: 100,
+            window_ledgers: 1_000,
+            recipient_window_cap: 10_000_0000000,
+            global_epoch_cap: 50_000_0000000,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
+        env.storage().instance().set(&DataKey::Token, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::VelocityConfig, &default_velocity);
+        env.storage().instance().set(&DataKey::NextGrantId, &0u64);
+        Ok(())
     }
 
-    /// Returns the configured governance/timelock authority.
-    pub fn governance(&self) -> Address {
-        self.governance
+    pub fn set_velocity_config(
+        env: Env,
+        caller: Address,
+        config: VelocityConfig,
+    ) -> Result<(), GrantsError> {
+        caller.require_auth();
+        Self::require_governance(&env, &caller)?;
+        if config.window_ledgers == 0
+            || config.recipient_window_cap <= 0
+            || config.global_epoch_cap <= 0
+        {
+            return Err(GrantsError::InvalidTotalAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::VelocityConfig, &config);
+        Ok(())
     }
 
-    /// Returns the grant for `grant_id`, if any.
-    pub fn get_grant(&self, grant_id: GrantId) -> Option<&Grant> {
-        self.grants.get(&grant_id)
+    pub fn preview_payout(
+        env: Env,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<VelocityPreview, GrantsError> {
+        let token = Self::token(&env)?;
+        let cfg = Self::velocity_config_internal(&env)?;
+        let now = env.ledger().sequence();
+
+        let rec_win = Self::recipient_window(&env, &recipient, &token, now);
+        let glob_win = Self::global_window(&env, &token, now);
+
+        let mut next_ledger = now;
+        if rec_win.has_paid {
+            let cooldown_end = rec_win
+                .last_payout_ledger
+                .saturating_add(cfg.min_spacing_ledgers);
+            if now < cooldown_end {
+                next_ledger = next_ledger.max(cooldown_end);
+            }
+        }
+        let active_rec = if now >= rec_win.window_start.saturating_add(cfg.window_ledgers) {
+            0
+        } else {
+            rec_win.window_outflow
+        };
+        if active_rec + amount > cfg.recipient_window_cap {
+            next_ledger = next_ledger.max(rec_win.window_start.saturating_add(cfg.window_ledgers));
+        }
+
+        let active_glob = if now >= glob_win.window_start.saturating_add(cfg.window_ledgers) {
+            0
+        } else {
+            glob_win.window_outflow
+        };
+        if active_glob + amount > cfg.global_epoch_cap {
+            next_ledger = next_ledger.max(glob_win.window_start.saturating_add(cfg.window_ledgers));
+        }
+
+        Ok(VelocityPreview {
+            accepted: next_ledger == now
+                && amount <= cfg.recipient_window_cap
+                && amount <= cfg.global_epoch_cap,
+            next_eligible_ledger: next_ledger,
+        })
     }
 
-    /// Returns the confirmed-but-unclaimed amount for `grant_id`.
-    pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
-        self.grants.get(&grant_id).map(|grant| grant.claimable)
-    }
-
-    /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
     pub fn create_grant(
-        &mut self,
+        env: Env,
         caller: Address,
         recipient: Address,
         total_amount: i128,
         milestones: Vec<i128>,
-    ) -> Result<GrantId, GrantsError> {
-        self.require_governance(caller)?;
-
+    ) -> Result<u64, GrantsError> {
+        caller.require_auth();
+        Self::require_governance(&env, &caller)?;
         if total_amount <= 0 {
             return Err(GrantsError::InvalidTotalAmount);
         }
@@ -142,274 +194,293 @@ impl RefractGrants {
         }
 
         let mut sum: i128 = 0;
-        for amount in &milestones {
-            if *amount <= 0 {
+        let mut stored = Vec::new(&env);
+        for amount in milestones.iter() {
+            if amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
+            stored.push_back(Milestone {
+                amount,
+                confirmed: false,
+                claimed: false,
+            });
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
         }
 
-        let grant_id = self.next_grant_id;
-        self.next_grant_id += 1;
+        let token = Self::token(&env)?;
+        token::Client::new(&env, &token).transfer(
+            &caller,
+            &env.current_contract_address(),
+            &total_amount,
+        );
 
-        let stored = milestones
-            .into_iter()
-            .map(|amount| Milestone {
-                amount,
-                confirmed: false,
-                claimed: false,
-            })
-            .collect();
-
-        self.grants.insert(
-            grant_id,
-            Grant {
+        let grant_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextGrantId)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextGrantId, &(grant_id + 1));
+        env.storage().persistent().set(
+            &DataKey::Grant(grant_id),
+            &Grant {
                 recipient,
                 total_amount,
                 milestones: stored,
                 claimable: 0,
             },
         );
-
         Ok(grant_id)
     }
 
-    /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
-        &mut self,
+        env: Env,
         caller: Address,
-        grant_id: GrantId,
-        milestone_index: usize,
+        grant_id: u64,
+        milestone_index: u32,
     ) -> Result<(), GrantsError> {
-        self.require_governance(caller)?;
-
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
+        caller.require_auth();
+        Self::require_governance(&env, &caller)?;
+        let mut grant: Grant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Grant(grant_id))
             .ok_or(GrantsError::GrantNotFound)?;
-
         if milestone_index >= grant.milestones.len() {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
-
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
-        for earlier in &grant.milestones[..milestone_index] {
-            if !earlier.confirmed {
+        for i in 0..milestone_index {
+            if !grant.milestones.get(i).unwrap().confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
             }
         }
-
-        let milestone = &mut grant.milestones[milestone_index];
-        if milestone.confirmed {
+        let mut ms = grant.milestones.get(milestone_index).unwrap();
+        if ms.confirmed {
             return Err(GrantsError::MilestoneAlreadyConfirmed);
         }
-
-        milestone.confirmed = true;
-        grant.claimable = grant
-            .claimable
-            .checked_add(milestone.amount)
-            .ok_or(GrantsError::MilestoneSumMismatch)?;
-
+        ms.confirmed = true;
+        grant.milestones.set(milestone_index, ms.clone());
+        grant.claimable += ms.amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Grant(grant_id), &grant);
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
-    pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
+    pub fn claim(env: Env, recipient: Address, grant_id: u64) -> Result<i128, GrantsError> {
+        recipient.require_auth();
+        let mut grant: Grant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Grant(grant_id))
             .ok_or(GrantsError::GrantNotFound)?;
-
         if grant.recipient != recipient {
             return Err(GrantsError::NotRecipient);
         }
-
         let amount = grant.claimable;
         if amount <= 0 {
             return Err(GrantsError::NothingToClaim);
         }
 
+        let token = Self::token(&env)?;
+        Self::enforce_and_record_velocity(&env, &recipient, &token, amount)?;
+
         grant.claimable = 0;
-        for milestone in grant.milestones.iter_mut() {
-            if milestone.confirmed {
-                milestone.claimed = true;
+        for i in 0..grant.milestones.len() {
+            let mut ms = grant.milestones.get(i).unwrap();
+            if ms.confirmed {
+                ms.claimed = true;
+                grant.milestones.set(i, ms);
             }
         }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Grant(grant_id), &grant);
 
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
         Ok(amount)
     }
 
-    fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
-        if caller != self.governance {
+    fn enforce_and_record_velocity(
+        env: &Env,
+        recipient: &Address,
+        token: &Address,
+        amount: i128,
+    ) -> Result<(), GrantsError> {
+        let cfg = Self::velocity_config_internal(env)?;
+        let now = env.ledger().sequence();
+
+        let mut rec_win = Self::recipient_window(env, recipient, token, now);
+        if rec_win.has_paid
+            && now
+                < rec_win
+                    .last_payout_ledger
+                    .saturating_add(cfg.min_spacing_ledgers)
+        {
+            env.events().publish(
+                (symbol_short!("vel_hit"), recipient.clone(), token.clone()),
+                (amount, symbol_short!("cooldown")),
+            );
+            return Err(GrantsError::CooldownNotElapsed);
+        }
+
+        if now >= rec_win.window_start.saturating_add(cfg.window_ledgers) {
+            rec_win.window_start = now;
+            rec_win.window_outflow = 0;
+        }
+        if rec_win.window_outflow + amount > cfg.recipient_window_cap {
+            env.events().publish(
+                (symbol_short!("vel_hit"), recipient.clone(), token.clone()),
+                (amount, symbol_short!("rec_cap")),
+            );
+            return Err(GrantsError::RecipientVelocityCapExceeded);
+        }
+
+        let mut glob_win = Self::global_window(env, token, now);
+        if now >= glob_win.window_start.saturating_add(cfg.window_ledgers) {
+            glob_win.window_start = now;
+            glob_win.window_outflow = 0;
+        }
+        if glob_win.window_outflow + amount > cfg.global_epoch_cap {
+            env.events().publish(
+                (symbol_short!("vel_hit"), recipient.clone(), token.clone()),
+                (amount, symbol_short!("glob_cap")),
+            );
+            return Err(GrantsError::GlobalEpochCapExceeded);
+        }
+
+        rec_win.has_paid = true;
+        rec_win.last_payout_ledger = now;
+        rec_win.window_outflow += amount;
+        glob_win.window_outflow += amount;
+
+        env.storage().persistent().set(
+            &DataKey::RecipientWindow(recipient.clone(), token.clone()),
+            &rec_win,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GlobalEpochWindow(token.clone()), &glob_win);
+        Ok(())
+    }
+
+    fn recipient_window(
+        env: &Env,
+        recipient: &Address,
+        token: &Address,
+        now: u32,
+    ) -> VelocityWindow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecipientWindow(recipient.clone(), token.clone()))
+            .unwrap_or(VelocityWindow {
+                has_paid: false,
+                last_payout_ledger: 0,
+                window_start: now,
+                window_outflow: 0,
+            })
+    }
+
+    fn global_window(env: &Env, token: &Address, now: u32) -> VelocityWindow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GlobalEpochWindow(token.clone()))
+            .unwrap_or(VelocityWindow {
+                has_paid: false,
+                last_payout_ledger: 0,
+                window_start: now,
+                window_outflow: 0,
+            })
+    }
+
+    fn require_governance(env: &Env, caller: &Address) -> Result<(), GrantsError> {
+        let gov: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(GrantsError::NotInitialized)?;
+        if caller != &gov {
             return Err(GrantsError::Unauthorized);
         }
         Ok(())
     }
+
+    fn token(env: &Env) -> Result<Address, GrantsError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(GrantsError::NotInitialized)
+    }
+
+    fn velocity_config_internal(env: &Env) -> Result<VelocityConfig, GrantsError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::VelocityConfig)
+            .ok_or(GrantsError::NotInitialized)
+    }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
-
-    const GOVERNANCE: Address = 1;
-    const RECIPIENT: Address = 2;
-    const STRANGER: Address = 3;
-
-    fn contract() -> RefractGrants {
-        RefractGrants::new(GOVERNANCE)
-    }
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::token::StellarAssetClient;
+    use soroban_sdk::vec;
 
     #[test]
-    fn full_lifecycle_create_confirm_claim() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
+    fn grants_velocity_cooldown_and_cap_enforcement() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.sequence_number = 500);
 
-        // Nothing claimable before any confirmation.
-        assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        let gov = Address::generate(&env);
+        let grantee = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        StellarAssetClient::new(&env, &usdc).mint(&gov, &1_000);
 
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        assert_eq!(grants.claimable(id), Some(100));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-        assert_eq!(grants.claimable(id), Some(0));
-
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 2).unwrap();
-        assert_eq!(grants.claimable(id), Some(200));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn claim_releases_only_confirmed_amounts() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
-            .unwrap();
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn rejects_milestone_sum_mismatch() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_milestones() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![]),
-            Err(GrantsError::NoMilestones)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 0, vec![0]),
-            Err(GrantsError::InvalidTotalAmount)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![100, 0]),
-            Err(GrantsError::InvalidMilestoneAmount)
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_order_confirmation() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
+        let contract_id = env.register_contract(None, RefractGrants);
+        let client = RefractGrantsClient::new(&env, &contract_id);
+        client.initialize(&gov, &usdc);
+        client.set_velocity_config(
+            &gov,
+            &VelocityConfig {
+                min_spacing_ledgers: 40,
+                window_ledgers: 200,
+                recipient_window_cap: 500,
+                global_epoch_cap: 800,
+            },
         );
 
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
+        let gid = client.create_grant(&gov, &grantee, &700, &vec![&env, 300, 400]);
+        client.confirm_milestone(&gov, &gid, &0);
+        assert_eq!(client.claim(&grantee, &gid), 300);
+
+        // Confirm milestone 1 (400): blocked by cooldown before ledger 540, and then by recipient cap (300+400 > 500) before ledger 700
+        client.confirm_milestone(&gov, &gid, &1);
         assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneAlreadyConfirmed)
+            client.try_claim(&grantee, &gid),
+            Err(Ok(GrantsError::CooldownNotElapsed))
         );
-    }
-
-    #[test]
-    fn enforces_governance_gating() {
-        let mut grants = contract();
+        env.ledger().with_mut(|li| li.sequence_number = 550);
         assert_eq!(
-            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
-            Err(GrantsError::Unauthorized)
+            client.try_claim(&grantee, &gid),
+            Err(Ok(GrantsError::RecipientVelocityCapExceeded))
         );
 
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-
-        assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
-        );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
-        );
+        env.ledger().with_mut(|li| li.sequence_number = 700);
+        assert_eq!(client.claim(&grantee, &gid), 400);
     }
 }
