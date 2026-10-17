@@ -1,9 +1,17 @@
 #![no_std]
+#![allow(
+    unexpected_cfgs,
+    clippy::disallowed_methods,
+    clippy::inconsistent_digit_grouping,
+    clippy::too_many_arguments
+)]
 
+pub mod kani_proofs;
+
+use kani_proofs::{
+    pure_accrue_premium, pure_apply_haircut, pure_calc_shares, pure_quote_withdrawal, BPS_DENOM,
+};
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
-
-/// Basis-point denominator used for premium-share configuration.
-const BPS_DENOM: i128 = 10_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -78,13 +86,11 @@ impl RefractBackstop {
     /// `staker`, mirroring `RefractPool`'s share-accounting pattern.
     pub fn deposit(env: Env, staker: Address, amount: i128) -> Result<i128, BackstopError> {
         staker.require_auth();
-        if amount <= 0 {
-            return Err(BackstopError::InvalidAmount);
-        }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
-        let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
+        let shares = pure_calc_shares(amount, state.total_shares, state.total_capital)
+            .ok_or(BackstopError::InvalidAmount)?;
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
@@ -95,7 +101,7 @@ impl RefractBackstop {
             &amount,
         );
 
-        let key = ("shares", staker.clone());
+        let key = ("shares", staker);
         let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(prev + shares));
 
@@ -112,8 +118,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -121,7 +127,8 @@ impl RefractBackstop {
             return Err(BackstopError::InsufficientShares);
         }
 
-        let amount = Self::quote_withdrawal(shares, state.total_shares, state.total_capital);
+        let amount = pure_quote_withdrawal(shares, state.total_shares, state.total_capital)
+            .ok_or(BackstopError::InvalidAmount)?;
         if amount > state.total_capital {
             return Err(BackstopError::InsufficientCapital);
         }
@@ -143,31 +150,20 @@ impl RefractBackstop {
     }
 
     /// Drain up to `amount` of backstop capital to cover a claim shortfall.
-    /// Callable only by the configured `RefractPool` (or its admin/timelock).
-    /// Returns the amount actually covered. Draining reduces `total_capital`
-    /// without burning shares, so every staker's share price drops
-    /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::read_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
-        if amount <= 0 {
-            return Err(BackstopError::InvalidAmount);
-        }
-
-        let mut state = Self::state(&env)?;
-        let covered = if amount > state.total_capital {
-            state.total_capital
-        } else {
-            amount
-        };
+        let mut state = Self::read_state(&env)?;
+        let (covered, remaining) =
+            pure_apply_haircut(amount, state.total_capital).ok_or(BackstopError::InvalidAmount)?;
         if covered <= 0 {
             return Ok(0);
         }
 
-        state.total_capital -= covered;
+        state.total_capital = remaining;
         env.storage().instance().set(&"state", &state);
 
         token::Client::new(&env, &config.token).transfer(
@@ -179,19 +175,16 @@ impl RefractBackstop {
         Ok(covered)
     }
 
-    /// Route a slice of premium income to backstop stakers. The premium share
-    /// is configured in basis points; the remainder is left for the caller
-    /// (e.g. the treasury fee-switch) to distribute.
+    /// Route a slice of premium income to backstop stakers.
     pub fn receive_premium(env: Env, amount: i128) -> Result<i128, BackstopError> {
-        if amount <= 0 {
-            return Err(BackstopError::InvalidAmount);
-        }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
-        let cut = amount * config.premium_share_bps / BPS_DENOM;
+        let (cut, new_capital) =
+            pure_accrue_premium(amount, config.premium_share_bps, state.total_capital)
+                .ok_or(BackstopError::InvalidAmount)?;
         state.premium_income += cut;
-        state.total_capital += cut;
+        state.total_capital = new_capital;
         env.storage().instance().set(&"state", &state);
 
         Ok(cut)
@@ -205,44 +198,68 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::read_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::read_config(&env)
     }
 
-    /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
-    /// subsequent depositors get shares proportional to the current share price.
-    fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
-        if total_shares == 0 || total_capital == 0 {
-            amount
-        } else {
-            amount * total_shares / total_capital
-        }
-    }
-
-    /// Mirror of `RefractPool::_quote_withdrawal`: value of `shares` at the
-    /// current share price.
-    fn quote_withdrawal(shares: i128, total_shares: i128, total_capital: i128) -> i128 {
-        if total_shares == 0 {
-            0
-        } else {
-            shares * total_capital / total_shares
-        }
-    }
-
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn read_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn read_state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::kani_proofs::*;
+    use super::*;
+
+    #[test]
+    fn pure_accounting_cores_preserve_share_conservation_and_treasury_budget_invariants() {
+        for total_shares in [100_i128, 1_000, 10_000] {
+            for total_capital in [100_i128, 1_250, 15_000] {
+                for deposit in [10_i128, 333, 5_000] {
+                    let minted = pure_calc_shares(deposit, total_shares, total_capital).unwrap();
+                    if minted > 0 {
+                        let new_shares = total_shares + minted;
+                        let new_capital = total_capital + deposit;
+                        let redeemed =
+                            pure_quote_withdrawal(minted, new_shares, new_capital).unwrap();
+                        assert!(redeemed <= deposit);
+                        assert!(new_capital - redeemed >= total_capital);
+                    }
+                }
+            }
+        }
+
+        // Share price monotonicity under premium accrual
+        let (cut, new_cap) = pure_accrue_premium(5_000, 2_500, 10_000).unwrap();
+        assert_eq!(cut, 1_250);
+        assert_eq!(new_cap, 11_250);
+
+        // Haircut conservation
+        let (covered, rem) = pure_apply_haircut(4_000, 10_000).unwrap();
+        assert_eq!(covered + rem, 10_000);
+        let (capped_cov, capped_rem) = pure_apply_haircut(25_000, 10_000).unwrap();
+        assert_eq!(capped_cov, 10_000);
+        assert_eq!(capped_rem, 0);
+
+        // Treasury budget invariant: allocations never exceed held balance
+        assert_eq!(
+            pure_allocate_treasury_budget(10_000, 6_000, 4_000),
+            Some(10_000)
+        );
+        assert_eq!(pure_allocate_treasury_budget(10_000, 6_000, 4_001), None);
     }
 }
