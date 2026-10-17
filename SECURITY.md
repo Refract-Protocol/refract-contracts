@@ -32,6 +32,14 @@ We aim to acknowledge reports within **72 hours** and to provide a remediation
 timeline after triage. We will credit reporters who wish to be named once a fix
 ships.
 
+### On-chain bug bounty escrow (`bounty/`)
+
+Verified vulnerability disclosures are rewarded through [`RefractBountyEscrow`](./bounty/src/lib.rs):
+
+- **Off-chain confidentiality, on-chain commitment.** Vulnerability details and proof-of-concept material stay strictly off-chain (submitted via `security@refract.example`). On-chain, `RefractBountyEscrow::award(caller, researcher, amount, report_hash)` records only an immutable 32-byte `report_hash` commitment (`BytesN<32>`, typically the SHA-256 digest of the canonical triage report) alongside the `researcher` address, `amount`, and ledger `timestamp` (`AwardRecord`).
+- **Governance/timelock-gated payouts.** Anyone (including [`RefractTreasury`](./treasury/src/lib.rs)) can top up the reward pool via `fund(from, amount)`, but only the configured `governance` (`RefractTimelock`) address can authorize payouts via `award`. There is deliberately no single admin EOA with payout authority so a compromised admin key cannot drain the bounty pool.
+- **Replay protection.** Each `report_hash` can be rewarded at most once; attempting to award the same commitment twice fails with `BountyError::DuplicateReport`. See [`docs/deployment-order.md`](./docs/deployment-order.md) for how `RefractBountyEscrow` is initialized and wired to `RefractTimelock`.
+
 ## Scope
 
 In scope: the smart contracts, the backend services, and the web app in the

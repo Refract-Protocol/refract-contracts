@@ -14,9 +14,18 @@ This repository holds the three on-chain contracts that make up Refract's settle
 
 | Crate | Contract | Responsibility |
 |---|---|---|
-| `pool/` | `RefractPool` | Holds USDC risk capital, prices & sells policies, settles claims against oracle data |
-| `policy/` | `RefractPolicyRegistry` | Queryable on-chain index of policies per holder (sidecar to the pool) |
-| `oracle/` | `RefractOracle` | Permissioned price/event feed with staleness enforcement and trigger evaluation |
+| [`pool/`](./pool) | `RefractPool` | Holds USDC risk capital, prices & sells policies, settles claims against oracle data |
+| [`policy/`](./policy) | `RefractPolicyRegistry` | Queryable on-chain index of policies per holder (sidecar to the pool) |
+| [`oracle/`](./oracle) | `RefractOracle` | Permissioned price/event feed with staleness enforcement and trigger evaluation |
+| [`backstop/`](./backstop) | `RefractBackstop` | Second-loss capital tranche that receives a configurable share of premiums and covers pool claim shortfalls |
+| [`bounty/`](./bounty) | `RefractBountyEscrow` | Governance/timelock-gated bug bounty escrow storing immutable `report_hash` disclosure commitments |
+| [`grants/`](./grants) | `RefractGrants` | Milestone-based community grants disbursement contract with ordered milestone confirmation |
+| [`treasury/`](./treasury) | `RefractTreasury` | Minimal admin/timelock-gated protocol treasury vault for fee custody and disbursements |
+| [`timelock/`](./timelock) | `RefractTimelock` | Delay-enforced governance execution controller for privileged protocol entrypoints |
+| [`governance/`](./governance) | `RefractGovernance` | Proposal lifecycle and vote tallying contract wired to `RefractVeToken` and `RefractTimelock` |
+| [`vetoken/`](./vetoken) | `RefractVeToken` | Vote-escrowed token locking and voting-power accounting |
+| [`multisig/`](./multisig) | `RefractMultisig` | M-of-N multisig controller for guardian or bootstrap administration |
+| [`incident_response/`](./incident_response) | `RefractIncidentResponse` | Emergency incident coordination and recovery state tracking |
 
 All amounts use **1e7 fixed-point** (the Stellar USDC convention). The contracts are `#![no_std]` and never touch floating point.
 
@@ -90,27 +99,49 @@ If you rebuild the same commit with the same toolchain (see `toolchain.rustc` in
   ]
 }
 ```
-```
 
 ## Deploy (testnet)
 
-Deploy in dependency order — the oracle first, then the pool, then the registry:
+Deploy and initialize contracts in dependency order so that every downstream initializer receives already-deployed contract addresses (see [`docs/deployment-order.md`](./docs/deployment-order.md) for the complete wiring sequence and address-configuration matrix):
 
-```bash
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/refract_oracle.wasm \
-  --source alice --network testnet
+1. **Settlement Token & Governance Root** — Resolve or deploy the settlement token (USDC SAC) and deploy `RefractTimelock` (plus `RefractVeToken`, `RefractGovernance`, and `RefractMultisig` if using full DAO governance).
+2. **Core Insurance Layer** — Deploy `RefractOracle`, then `RefractPool`, then `RefractPolicyRegistry`:
+   ```bash
+   stellar contract deploy \
+     --wasm target/wasm32-unknown-unknown/release/refract_oracle.wasm \
+     --source alice --network testnet
 
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/refract_pool.wasm \
-  --source alice --network testnet
+   stellar contract deploy \
+     --wasm target/wasm32-unknown-unknown/release/refract_pool.wasm \
+     --source alice --network testnet
 
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/refract_policy.wasm \
-  --source alice --network testnet
-```
+   stellar contract deploy \
+     --wasm target/wasm32-unknown-unknown/release/refract_policy.wasm \
+     --source alice --network testnet
+   ```
+   Initialize each core contract (`admin`/`timelock`, USDC token address, and `pool` ↔ `policy` / `oracle` cross-contract wiring).
+3. **Governance-Adjacent Vaults & Programs** — Deploy and initialize the four governance-adjacent contracts once the token, `RefractPool`, and `RefractTimelock` addresses are known:
+   ```bash
+   stellar contract deploy \
+     --wasm target/wasm32-unknown-unknown/release/refract_treasury.wasm \
+     --source alice --network testnet
 
-Then `initialize` each contract (admin, USDC token address, and pool↔registry wiring).
+   stellar contract deploy \
+     --wasm target/wasm32-unknown-unknown/release/refract_backstop.wasm \
+     --source alice --network testnet
+
+   stellar contract deploy \
+     --wasm target/wasm32-unknown-unknown/release/refract_bounty.wasm \
+     --source alice --network testnet
+
+   stellar contract deploy \
+     --wasm target/wasm32-unknown-unknown/release/refract_grants.wasm \
+     --source alice --network testnet
+   ```
+   - `RefractTreasury::initialize(admin)` — set `admin` to the `RefractTimelock` address.
+   - `RefractBackstop::initialize(pool, admin, token, premium_share_bps)` — wire `pool` to `RefractPool`, `admin` to `RefractTimelock`, and `token` to USDC.
+   - `RefractBountyEscrow::initialize(governance, token)` — wire `governance` to `RefractTimelock` and `token` to USDC.
+   - `RefractGrants::new(governance)` — wire `governance` to `RefractTimelock`.
 
 ## Authorization model
 
@@ -119,6 +150,10 @@ Then `initialize` each contract (admin, USDC token address, and pool↔registry 
 - **RefractPool guardian (fast-path pause)** — the pool stores a `Guardian` address, distinct from the admin/timelock. The guardian's *only* power is to trigger the emergency pause instantly: `set_paused(true)` accepts either the admin/timelock **or** the guardian, with no timelock delay. Unpausing (`set_paused(false)`) is **admin/timelock-only** — a guardian can freeze the protocol fast but cannot unilaterally resume it, so a compromised guardian key is never worse than having none. The guardian role itself is settable/removable **only** through the full governance/timelock (admin) path; a guardian can never grant itself the role or extend its own term. Guardian powers do not extend to any other admin action (e.g. the oracle circuit-breaker clear stays admin/timelock-gated).
 - **RefractOracle** — only registered relayers (or the admin) may `submit`; readings older than 30 minutes are rejected. Consecutive submissions from the same (relayer, feed) pair within 60 seconds are rejected with `SubmittedTooSoon`. `set_feed_metadata` and `update_reputation` are admin-only.
 - **RefractPolicyRegistry** — only the registered pool contract or the admin may `register_policy` / `deactivate_policy`.
+- **RefractBackstop** — `deposit` and `withdraw` require the staker's auth. `cover_shortfall(caller, amount)` requires `caller.require_auth()` and is restricted strictly to the configured `RefractPool` address or `admin` (`RefractTimelock`).
+- **RefractBountyEscrow** — `fund(from, amount)` is permissionless (requires `from.require_auth()`). `award(caller, researcher, amount, report_hash)` is gated strictly by the `governance` (`RefractTimelock`) address; there is no single admin key with payout authority, and duplicate `report_hash` commitments are rejected with `BountyError::DuplicateReport`.
+- **RefractGrants** — `create_grant` and `confirm_milestone` are restricted to the `governance` (`RefractTimelock`) authority, with milestones confirmed strictly in order. `claim(recipient, grant_id)` is permissionless for the designated grant `recipient` and releases only confirmed-but-unclaimed milestone amounts.
+- **RefractTreasury** — token deposits occur via standard token transfers to the treasury address; `withdraw(caller, token, amount, to)` requires `caller.require_auth()` and is restricted strictly to the configured `admin` (`RefractTimelock`).
 
 ## Oracle API
 
