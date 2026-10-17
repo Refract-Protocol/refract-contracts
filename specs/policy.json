@@ -1,0 +1,361 @@
+{
+  "contract": "policy",
+  "enums": [
+    {
+      "name": "CoverageType",
+      "variants": [
+        {
+          "discriminant": 0,
+          "name": "StablecoinDepeg"
+        },
+        {
+          "discriminant": 1,
+          "name": "MarketCrash"
+        },
+        {
+          "discriminant": 2,
+          "name": "LiquidationShield"
+        },
+        {
+          "discriminant": 3,
+          "name": "SmartContractRisk"
+        },
+        {
+          "discriminant": 4,
+          "name": "FlightDelay"
+        }
+      ]
+    },
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Admin"
+        },
+        {
+          "discriminant": null,
+          "name": "PoolContract"
+        },
+        {
+          "discriminant": null,
+          "name": "Policy(u64)"
+        },
+        {
+          "discriminant": null,
+          "name": "HolderPolicies(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "TotalPolicies"
+        },
+        {
+          "discriminant": null,
+          "name": "TotalPremium"
+        },
+        {
+          "discriminant": null,
+          "name": "ActivePolicies"
+        },
+        {
+          "discriminant": null,
+          "name": "PendingAdmin"
+        },
+        {
+          "discriminant": null,
+          "name": "ContractVersion"
+        }
+      ]
+    },
+    {
+      "name": "RegistryError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "Unauthorized"
+        },
+        {
+          "discriminant": 4,
+          "name": "PolicyNotFound"
+        },
+        {
+          "discriminant": 5,
+          "name": "PolicyAlreadyExists"
+        },
+        {
+          "discriminant": 6,
+          "name": "NoPendingPoolContract"
+        },
+        {
+          "discriminant": 7,
+          "name": "PoolContractChangeNotReady"
+        },
+        {
+          "discriminant": 8,
+          "name": "NoPendingAdmin"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        }
+      ],
+      "name": "accept_admin",
+      "output": "Result<(), RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        }
+      ],
+      "name": "cancel_pool_contract",
+      "output": "Result<(), RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        }
+      ],
+      "name": "confirm_pool_contract",
+      "output": "Result<(), RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "policy_id",
+          "type": "u64"
+        }
+      ],
+      "name": "deactivate_policy",
+      "output": "Result<(), RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "holder",
+          "type": "Address"
+        }
+      ],
+      "name": "get_holder_active_policy_ids",
+      "output": "Vec<u64>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "holder",
+          "type": "Address"
+        }
+      ],
+      "name": "get_holder_policy_ids",
+      "output": "Vec<u64>"
+    },
+    {
+      "inputs": [],
+      "name": "get_pending_pool_contract",
+      "output": "Option<PendingPoolContract>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "policy_id",
+          "type": "u64"
+        }
+      ],
+      "name": "get_policy",
+      "output": "Result<PolicyRecord, RegistryError>"
+    },
+    {
+      "inputs": [],
+      "name": "get_pool_contract",
+      "output": "Option<Address>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "admin",
+          "type": "Address"
+        },
+        {
+          "name": "pool_contract",
+          "type": "Address"
+        }
+      ],
+      "name": "initialize",
+      "output": "Result<(), RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "name": "propose_admin",
+      "output": "Result<(), RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "pool_contract",
+          "type": "Address"
+        }
+      ],
+      "name": "propose_pool_contract",
+      "output": "Result<(), RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "reg",
+          "type": "PolicyRegistration"
+        }
+      ],
+      "name": "register_policy",
+      "output": "Result<u64, RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "delay",
+          "type": "u64"
+        }
+      ],
+      "name": "set_pool_contract_change_delay",
+      "output": "Result<(), RegistryError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "new_wasm_hash",
+          "type": "soroban_sdk::BytesN<32>"
+        }
+      ],
+      "name": "upgrade",
+      "output": "Result<(), RegistryError>"
+    }
+  ],
+  "interface_sha256": "2412dd0f6bb8604877ba13133626ab1a382242bbb60774ca2410f93a3e266b51",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "pool_contract",
+          "type": "Address"
+        },
+        {
+          "name": "executable_at",
+          "type": "u64"
+        }
+      ],
+      "name": "PendingPoolContract"
+    },
+    {
+      "fields": [
+        {
+          "name": "policy_id",
+          "type": "u64"
+        },
+        {
+          "name": "holder",
+          "type": "Address"
+        },
+        {
+          "name": "coverage_type",
+          "type": "CoverageType"
+        },
+        {
+          "name": "coverage_amount",
+          "type": "i128"
+        },
+        {
+          "name": "premium",
+          "type": "i128"
+        },
+        {
+          "name": "expires_at",
+          "type": "u64"
+        },
+        {
+          "name": "is_active",
+          "type": "bool"
+        },
+        {
+          "name": "created_at",
+          "type": "u64"
+        }
+      ],
+      "name": "PolicyRecord"
+    },
+    {
+      "fields": [
+        {
+          "name": "policy_id",
+          "type": "u64"
+        },
+        {
+          "name": "holder",
+          "type": "Address"
+        },
+        {
+          "name": "coverage_type",
+          "type": "CoverageType"
+        },
+        {
+          "name": "coverage_amount",
+          "type": "i128"
+        },
+        {
+          "name": "premium",
+          "type": "i128"
+        },
+        {
+          "name": "expires_at",
+          "type": "u64"
+        }
+      ],
+      "name": "PolicyRegistration"
+    }
+  ]
+}

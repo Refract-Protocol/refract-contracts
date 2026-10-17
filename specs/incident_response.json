@@ -1,0 +1,122 @@
+{
+  "contract": "incident_response",
+  "enums": [
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Guardian"
+        },
+        {
+          "discriminant": null,
+          "name": "Admin"
+        }
+      ]
+    },
+    {
+      "name": "IncidentError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "Unauthorized"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [],
+      "name": "admin",
+      "output": "Option<Address>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "pool",
+          "type": "Address"
+        },
+        {
+          "name": "registry",
+          "type": "Address"
+        },
+        {
+          "name": "oracle",
+          "type": "Address"
+        },
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "name": "emergency_lockdown",
+      "output": "Result<(), IncidentError>"
+    },
+    {
+      "inputs": [],
+      "name": "guardian",
+      "output": "Option<Address>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "admin",
+          "type": "Address"
+        },
+        {
+          "name": "guardian",
+          "type": "Address"
+        }
+      ],
+      "name": "initialize",
+      "output": "Result<(), IncidentError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "registry",
+          "type": "Address"
+        },
+        {
+          "name": "new_pool",
+          "type": "Address"
+        }
+      ],
+      "name": "migrate_pool",
+      "output": "Result<(), IncidentError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "new_guardian",
+          "type": "Address"
+        }
+      ],
+      "name": "set_guardian",
+      "output": "Result<(), IncidentError>"
+    }
+  ],
+  "interface_sha256": "785aae83488b7723d98a7ec9ca6575e74bb2fe442c86fbb00e7cd4592b2312e6",
+  "protocol_version": "1.0.0",
+  "structs": []
+}

@@ -1,0 +1,152 @@
+{
+  "contract": "bounty",
+  "enums": [
+    {
+      "name": "BountyError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "InvalidAmount"
+        },
+        {
+          "discriminant": 4,
+          "name": "InsufficientBalance"
+        },
+        {
+          "discriminant": 5,
+          "name": "Unauthorized"
+        },
+        {
+          "discriminant": 6,
+          "name": "DuplicateReport"
+        }
+      ]
+    },
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Governance"
+        },
+        {
+          "discriminant": null,
+          "name": "Token"
+        },
+        {
+          "discriminant": null,
+          "name": "Balance"
+        },
+        {
+          "discriminant": null,
+          "name": "Award(BytesN<32>)"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "researcher",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "i128"
+        },
+        {
+          "name": "report_hash",
+          "type": "BytesN<32>"
+        }
+      ],
+      "name": "award",
+      "output": "Result<(), BountyError>"
+    },
+    {
+      "inputs": [],
+      "name": "balance",
+      "output": "Result<i128, BountyError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "from",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "i128"
+        }
+      ],
+      "name": "fund",
+      "output": "Result<(), BountyError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "report_hash",
+          "type": "BytesN<32>"
+        }
+      ],
+      "name": "get_award",
+      "output": "Option<AwardRecord>"
+    },
+    {
+      "inputs": [],
+      "name": "governance",
+      "output": "Result<Address, BountyError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "governance",
+          "type": "Address"
+        },
+        {
+          "name": "token",
+          "type": "Address"
+        }
+      ],
+      "name": "initialize",
+      "output": "Result<(), BountyError>"
+    }
+  ],
+  "interface_sha256": "f1fab7abf0e75e43df12f7e38ff8360f48e0d7702f6fcc975c0cc56a570202e1",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "researcher",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "i128"
+        },
+        {
+          "name": "report_hash",
+          "type": "BytesN<32>"
+        },
+        {
+          "name": "timestamp",
+          "type": "u64"
+        }
+      ],
+      "name": "AwardRecord"
+    }
+  ]
+}

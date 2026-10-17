@@ -1,0 +1,204 @@
+{
+  "contract": "grants",
+  "enums": [
+    {
+      "name": "GrantsError",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Unauthorized"
+        },
+        {
+          "discriminant": null,
+          "name": "GrantNotFound"
+        },
+        {
+          "discriminant": null,
+          "name": "NoMilestones"
+        },
+        {
+          "discriminant": null,
+          "name": "MilestoneSumMismatch"
+        },
+        {
+          "discriminant": null,
+          "name": "InvalidMilestoneAmount"
+        },
+        {
+          "discriminant": null,
+          "name": "InvalidTotalAmount"
+        },
+        {
+          "discriminant": null,
+          "name": "InvalidMilestoneIndex"
+        },
+        {
+          "discriminant": null,
+          "name": "MilestoneAlreadyConfirmed"
+        },
+        {
+          "discriminant": null,
+          "name": "MilestoneOutOfOrder"
+        },
+        {
+          "discriminant": null,
+          "name": "NotRecipient"
+        },
+        {
+          "discriminant": null,
+          "name": "NothingToClaim"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "grant_id",
+          "type": "GrantId"
+        }
+      ],
+      "name": "claim",
+      "output": "Result<i128, GrantsError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "grant_id",
+          "type": "GrantId"
+        }
+      ],
+      "name": "claimable",
+      "output": "Option<i128>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "grant_id",
+          "type": "GrantId"
+        },
+        {
+          "name": "milestone_index",
+          "type": "usize"
+        }
+      ],
+      "name": "confirm_milestone",
+      "output": "Result<(), GrantsError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "total_amount",
+          "type": "i128"
+        },
+        {
+          "name": "milestones",
+          "type": "Vec<i128>"
+        }
+      ],
+      "name": "create_grant",
+      "output": "Result<GrantId, GrantsError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "grant_id",
+          "type": "GrantId"
+        }
+      ],
+      "name": "get_grant",
+      "output": "Option<&Grant>"
+    },
+    {
+      "inputs": [],
+      "name": "governance",
+      "output": "Address"
+    },
+    {
+      "inputs": [
+        {
+          "name": "governance",
+          "type": "Address"
+        }
+      ],
+      "name": "new",
+      "output": "Self"
+    }
+  ],
+  "interface_sha256": "9c0721a7df0548cf7313bf62d72149c85a4213bc46dfedba0744d49154e45e06",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "recipient",
+          "type": "Address"
+        },
+        {
+          "name": "total_amount",
+          "type": "i128"
+        },
+        {
+          "name": "milestones",
+          "type": "Vec<Milestone>"
+        },
+        {
+          "name": "claimable",
+          "type": "i128"
+        }
+      ],
+      "name": "Grant"
+    },
+    {
+      "fields": [
+        {
+          "name": "amount",
+          "type": "i128"
+        },
+        {
+          "name": "confirmed",
+          "type": "bool"
+        },
+        {
+          "name": "claimed",
+          "type": "bool"
+        }
+      ],
+      "name": "Milestone"
+    },
+    {
+      "fields": [
+        {
+          "name": "governance",
+          "type": "Address"
+        },
+        {
+          "name": "next_grant_id",
+          "type": "GrantId"
+        },
+        {
+          "name": "grants",
+          "type": "BTreeMap<GrantId, Grant>"
+        }
+      ],
+      "name": "RefractGrants"
+    }
+  ]
+}

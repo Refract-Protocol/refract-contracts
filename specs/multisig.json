@@ -1,0 +1,225 @@
+{
+  "contract": "multisig",
+  "enums": [
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Owners"
+        },
+        {
+          "discriminant": null,
+          "name": "Threshold"
+        },
+        {
+          "discriminant": null,
+          "name": "NextId"
+        },
+        {
+          "discriminant": null,
+          "name": "Proposal(u64)"
+        }
+      ]
+    },
+    {
+      "name": "MultisigError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "Unauthorized"
+        },
+        {
+          "discriminant": 4,
+          "name": "NotOwner"
+        },
+        {
+          "discriminant": 5,
+          "name": "ProposalNotFound"
+        },
+        {
+          "discriminant": 6,
+          "name": "ProposalNotPending"
+        },
+        {
+          "discriminant": 7,
+          "name": "ThresholdAlreadyMet"
+        },
+        {
+          "discriminant": 8,
+          "name": "InvalidThreshold"
+        },
+        {
+          "discriminant": 9,
+          "name": "CannotRemoveLastOwner"
+        }
+      ]
+    },
+    {
+      "name": "ProposalStatus",
+      "variants": [
+        {
+          "discriminant": 0,
+          "name": "Pending"
+        },
+        {
+          "discriminant": 1,
+          "name": "Executed"
+        },
+        {
+          "discriminant": 2,
+          "name": "Cancelled"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [
+        {
+          "name": "new_owner",
+          "type": "Address"
+        }
+      ],
+      "name": "add_owner",
+      "output": "Result<(), MultisigError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "name": "approve",
+      "output": "Result<(), MultisigError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "new_threshold",
+          "type": "u32"
+        }
+      ],
+      "name": "change_threshold",
+      "output": "Result<(), MultisigError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "name": "execute",
+      "output": "Result<(), MultisigError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "name": "get_proposal",
+      "output": "Option<Proposal>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "owners",
+          "type": "Vec<Address>"
+        },
+        {
+          "name": "threshold",
+          "type": "u32"
+        }
+      ],
+      "name": "initialize",
+      "output": "Result<(), MultisigError>"
+    },
+    {
+      "inputs": [],
+      "name": "owners",
+      "output": "Vec<Address>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "proposer",
+          "type": "Address"
+        },
+        {
+          "name": "target",
+          "type": "Address"
+        },
+        {
+          "name": "function",
+          "type": "Symbol"
+        },
+        {
+          "name": "args",
+          "type": "Vec<Val>"
+        }
+      ],
+      "name": "propose",
+      "output": "Result<u64, MultisigError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "owner",
+          "type": "Address"
+        }
+      ],
+      "name": "remove_owner",
+      "output": "Result<(), MultisigError>"
+    },
+    {
+      "inputs": [],
+      "name": "threshold",
+      "output": "u32"
+    }
+  ],
+  "interface_sha256": "e5c997e95890afe426c35950d57bf00eaad6cf3c9d10b9011b53da47ded237c3",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "target",
+          "type": "Address"
+        },
+        {
+          "name": "function",
+          "type": "Symbol"
+        },
+        {
+          "name": "args",
+          "type": "Vec<Val>"
+        },
+        {
+          "name": "approvals",
+          "type": "Vec<Address>"
+        },
+        {
+          "name": "status",
+          "type": "ProposalStatus"
+        }
+      ],
+      "name": "Proposal"
+    }
+  ]
+}

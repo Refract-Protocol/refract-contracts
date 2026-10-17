@@ -1,0 +1,56 @@
+{
+  "contract": "treasury",
+  "enums": [
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Admin"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [],
+      "name": "admin",
+      "output": "Address"
+    },
+    {
+      "inputs": [
+        {
+          "name": "admin",
+          "type": "Address"
+        }
+      ],
+      "name": "initialize",
+      "output": "()"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "token",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "i128"
+        },
+        {
+          "name": "to",
+          "type": "Address"
+        }
+      ],
+      "name": "withdraw",
+      "output": "()"
+    }
+  ],
+  "interface_sha256": "bee6a9e54d7977d05385846abd50f25ae54f9de87be2501ff93fcc187a9cbd02",
+  "protocol_version": "1.0.0",
+  "structs": []
+}

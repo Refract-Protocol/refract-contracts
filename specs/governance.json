@@ -1,0 +1,348 @@
+{
+  "contract": "governance",
+  "enums": [
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Admin"
+        },
+        {
+          "discriminant": null,
+          "name": "Config"
+        },
+        {
+          "discriminant": null,
+          "name": "Token"
+        },
+        {
+          "discriminant": null,
+          "name": "Timelock"
+        },
+        {
+          "discriminant": null,
+          "name": "NextId"
+        },
+        {
+          "discriminant": null,
+          "name": "ProposalCount"
+        },
+        {
+          "discriminant": null,
+          "name": "Proposal(u64)"
+        },
+        {
+          "discriminant": null,
+          "name": "Vote(u64, Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "Delegate(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "DelegatedWeight(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "Checkpoints(Address)"
+        }
+      ]
+    },
+    {
+      "name": "GovernanceError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "Unauthorized"
+        },
+        {
+          "discriminant": 4,
+          "name": "BelowProposalThreshold"
+        },
+        {
+          "discriminant": 5,
+          "name": "ProposalNotFound"
+        },
+        {
+          "discriminant": 6,
+          "name": "WrongState"
+        },
+        {
+          "discriminant": 7,
+          "name": "VotingOpen"
+        },
+        {
+          "discriminant": 8,
+          "name": "AlreadyVoted"
+        },
+        {
+          "discriminant": 9,
+          "name": "ProposalDefeated"
+        },
+        {
+          "discriminant": 10,
+          "name": "AlreadyQueued"
+        },
+        {
+          "discriminant": 11,
+          "name": "DelegationChain"
+        }
+      ]
+    },
+    {
+      "name": "ProposalStatus",
+      "variants": [
+        {
+          "discriminant": 0,
+          "name": "Active"
+        },
+        {
+          "discriminant": 1,
+          "name": "Defeated"
+        },
+        {
+          "discriminant": 2,
+          "name": "Succeeded"
+        },
+        {
+          "discriminant": 3,
+          "name": "Queued"
+        },
+        {
+          "discriminant": 4,
+          "name": "Executed"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [],
+      "name": "admin",
+      "output": "Option<Address>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "voter",
+          "type": "Address"
+        },
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        },
+        {
+          "name": "support",
+          "type": "bool"
+        }
+      ],
+      "name": "cast_vote",
+      "output": "Result<i128, GovernanceError>"
+    },
+    {
+      "inputs": [],
+      "name": "config",
+      "output": "Option<GovernorConfig>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "name": "execute",
+      "output": "Result<(), GovernanceError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        }
+      ],
+      "name": "finalize",
+      "output": "Result<ProposalStatus, GovernanceError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "name": "get_proposal",
+      "output": "Option<ProposalState>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "admin",
+          "type": "Address"
+        },
+        {
+          "name": "token",
+          "type": "Address"
+        }
+      ],
+      "name": "initialize",
+      "output": "()"
+    },
+    {
+      "inputs": [
+        {
+          "name": "proposer",
+          "type": "Address"
+        },
+        {
+          "name": "target",
+          "type": "Address"
+        },
+        {
+          "name": "function",
+          "type": "Symbol"
+        },
+        {
+          "name": "args",
+          "type": "Vec<Val>"
+        },
+        {
+          "name": "description",
+          "type": "Symbol"
+        }
+      ],
+      "name": "propose",
+      "output": "Result<u64, GovernanceError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "proposal_id",
+          "type": "u64"
+        },
+        {
+          "name": "eta",
+          "type": "u64"
+        }
+      ],
+      "name": "queue",
+      "output": "Result<(), GovernanceError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "config",
+          "type": "GovernorConfig"
+        }
+      ],
+      "name": "set_config",
+      "output": "Result<(), GovernanceError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "timelock",
+          "type": "Address"
+        }
+      ],
+      "name": "set_timelock",
+      "output": "Result<(), GovernanceError>"
+    }
+  ],
+  "interface_sha256": "3fbbe81740dc7230730b6f7f29f50343f2996ca94be8359df139c64f365f1713",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "token",
+          "type": "Address"
+        },
+        {
+          "name": "voting_period",
+          "type": "u64"
+        },
+        {
+          "name": "quorum_bps",
+          "type": "u32"
+        },
+        {
+          "name": "proposal_threshold",
+          "type": "i128"
+        }
+      ],
+      "name": "GovernorConfig"
+    },
+    {
+      "fields": [
+        {
+          "name": "proposer",
+          "type": "Address"
+        },
+        {
+          "name": "target",
+          "type": "Address"
+        },
+        {
+          "name": "function",
+          "type": "Symbol"
+        },
+        {
+          "name": "args",
+          "type": "Vec<Val>"
+        },
+        {
+          "name": "description",
+          "type": "Symbol"
+        },
+        {
+          "name": "vote_start",
+          "type": "u64"
+        },
+        {
+          "name": "vote_end",
+          "type": "u64"
+        },
+        {
+          "name": "votes_for",
+          "type": "i128"
+        },
+        {
+          "name": "votes_against",
+          "type": "i128"
+        },
+        {
+          "name": "status",
+          "type": "ProposalStatus"
+        },
+        {
+          "name": "voters",
+          "type": "Vec<Address>"
+        },
+        {
+          "name": "snapshot_ledger",
+          "type": "u32"
+        }
+      ],
+      "name": "ProposalState"
+    }
+  ]
+}

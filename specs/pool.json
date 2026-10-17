@@ -1,0 +1,713 @@
+{
+  "contract": "pool",
+  "enums": [
+    {
+      "name": "CoverageType",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "StablecoinDepeg"
+        },
+        {
+          "discriminant": null,
+          "name": "MarketCrash"
+        },
+        {
+          "discriminant": null,
+          "name": "LiquidationShield"
+        },
+        {
+          "discriminant": null,
+          "name": "SmartContractRisk"
+        },
+        {
+          "discriminant": null,
+          "name": "FlightDelay"
+        }
+      ]
+    },
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Admin"
+        },
+        {
+          "discriminant": null,
+          "name": "UsdcToken"
+        },
+        {
+          "discriminant": null,
+          "name": "PolicyRegistry"
+        },
+        {
+          "discriminant": null,
+          "name": "Accounting"
+        },
+        {
+          "discriminant": null,
+          "name": "TotalCapital"
+        },
+        {
+          "discriminant": null,
+          "name": "TotalCoverage"
+        },
+        {
+          "discriminant": null,
+          "name": "TotalPremiums"
+        },
+        {
+          "discriminant": null,
+          "name": "Shares(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "TotalShares"
+        },
+        {
+          "discriminant": null,
+          "name": "Policy(u64)"
+        },
+        {
+          "discriminant": null,
+          "name": "UserPolicies(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "NextPolicyId"
+        },
+        {
+          "discriminant": null,
+          "name": "PoolConfig"
+        },
+        {
+          "discriminant": null,
+          "name": "Initialized"
+        },
+        {
+          "discriminant": null,
+          "name": "OracleData(CoverageType)"
+        },
+        {
+          "discriminant": null,
+          "name": "LastDeposit(Address)"
+        }
+      ]
+    },
+    {
+      "name": "PolicyStatus",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Active"
+        },
+        {
+          "discriminant": null,
+          "name": "Claimed"
+        },
+        {
+          "discriminant": null,
+          "name": "Expired"
+        }
+      ]
+    },
+    {
+      "name": "PoolError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "Unauthorized"
+        },
+        {
+          "discriminant": 4,
+          "name": "InsufficientCapacity"
+        },
+        {
+          "discriminant": 5,
+          "name": "PolicyNotFound"
+        },
+        {
+          "discriminant": 6,
+          "name": "PolicyExpired"
+        },
+        {
+          "discriminant": 7,
+          "name": "PolicyNotTriggered"
+        },
+        {
+          "discriminant": 8,
+          "name": "NotPolicyholder"
+        },
+        {
+          "discriminant": 9,
+          "name": "AlreadyClaimed"
+        },
+        {
+          "discriminant": 10,
+          "name": "InsufficientPremium"
+        },
+        {
+          "discriminant": 11,
+          "name": "ZeroAmount"
+        },
+        {
+          "discriminant": 12,
+          "name": "InsufficientShares"
+        },
+        {
+          "discriminant": 13,
+          "name": "CapitalLocked"
+        },
+        {
+          "discriminant": 14,
+          "name": "PolicyNotYetExpired"
+        },
+        {
+          "discriminant": 15,
+          "name": "LockupActive"
+        }
+      ]
+    },
+    {
+      "name": "RegistryCoverageType",
+      "variants": [
+        {
+          "discriminant": 0,
+          "name": "StablecoinDepeg"
+        },
+        {
+          "discriminant": 1,
+          "name": "MarketCrash"
+        },
+        {
+          "discriminant": 2,
+          "name": "LiquidationShield"
+        },
+        {
+          "discriminant": 3,
+          "name": "SmartContractRisk"
+        },
+        {
+          "discriminant": 4,
+          "name": "FlightDelay"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [],
+      "name": "_accounting",
+      "output": "PoolAccounting"
+    },
+    {
+      "inputs": [
+        {
+          "name": "config",
+          "type": "&PoolConfig"
+        },
+        {
+          "name": "params",
+          "type": "&PolicyParams"
+        }
+      ],
+      "name": "_calc_premium",
+      "output": "i128"
+    },
+    {
+      "inputs": [
+        {
+          "name": "acc",
+          "type": "&PoolAccounting"
+        }
+      ],
+      "name": "_save_accounting",
+      "output": "()"
+    },
+    {
+      "inputs": [],
+      "name": "accounting",
+      "output": "PoolAccounting"
+    },
+    {
+      "inputs": [],
+      "name": "admin",
+      "output": "Option<Address>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "holder",
+          "type": "Address"
+        },
+        {
+          "name": "params",
+          "type": "PolicyParams"
+        }
+      ],
+      "name": "buy_policy",
+      "output": "Result<u64, PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "policy_id",
+          "type": "u64"
+        }
+      ],
+      "name": "expire_policy",
+      "output": "Result<(), PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "ids",
+          "type": "Vec<u64>"
+        }
+      ],
+      "name": "get_policies",
+      "output": "Vec<Policy>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "name": "get_policy",
+      "output": "Option<Policy>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "admin",
+          "type": "Address"
+        },
+        {
+          "name": "usdc_token",
+          "type": "Address"
+        },
+        {
+          "name": "policy_registry",
+          "type": "Address"
+        }
+      ],
+      "name": "initialize",
+      "output": "Result<(), PoolError>"
+    },
+    {
+      "inputs": [],
+      "name": "load",
+      "output": "Self"
+    },
+    {
+      "inputs": [
+        {
+          "name": "provider",
+          "type": "Address"
+        }
+      ],
+      "name": "lockup_expires_at",
+      "output": "Option<u64>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        }
+      ],
+      "name": "migrate_accounting",
+      "output": "Result<(), PoolError>"
+    },
+    {
+      "inputs": [],
+      "name": "policy_registry",
+      "output": "Option<Address>"
+    },
+    {
+      "inputs": [],
+      "name": "pool_config",
+      "output": "Option<PoolConfig>"
+    },
+    {
+      "inputs": [],
+      "name": "pool_stats",
+      "output": "PoolStats"
+    },
+    {
+      "inputs": [
+        {
+          "name": "policy_id",
+          "type": "u64"
+        }
+      ],
+      "name": "process_claim",
+      "output": "Result<i128, PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "provider",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "i128"
+        }
+      ],
+      "name": "provide_capital",
+      "output": "Result<i128, PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "params",
+          "type": "PolicyParams"
+        }
+      ],
+      "name": "quote_premium",
+      "output": "Result<i128, PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "amount",
+          "type": "i128"
+        }
+      ],
+      "name": "quote_shares",
+      "output": "Result<i128, PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "shares",
+          "type": "i128"
+        }
+      ],
+      "name": "quote_withdrawal",
+      "output": "Result<i128, PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "name": "set_admin",
+      "output": "Result<(), PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "policy_registry",
+          "type": "Address"
+        }
+      ],
+      "name": "set_policy_registry",
+      "output": "Result<(), PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "config",
+          "type": "PoolConfig"
+        }
+      ],
+      "name": "set_pool_config",
+      "output": "Result<(), PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "user",
+          "type": "Address"
+        }
+      ],
+      "name": "shares_of",
+      "output": "i128"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "coverage_type",
+          "type": "CoverageType"
+        },
+        {
+          "name": "value",
+          "type": "i128"
+        }
+      ],
+      "name": "update_oracle",
+      "output": "Result<(), PoolError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "user",
+          "type": "Address"
+        }
+      ],
+      "name": "user_policies",
+      "output": "Vec<u64>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "provider",
+          "type": "Address"
+        },
+        {
+          "name": "shares",
+          "type": "i128"
+        }
+      ],
+      "name": "withdraw_capital",
+      "output": "Result<i128, PoolError>"
+    }
+  ],
+  "interface_sha256": "53fa94b197ee16ae37a507836fa71cd4a4f12368ef52c5c8faefffb62addd19c",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "value",
+          "type": "i128"
+        },
+        {
+          "name": "updated_at",
+          "type": "u64"
+        }
+      ],
+      "name": "OracleData"
+    },
+    {
+      "fields": [
+        {
+          "name": "id",
+          "type": "u64"
+        },
+        {
+          "name": "holder",
+          "type": "Address"
+        },
+        {
+          "name": "coverage_type",
+          "type": "CoverageType"
+        },
+        {
+          "name": "coverage_amount",
+          "type": "i128"
+        },
+        {
+          "name": "premium_paid",
+          "type": "i128"
+        },
+        {
+          "name": "trigger_threshold",
+          "type": "i128"
+        },
+        {
+          "name": "start_time",
+          "type": "u64"
+        },
+        {
+          "name": "end_time",
+          "type": "u64"
+        },
+        {
+          "name": "status",
+          "type": "PolicyStatus"
+        },
+        {
+          "name": "payout_at",
+          "type": "Option<u64>"
+        }
+      ],
+      "name": "Policy"
+    },
+    {
+      "fields": [
+        {
+          "name": "coverage_amount",
+          "type": "i128"
+        },
+        {
+          "name": "coverage_type",
+          "type": "CoverageType"
+        },
+        {
+          "name": "duration_days",
+          "type": "u32"
+        },
+        {
+          "name": "trigger_threshold",
+          "type": "i128"
+        }
+      ],
+      "name": "PolicyParams"
+    },
+    {
+      "fields": [
+        {
+          "name": "policy_id",
+          "type": "u64"
+        },
+        {
+          "name": "holder",
+          "type": "Address"
+        },
+        {
+          "name": "coverage_type",
+          "type": "RegistryCoverageType"
+        },
+        {
+          "name": "coverage_amount",
+          "type": "i128"
+        },
+        {
+          "name": "premium",
+          "type": "i128"
+        },
+        {
+          "name": "expires_at",
+          "type": "u64"
+        }
+      ],
+      "name": "PolicyRegistration"
+    },
+    {
+      "fields": [
+        {
+          "name": "total_capital",
+          "type": "i128"
+        },
+        {
+          "name": "total_coverage",
+          "type": "i128"
+        },
+        {
+          "name": "total_premiums",
+          "type": "i128"
+        },
+        {
+          "name": "total_shares",
+          "type": "i128"
+        },
+        {
+          "name": "next_policy_id",
+          "type": "u64"
+        }
+      ],
+      "name": "PoolAccounting"
+    },
+    {
+      "fields": [
+        {
+          "name": "base_premium_rate_bps",
+          "type": "u32"
+        },
+        {
+          "name": "max_utilization_bps",
+          "type": "u32"
+        },
+        {
+          "name": "min_coverage",
+          "type": "i128"
+        },
+        {
+          "name": "max_coverage",
+          "type": "i128"
+        },
+        {
+          "name": "lockup_days",
+          "type": "u32"
+        }
+      ],
+      "name": "PoolConfig"
+    },
+    {
+      "fields": [
+        {
+          "name": "config",
+          "type": "PoolConfig"
+        },
+        {
+          "name": "total_capital",
+          "type": "i128"
+        },
+        {
+          "name": "total_shares",
+          "type": "i128"
+        },
+        {
+          "name": "total_coverage",
+          "type": "i128"
+        }
+      ],
+      "name": "PoolState"
+    },
+    {
+      "fields": [
+        {
+          "name": "total_capital",
+          "type": "i128"
+        },
+        {
+          "name": "total_coverage",
+          "type": "i128"
+        },
+        {
+          "name": "total_shares",
+          "type": "i128"
+        },
+        {
+          "name": "utilization_bps",
+          "type": "u32"
+        },
+        {
+          "name": "share_price",
+          "type": "i128"
+        },
+        {
+          "name": "apy_estimate_bps",
+          "type": "u32"
+        },
+        {
+          "name": "available_capacity",
+          "type": "i128"
+        }
+      ],
+      "name": "PoolStats"
+    }
+  ]
+}

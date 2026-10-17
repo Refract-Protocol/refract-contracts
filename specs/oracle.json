@@ -1,0 +1,451 @@
+{
+  "contract": "oracle",
+  "enums": [
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Admin"
+        },
+        {
+          "discriminant": null,
+          "name": "Relayers"
+        },
+        {
+          "discriminant": null,
+          "name": "Reading(Symbol)"
+        },
+        {
+          "discriminant": null,
+          "name": "FallbackOracle"
+        },
+        {
+          "discriminant": null,
+          "name": "pub enum DataKey {"
+        },
+        {
+          "discriminant": null,
+          "name": "Admin"
+        },
+        {
+          "discriminant": null,
+          "name": "Relayers"
+        },
+        {
+          "discriminant": null,
+          "name": "Reading(Symbol)"
+        },
+        {
+          "discriminant": null,
+          "name": "FallbackOracle"
+        },
+        {
+          "discriminant": null,
+          "name": "RelayerReading(Symbol, Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "ReadingHistory(Symbol)"
+        },
+        {
+          "discriminant": null,
+          "name": "RelayerBond(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "FeedMetadata(Symbol)"
+        },
+        {
+          "discriminant": null,
+          "name": "LastSubmissionAt(Address, Symbol)"
+        },
+        {
+          "discriminant": null,
+          "name": "RelayerReputation(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "ContractVersion"
+        },
+        {
+          "discriminant": null,
+          "name": "PendingAdmin"
+        },
+        {
+          "discriminant": null,
+          "name": "Threshold(Symbol)"
+        },
+        {
+          "discriminant": null,
+          "name": "PendingRelayer(Address)"
+        }
+      ]
+    },
+    {
+      "name": "OracleError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "Unauthorized"
+        },
+        {
+          "discriminant": 4,
+          "name": "FeedNotFound"
+        },
+        {
+          "discriminant": 5,
+          "name": "StaleReading"
+        },
+        {
+          "discriminant": 6,
+          "name": "UnknownCoverageType"
+        },
+        {
+          "discriminant": 7,
+          "name": "FutureTimestamp"
+        },
+        {
+          "discriminant": 8,
+          "name": "StaleSubmission"
+        },
+        {
+          "discriminant": 9,
+          "name": "NoPendingAdmin"
+        },
+        {
+          "discriminant": 10,
+          "name": "SubmittedTooSoon"
+        },
+        {
+          "discriminant": 11,
+          "name": "InsufficientBond"
+        },
+        {
+          "discriminant": 12,
+          "name": "RelayerNotBonded"
+        },
+        {
+          "discriminant": 13,
+          "name": "InvalidSlashAmount"
+        },
+        {
+          "discriminant": 14,
+          "name": "RelayerNotPending"
+        },
+        {
+          "discriminant": 15,
+          "name": "NoticePeriodNotElapsed"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        }
+      ],
+      "name": "accept_admin",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        }
+      ],
+      "name": "activate_relayer",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        }
+      ],
+      "name": "add_relayer",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [],
+      "name": "admin",
+      "output": "Option<Address>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "feed_id",
+          "type": "Symbol"
+        }
+      ],
+      "name": "get_feed_health",
+      "output": "FeedHealth"
+    },
+    {
+      "inputs": [
+        {
+          "name": "feed_id",
+          "type": "Symbol"
+        }
+      ],
+      "name": "get_feed_metadata",
+      "output": "Option<FeedMetadata>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "feed_id",
+          "type": "Symbol"
+        }
+      ],
+      "name": "get_reading",
+      "output": "Result<OracleReading, OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "feed_id",
+          "type": "Symbol"
+        }
+      ],
+      "name": "get_threshold",
+      "output": "Option<i128>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "admin",
+          "type": "Address"
+        }
+      ],
+      "name": "initialize",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "coverage_type",
+          "type": "u32"
+        },
+        {
+          "name": "feed_id",
+          "type": "Symbol"
+        }
+      ],
+      "name": "is_triggered",
+      "output": "Result<bool, OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "feed_ids",
+          "type": "Vec<Symbol>"
+        }
+      ],
+      "name": "list_feeds",
+      "output": "Map<Symbol, i64>"
+    },
+    {
+      "inputs": [],
+      "name": "list_relayers",
+      "output": "Vec<Address>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "new_admin",
+          "type": "Address"
+        }
+      ],
+      "name": "propose_admin",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        }
+      ],
+      "name": "relayer_reputation",
+      "output": "Option<i128>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        }
+      ],
+      "name": "remove_relayer",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "feed_id",
+          "type": "Symbol"
+        },
+        {
+          "name": "metadata",
+          "type": "FeedMetadata"
+        }
+      ],
+      "name": "set_feed_metadata",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "feed_id",
+          "type": "Symbol"
+        },
+        {
+          "name": "threshold",
+          "type": "i128"
+        }
+      ],
+      "name": "set_threshold",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        },
+        {
+          "name": "feed_id",
+          "type": "Symbol"
+        },
+        {
+          "name": "value",
+          "type": "i128"
+        },
+        {
+          "name": "timestamp",
+          "type": "u64"
+        },
+        {
+          "name": "source",
+          "type": "Symbol"
+        }
+      ],
+      "name": "submit",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        },
+        {
+          "name": "delta",
+          "type": "i128"
+        }
+      ],
+      "name": "update_reputation",
+      "output": "Result<(), OracleError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "new_wasm_hash",
+          "type": "soroban_sdk::BytesN<32>"
+        }
+      ],
+      "name": "upgrade",
+      "output": "Result<(), OracleError>"
+    }
+  ],
+  "interface_sha256": "5bc1e390d79a8f77dbd7c97dd9f23e42c42ad9a94fd9640f1a09353729ce14f8",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "last_updated_at",
+          "type": "u64"
+        },
+        {
+          "name": "active_relayer_count",
+          "type": "u32"
+        },
+        {
+          "name": "recent_rejection_count",
+          "type": "u32"
+        }
+      ],
+      "name": "FeedHealth"
+    },
+    {
+      "fields": [
+        {
+          "name": "decimals",
+          "type": "u32"
+        },
+        {
+          "name": "source_name",
+          "type": "Symbol"
+        },
+        {
+          "name": "expected_cadence_secs",
+          "type": "u64"
+        }
+      ],
+      "name": "FeedMetadata"
+    },
+    {
+      "fields": [
+        {
+          "name": "value",
+          "type": "i128"
+        },
+        {
+          "name": "timestamp",
+          "type": "u64"
+        },
+        {
+          "name": "source",
+          "type": "Symbol"
+        }
+      ],
+      "name": "OracleReading"
+    },
+    {
+      "fields": [
+        {
+          "name": "relayer",
+          "type": "Address"
+        },
+        {
+          "name": "bond_amount",
+          "type": "i128"
+        },
+        {
+          "name": "bonded_at",
+          "type": "u64"
+        },
+        {
+          "name": "unstake_available_at",
+          "type": "u64"
+        }
+      ],
+      "name": "RelayerBondRecord"
+    }
+  ]
+}

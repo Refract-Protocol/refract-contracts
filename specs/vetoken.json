@@ -1,0 +1,208 @@
+{
+  "contract": "vetoken",
+  "enums": [
+    {
+      "name": "DataKey",
+      "variants": [
+        {
+          "discriminant": null,
+          "name": "Token"
+        },
+        {
+          "discriminant": null,
+          "name": "Treasury"
+        },
+        {
+          "discriminant": null,
+          "name": "Lock(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "FeeAccount(Address)"
+        },
+        {
+          "discriminant": null,
+          "name": "FeeCheckpoint"
+        }
+      ]
+    },
+    {
+      "name": "VeTokenError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "InvalidAmount"
+        },
+        {
+          "discriminant": 4,
+          "name": "InvalidDuration"
+        },
+        {
+          "discriminant": 5,
+          "name": "NoLock"
+        },
+        {
+          "discriminant": 6,
+          "name": "LockNotExpired"
+        },
+        {
+          "discriminant": 7,
+          "name": "CannotShortenLock"
+        },
+        {
+          "discriminant": 8,
+          "name": "NothingToClaim"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        }
+      ],
+      "name": "claim_fees",
+      "output": "Result<i128, VeTokenError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "address",
+          "type": "Address"
+        }
+      ],
+      "name": "claimable_fees",
+      "output": "i128"
+    },
+    {
+      "inputs": [
+        {
+          "name": "amount",
+          "type": "i128"
+        }
+      ],
+      "name": "distribute_fees",
+      "output": "Result<(), VeTokenError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "duration",
+          "type": "u64"
+        }
+      ],
+      "name": "extend_lock",
+      "output": "Result<(), VeTokenError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "token",
+          "type": "Address"
+        },
+        {
+          "name": "treasury",
+          "type": "Address"
+        }
+      ],
+      "name": "initialize",
+      "output": "Result<(), VeTokenError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "i128"
+        },
+        {
+          "name": "duration",
+          "type": "u64"
+        }
+      ],
+      "name": "lock",
+      "output": "Result<(), VeTokenError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "address",
+          "type": "Address"
+        }
+      ],
+      "name": "voting_power",
+      "output": "i128"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        }
+      ],
+      "name": "withdraw",
+      "output": "Result<i128, VeTokenError>"
+    }
+  ],
+  "interface_sha256": "583ec53bb502477c39353d94a379bcc4e3d89e29c825a818a9056e0748267e78",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "reward_per_power_paid",
+          "type": "i128"
+        },
+        {
+          "name": "pending",
+          "type": "i128"
+        }
+      ],
+      "name": "FeeAccount"
+    },
+    {
+      "fields": [
+        {
+          "name": "acc_fee_per_power",
+          "type": "i128"
+        },
+        {
+          "name": "total_power",
+          "type": "i128"
+        }
+      ],
+      "name": "FeeCheckpoint"
+    },
+    {
+      "fields": [
+        {
+          "name": "amount",
+          "type": "i128"
+        },
+        {
+          "name": "unlock_at",
+          "type": "u64"
+        }
+      ],
+      "name": "LockInfo"
+    }
+  ]
+}

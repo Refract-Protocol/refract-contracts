@@ -128,6 +128,22 @@
 // =============================================================================
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("export-specs") {
+        let status = std::process::Command::new("python3")
+            .arg("scripts/export_specs.py")
+            .args(&args[1..])
+            .status()
+            .or_else(|_| {
+                std::process::Command::new("python")
+                    .arg("scripts/export_specs.py")
+                    .args(&args[1..])
+                    .status()
+            })
+            .expect("failed to invoke python3/python for scripts/export_specs.py");
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
     // TODO (#133): Implement the authz-matrix verifier.
     //
     // Suggested implementation order:

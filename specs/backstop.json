@@ -1,0 +1,176 @@
+{
+  "contract": "backstop",
+  "enums": [
+    {
+      "name": "BackstopError",
+      "variants": [
+        {
+          "discriminant": 1,
+          "name": "AlreadyInitialized"
+        },
+        {
+          "discriminant": 2,
+          "name": "NotInitialized"
+        },
+        {
+          "discriminant": 3,
+          "name": "Unauthorized"
+        },
+        {
+          "discriminant": 4,
+          "name": "InvalidAmount"
+        },
+        {
+          "discriminant": 5,
+          "name": "InsufficientShares"
+        },
+        {
+          "discriminant": 6,
+          "name": "InsufficientCapital"
+        },
+        {
+          "discriminant": 7,
+          "name": "InvalidPremiumShare"
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "inputs": [],
+      "name": "config",
+      "output": "Result<BackstopConfig, BackstopError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "caller",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "i128"
+        }
+      ],
+      "name": "cover_shortfall",
+      "output": "Result<i128, BackstopError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "staker",
+          "type": "Address"
+        },
+        {
+          "name": "amount",
+          "type": "i128"
+        }
+      ],
+      "name": "deposit",
+      "output": "Result<i128, BackstopError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "pool",
+          "type": "Address"
+        },
+        {
+          "name": "admin",
+          "type": "Address"
+        },
+        {
+          "name": "token",
+          "type": "Address"
+        },
+        {
+          "name": "premium_share_bps",
+          "type": "i128"
+        }
+      ],
+      "name": "initialize",
+      "output": "Result<(), BackstopError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "amount",
+          "type": "i128"
+        }
+      ],
+      "name": "receive_premium",
+      "output": "Result<i128, BackstopError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "staker",
+          "type": "Address"
+        }
+      ],
+      "name": "shares_of",
+      "output": "i128"
+    },
+    {
+      "inputs": [],
+      "name": "state",
+      "output": "Result<BackstopState, BackstopError>"
+    },
+    {
+      "inputs": [
+        {
+          "name": "staker",
+          "type": "Address"
+        },
+        {
+          "name": "shares",
+          "type": "i128"
+        }
+      ],
+      "name": "withdraw",
+      "output": "Result<i128, BackstopError>"
+    }
+  ],
+  "interface_sha256": "b8b56ce07d5f60b53f256e4ee4b6c1c1bca60704e00c51a47e99ed4c514e277f",
+  "protocol_version": "1.0.0",
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "pool",
+          "type": "Address"
+        },
+        {
+          "name": "admin",
+          "type": "Address"
+        },
+        {
+          "name": "token",
+          "type": "Address"
+        },
+        {
+          "name": "premium_share_bps",
+          "type": "i128"
+        }
+      ],
+      "name": "BackstopConfig"
+    },
+    {
+      "fields": [
+        {
+          "name": "total_shares",
+          "type": "i128"
+        },
+        {
+          "name": "total_capital",
+          "type": "i128"
+        },
+        {
+          "name": "premium_income",
+          "type": "i128"
+        }
+      ],
+      "name": "BackstopState"
+    }
+  ]
+}
