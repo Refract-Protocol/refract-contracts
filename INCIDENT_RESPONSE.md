@@ -1,4 +1,4 @@
-﻿# Refract Protocol Incident Response Runbook: Admin Key Compromise
+# Refract Protocol Incident Response Runbook: Admin Key Compromise
 
 **Document Version:** 1.0.0  
 **Scope:** `RefractPool`, `RefractPolicyRegistry`, `RefractOracle`, `RefractIncidentResponse`  
@@ -111,3 +111,16 @@ A formal simulation of this tabletop runbook was implemented and verified in `in
 ### Lessons Learned & Gaps Identified:
 - **Pre-authorization Requirement**: Cross-contract invocations require that either the caller is the current admin or contracts support a registered Guardian role. Protocols must deploy the incident response coordinator at genesis so its address is pre-wired into recovery keys.
 - **Off-chain Key Hygiene**: Emergency guardian keys must be kept on segregated cold storage (air-gapped hardware or multi-party computation multisig) to ensure the guardian key cannot be compromised simultaneously with the operational admin key.
+
+---
+
+## 6. Emergency Governance Fast-Track & Post-Hoc Ratification
+
+During an exploit or rapid loss event, responders use `RefractTimelock::queue_emergency`
+with a vetoken supermajority plus `RefractMultisig` sign-off to execute
+`PauseContract`, `LossEventDrawdown`, or `StuckFundRescue` after the shortened
+`fast_track_delay`. Governance must call `ratify_emergency` within
+`ratification_window`, or `enforce_ratification_deadline` automatically flags the
+action `Unratified` and triggers the rollback entrypoint (e.g. unpausing
+`RefractTreasury` / `RefractBackstop`).
+

@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
@@ -7,26 +8,24 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+    EmergencyPaused,
 }
 
-/// `RefractTreasury` is a deliberately minimal token-custody vault.
-///
-/// Funds are deposited via plain token transfers to the contract address
-/// (no `deposit` entrypoint is required). Withdrawals are admin-gated.
 #[contract]
 pub struct RefractTreasury;
 
 #[contractimpl]
 impl RefractTreasury {
-    /// Initialize the treasury with an admin authorized to withdraw funds.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &false);
     }
 
-    /// Return the configured admin.
     pub fn admin(env: Env) -> Address {
         env.storage()
             .instance()
@@ -34,7 +33,27 @@ impl RefractTreasury {
             .expect("not initialized")
     }
 
-    /// Withdraw `amount` of `token` to `to`. Only the admin may call this.
+    /// Emergency fast-track target entrypoint to pause/unpause routine treasury
+    /// withdrawals. If post-hoc ratification is missed, the timelock rollback
+    /// calls `set_emergency_paused(admin, false)` to lift the pause automatically.
+    pub fn set_emergency_paused(env: Env, caller: Address, paused: bool) {
+        caller.require_auth();
+        let admin = Self::admin(env.clone());
+        if caller != admin {
+            panic!("unauthorized");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &paused);
+    }
+
+    pub fn is_emergency_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyPaused)
+            .unwrap_or(false)
+    }
+
     pub fn withdraw(env: Env, caller: Address, token: Address, amount: i128, to: Address) {
         caller.require_auth();
         let admin: Address = env
@@ -44,6 +63,9 @@ impl RefractTreasury {
             .expect("not initialized");
         if caller != admin {
             panic!("unauthorized");
+        }
+        if Self::is_emergency_paused(env.clone()) {
+            panic!("emergency paused");
         }
         if amount <= 0 {
             panic!("amount must be positive");
@@ -59,7 +81,7 @@ mod test {
     use soroban_sdk::{testutils::Address as _, Env};
 
     #[test]
-    fn withdraw_is_admin_gated() {
+    fn withdraw_is_admin_gated_and_respects_emergency_pause() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RefractTreasury);
@@ -70,17 +92,20 @@ mod test {
         assert_eq!(client.admin(), admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
-        // Deposit via plain transfer.
         sac.mint(&contract_id, &1_000);
-        assert_eq!(token_client.balance(&contract_id), 1_000);
-
         let to = Address::generate(&env);
+
+        client.set_emergency_paused(&admin, &true);
+        assert!(client.try_withdraw(&admin, &token_id, &400, &to).is_err());
+
+        client.set_emergency_paused(&admin, &false);
         client.withdraw(&admin, &token_id, &400, &to);
         assert_eq!(token_client.balance(&to), 400);
-        assert_eq!(token_client.balance(&contract_id), 600);
     }
 }

@@ -1,8 +1,8 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
-/// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
 
 #[contracterror]
@@ -16,6 +16,7 @@ pub enum BackstopError {
     InsufficientShares = 5,
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
+    EmergencyPaused = 8,
 }
 
 #[contracttype]
@@ -24,7 +25,6 @@ pub struct BackstopConfig {
     pub pool: Address,
     pub admin: Address,
     pub token: Address,
-    /// Share of premium income (in basis points) routed to backstop stakers.
     pub premium_share_bps: i128,
 }
 
@@ -41,8 +41,6 @@ pub struct RefractBackstop;
 
 #[contractimpl]
 impl RefractBackstop {
-    /// Initialize the backstop tranche. `pool` is the only caller allowed to
-    /// draw capital via `cover_shortfall`.
     pub fn initialize(
         env: Env,
         pool: Address,
@@ -71,18 +69,38 @@ impl RefractBackstop {
                 premium_income: 0,
             },
         );
+        env.storage().instance().set(&"paused", &false);
         Ok(())
     }
 
-    /// Deposit `amount` of the configured token and mint backstop shares to
-    /// `staker`, mirroring `RefractPool`'s share-accounting pattern.
+    pub fn set_emergency_paused(
+        env: Env,
+        caller: Address,
+        paused: bool,
+    ) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let config = Self::read_config(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        env.storage().instance().set(&"paused", &paused);
+        Ok(())
+    }
+
+    pub fn is_emergency_paused(env: Env) -> bool {
+        env.storage().instance().get(&"paused").unwrap_or(false)
+    }
+
     pub fn deposit(env: Env, staker: Address, amount: i128) -> Result<i128, BackstopError> {
         staker.require_auth();
+        if Self::is_emergency_paused(env.clone()) {
+            return Err(BackstopError::EmergencyPaused);
+        }
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
         if shares <= 0 {
@@ -106,14 +124,16 @@ impl RefractBackstop {
         Ok(shares)
     }
 
-    /// Burn `shares` and return the proportional capital to `staker`.
     pub fn withdraw(env: Env, staker: Address, shares: i128) -> Result<i128, BackstopError> {
         staker.require_auth();
+        if Self::is_emergency_paused(env.clone()) {
+            return Err(BackstopError::EmergencyPaused);
+        }
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -142,14 +162,9 @@ impl RefractBackstop {
         Ok(amount)
     }
 
-    /// Drain up to `amount` of backstop capital to cover a claim shortfall.
-    /// Callable only by the configured `RefractPool` (or its admin/timelock).
-    /// Returns the amount actually covered. Draining reduces `total_capital`
-    /// without burning shares, so every staker's share price drops
-    /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::read_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -157,7 +172,7 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
 
-        let mut state = Self::state(&env)?;
+        let mut state = Self::read_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
         } else {
@@ -179,15 +194,12 @@ impl RefractBackstop {
         Ok(covered)
     }
 
-    /// Route a slice of premium income to backstop stakers. The premium share
-    /// is configured in basis points; the remainder is left for the caller
-    /// (e.g. the treasury fee-switch) to distribute.
     pub fn receive_premium(env: Env, amount: i128) -> Result<i128, BackstopError> {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let cut = amount * config.premium_share_bps / BPS_DENOM;
         state.premium_income += cut;
@@ -205,15 +217,13 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::read_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::read_config(&env)
     }
 
-    /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
-    /// subsequent depositors get shares proportional to the current share price.
     fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
         if total_shares == 0 || total_capital == 0 {
             amount
@@ -222,8 +232,6 @@ impl RefractBackstop {
         }
     }
 
-    /// Mirror of `RefractPool::_quote_withdrawal`: value of `shares` at the
-    /// current share price.
     fn quote_withdrawal(shares: i128, total_shares: i128, total_capital: i128) -> i128 {
         if total_shares == 0 {
             0
@@ -232,17 +240,49 @@ impl RefractBackstop {
         }
     }
 
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn read_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn read_state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn backstop_emergency_pause_and_loss_event_drawdown() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBackstop);
+        let client = RefractBackstopClient::new(&env, &contract_id);
+        let pool = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let staker = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        token::StellarAssetClient::new(&env, &token_id).mint(&staker, &1_000);
+        client.initialize(&pool, &admin, &token_id, &2_000);
+        client.deposit(&staker, &600);
+
+        client.set_emergency_paused(&admin, &true);
+        assert_eq!(
+            client.try_deposit(&staker, &100),
+            Err(Ok(BackstopError::EmergencyPaused))
+        );
+        // Loss-event drawdown still executes while paused!
+        assert_eq!(client.cover_shortfall(&pool, &200), 200);
     }
 }

@@ -91,3 +91,22 @@ If the governance stack must be replaced, the current `Admin` (the timelock)
 can transfer `Admin` to a new timelock or, in an emergency, back to a bootstrap
 key. Treat any such transfer as a high-impact operation and document it in the
 same proposal that authorizes it.
+
+## Emergency Governance Fast-Track Path with Post-Hoc Ratification
+
+For time-critical incident response, `RefractTimelock` supports a dedicated
+`EmergencyProposal` fast-track queue (`queue_emergency` → `execute_emergency` →
+`ratify_emergency` / `enforce_ratification_deadline`):
+
+- **Strict Action Allowlist:** Only `PauseContract`, `LossEventDrawdown`, and
+  `StuckFundRescue` are eligible. Contract upgrades (`UpgradeContract`) and
+  fast-track parameter changes (`ModifyFastTrackConfig`) are rejected to prevent
+  self-expansion.
+- **Dual Approval Gate:** Requires both a vetoken supermajority (`>= supermajority_bps`)
+  and `RefractMultisig` authorization.
+- **Shortened Delay & Post-Hoc Ratification:** Executes after `fast_track_delay`
+  and must be ratified within `ratification_window` via `ratify_emergency`. If
+  the window expires without ratification, `enforce_ratification_deadline` marks
+  the proposal `Unratified`, emits `emergency_unratified`, and invokes the
+  configured rollback call (e.g. lifting an emergency pause).
+
