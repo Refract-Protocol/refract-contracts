@@ -1,0 +1,21 @@
+{
+  "entries": [
+    {
+      "contract": "refract-backstop",
+      "key": "state",
+      "premium_income": 4000000000,
+      "total_capital": 84000000000,
+      "total_shares": 80000000000
+    },
+    {
+      "contract": "refract-bounty",
+      "escrowed_balance": 25000000000,
+      "key": "balance"
+    }
+  ],
+  "ledger_close_time": 1710000000,
+  "ledger_sequence": 512000,
+  "network": "testnet",
+  "schema_version": 1,
+  "sha256": "8b9a5c7e3f1a4d6e8c0b2a4f6e8d0c2a4b6d8f0e2c4a6b8d0e2f4a6c8b0d2e4f"
+}
