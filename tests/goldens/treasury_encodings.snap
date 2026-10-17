@@ -1,0 +1,4 @@
+contract=refract-treasury
+storage:instance:key=Enum(DataKey::Admin) value=Address(1)
+storage:persistent:key=Enum(DataKey::TotalWithdrawn(Address(2))) value=I128(400)
+event:topic=Vec[Sym(treasury),Sym(withdraw)] data=Map[caller:Address(1),token:Address(2),to:Address(6),amount:I128(400)]

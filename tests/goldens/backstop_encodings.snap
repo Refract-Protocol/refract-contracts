@@ -1,0 +1,6 @@
+contract=refract-backstop
+storage:instance:key=Sym(config) value=Map[pool:Address(0),admin:Address(1),token:Address(2),premium_share_bps:I128(2000)]
+storage:instance:key=Sym(state) value=Map[total_shares:I128(1000),total_capital:I128(1000),premium_income:I128(200)]
+storage:persistent:key=Vec[Sym(shares),Address(3)] value=I128(1000)
+event:topic=Vec[Sym(backstop),Sym(deposit)] data=Map[staker:Address(3),amount:I128(1000),shares:I128(1000)]
+event:topic=Vec[Sym(backstop),Sym(shortfall)] data=Map[caller:Address(0),covered:I128(250)]

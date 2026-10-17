@@ -1,0 +1,7 @@
+contract=refract-bounty
+storage:instance:key=Enum(DataKey::Governance) value=Address(1)
+storage:instance:key=Enum(DataKey::Token) value=Address(2)
+storage:instance:key=Enum(DataKey::Balance) value=I128(600)
+storage:persistent:key=Enum(DataKey::Award(BytesN32(07070707))) value=Map[researcher:Address(4),amount:I128(400),report_hash:BytesN32(07070707),timestamp:U64(1700000000)]
+event:topic=Vec[Sym(bounty),Sym(funded)] data=Map[from:Address(5),amount:I128(1000)]
+event:topic=Vec[Sym(bounty),Sym(awarded)] data=Map[researcher:Address(4),amount:I128(400),report_hash:BytesN32(07070707)]

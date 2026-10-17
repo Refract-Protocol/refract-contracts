@@ -1,0 +1,7 @@
+contract=refract-grants
+storage:instance:key=Enum(DataKey::Governance) value=Address(1)
+storage:instance:key=Enum(DataKey::NextGrantId) value=U64(1)
+storage:persistent:key=Enum(DataKey::Grant(0)) value=Map[recipient:Address(2),total_amount:I128(300),milestones:Vec[Map[amount:I128(100),confirmed:Bool(true),claimed:Bool(true)],Map[amount:I128(200),confirmed:Bool(false),claimed:Bool(false)]],claimable:I128(0)]
+event:topic=Vec[Sym(grants),Sym(created)] data=Map[grant_id:U64(0),recipient:Address(2),total_amount:I128(300)]
+event:topic=Vec[Sym(grants),Sym(milestone_confirmed)] data=Map[grant_id:U64(0),milestone_index:U32(0),amount:I128(100)]
+event:topic=Vec[Sym(grants),Sym(claimed)] data=Map[grant_id:U64(0),recipient:Address(2),amount:I128(100)]

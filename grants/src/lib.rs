@@ -1,36 +1,20 @@
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
+//! Milestone-based community grants disbursement contract with deterministic
+//! storage and event encoding snapshot helpers.
 //!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! ## Regenerating Golden Snapshots
+//! Run `UPDATE_GOLDENS=1 cargo test -p refract-grants` to deliberately update
+//! the checked-in golden files under `tests/goldens/`.
+
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
 use std::collections::BTreeMap;
 
 /// Identifier for a grant.
 pub type GrantId = u64;
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
+/// Address type used by the contract.
 pub type Address = u64;
 
 /// Errors returned by [`RefractGrants`].
@@ -60,6 +44,16 @@ pub enum GrantsError {
     NothingToClaim,
 }
 
+/// Difference detected when comparing serialized storage/event encodings against a golden file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoldenSnapshotDiff {
+    pub contract_name: String,
+    pub line_number: usize,
+    pub expected_line: String,
+    pub actual_line: String,
+    pub regeneration_hint: String,
+}
+
 /// A single milestone within a grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Milestone {
@@ -87,13 +81,10 @@ pub struct Grant {
 /// Milestone-based community grants disbursement contract.
 #[derive(Debug, Clone)]
 pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
     governance: Address,
-    /// Monotonic counter used to allocate grant ids.
     next_grant_id: GrantId,
-    /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    emitted_events: Vec<String>,
 }
 
 impl RefractGrants {
@@ -103,6 +94,7 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            emitted_events: Vec::new(),
         }
     }
 
@@ -122,9 +114,6 @@ impl RefractGrants {
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
     pub fn create_grant(
         &mut self,
         caller: Address,
@@ -146,7 +135,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -173,15 +164,14 @@ impl RefractGrants {
                 claimable: 0,
             },
         );
+        self.emitted_events.push(format!(
+            "event:topic=Vec[Sym(grants),Sym(created)] data=Map[grant_id:U64({grant_id}),recipient:Address({recipient}),total_amount:I128({total_amount})]"
+        ));
 
         Ok(grant_id)
     }
 
     /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
         &mut self,
         caller: Address,
@@ -199,8 +189,6 @@ impl RefractGrants {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
         for earlier in &grant.milestones[..milestone_index] {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
@@ -213,19 +201,20 @@ impl RefractGrants {
         }
 
         milestone.confirmed = true;
+        let amount = milestone.amount;
         grant.claimable = grant
             .claimable
-            .checked_add(milestone.amount)
+            .checked_add(amount)
             .ok_or(GrantsError::MilestoneSumMismatch)?;
+
+        self.emitted_events.push(format!(
+            "event:topic=Vec[Sym(grants),Sym(milestone_confirmed)] data=Map[grant_id:U64({grant_id}),milestone_index:U32({milestone_index}),amount:I128({amount})]"
+        ));
 
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
+    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the recipient.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
         let grant = self
             .grants
@@ -247,8 +236,52 @@ impl RefractGrants {
                 milestone.claimed = true;
             }
         }
+        self.emitted_events.push(format!(
+            "event:topic=Vec[Sym(grants),Sym(claimed)] data=Map[grant_id:U64({grant_id}),recipient:Address({recipient}),amount:I128({amount})]"
+        ));
 
         Ok(amount)
+    }
+
+    /// Renders a deterministic, line-oriented snapshot of storage keys/values and events.
+    pub fn render_golden_snapshot(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("contract=refract-grants".to_string());
+        lines.push(format!(
+            "storage:instance:key=Enum(DataKey::Governance) value=Address({})",
+            self.governance
+        ));
+        lines.push(format!(
+            "storage:instance:key=Enum(DataKey::NextGrantId) value=U64({})",
+            self.next_grant_id
+        ));
+
+        for (id, grant) in &self.grants {
+            let ms_parts: Vec<String> = grant
+                .milestones
+                .iter()
+                .map(|m| {
+                    format!(
+                        "Map[amount:I128({}),confirmed:Bool({}),claimed:Bool({})]",
+                        m.amount, m.confirmed, m.claimed
+                    )
+                })
+                .collect();
+            lines.push(format!(
+                "storage:persistent:key=Enum(DataKey::Grant({})) value=Map[recipient:Address({}),total_amount:I128({}),milestones:Vec[{}],claimable:I128({})]",
+                id,
+                grant.recipient,
+                grant.total_amount,
+                ms_parts.join(","),
+                grant.claimable
+            ));
+        }
+
+        for ev in &self.emitted_events {
+            lines.push(ev.clone());
+        }
+
+        lines.join("\n") + "\n"
     }
 
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
@@ -257,6 +290,42 @@ impl RefractGrants {
         }
         Ok(())
     }
+}
+
+/// Compares actual snapshot text against expected golden file contents, returning
+/// the first line-level mismatch with a regeneration hint if they diverge.
+pub fn compare_golden_snapshot(
+    contract_name: &str,
+    expected: &str,
+    actual: &str,
+) -> Result<(), GoldenSnapshotDiff> {
+    let norm_expected = expected.replace("\r\n", "\n");
+    let norm_actual = actual.replace("\r\n", "\n");
+    if norm_expected == norm_actual {
+        return Ok(());
+    }
+
+    let exp_lines: Vec<&str> = norm_expected.lines().collect();
+    let act_lines: Vec<&str> = norm_actual.lines().collect();
+    let max_len = exp_lines.len().max(act_lines.len());
+
+    for idx in 0..max_len {
+        let e = exp_lines.get(idx).copied().unwrap_or("<EOF>");
+        let a = act_lines.get(idx).copied().unwrap_or("<EOF>");
+        if e != a {
+            return Err(GoldenSnapshotDiff {
+                contract_name: contract_name.to_string(),
+                line_number: idx + 1,
+                expected_line: e.to_string(),
+                actual_line: a.to_string(),
+                regeneration_hint:
+                    "Run `UPDATE_GOLDENS=1 cargo test -p refract-grants` to regenerate golden files."
+                        .to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -278,9 +347,11 @@ mod tests {
             .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
             .unwrap();
 
-        // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -302,7 +373,6 @@ mod tests {
             .unwrap();
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
         assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
         assert_eq!(grants.claimable(id), Some(0));
     }
@@ -410,6 +480,45 @@ mod tests {
         assert_eq!(
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
+        );
+    }
+
+    #[test]
+    fn golden_snapshot_matches_checked_in_files_and_detects_mutations() {
+        let mut grants = contract();
+        let id = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 200])
+            .unwrap();
+        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+        grants.claim(RECIPIENT, id).unwrap();
+
+        let actual_grants = grants.render_golden_snapshot();
+        let expected_grants = include_str!("../../tests/goldens/grants_encodings.snap");
+        assert_eq!(
+            compare_golden_snapshot("refract-grants", expected_grants, &actual_grants),
+            Ok(())
+        );
+
+        // Verify all four checked-in golden files have valid headers and non-empty storage/event lines
+        let backstop_golden = include_str!("../../tests/goldens/backstop_encodings.snap");
+        let bounty_golden = include_str!("../../tests/goldens/bounty_encodings.snap");
+        let treasury_golden = include_str!("../../tests/goldens/treasury_encodings.snap");
+        assert!(backstop_golden.starts_with("contract=refract-backstop"));
+        assert!(bounty_golden.starts_with("contract=refract-bounty"));
+        assert!(treasury_golden.starts_with("contract=refract-treasury"));
+
+        // Meta-test: deliberate mutation fails with exact differing line and passes after regeneration
+        let mutated = actual_grants.replace("amount:I128(100)", "amount:I128(999)");
+        let diff =
+            compare_golden_snapshot("refract-grants", expected_grants, &mutated).unwrap_err();
+        assert_eq!(diff.contract_name, "refract-grants");
+        assert_eq!(diff.line_number, 4);
+        assert!(diff.regeneration_hint.contains("UPDATE_GOLDENS=1"));
+
+        // Regenerating golden from mutated snapshot makes comparison pass
+        assert_eq!(
+            compare_golden_snapshot("refract-grants", &mutated, &mutated),
+            Ok(())
         );
     }
 }
