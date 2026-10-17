@@ -213,3 +213,37 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Double-Entry Accounting Identity (`Backstop`, `Bounty`, `Grants`, `Treasury`)
+
+Every value-moving action across `RefractBackstop`, `RefractBountyEscrow`,
+`RefractGrants`, and `RefractTreasury` posts an append-only `JournalEntry`:
+
+```
+JournalEntry {
+    entry_id:        u64,
+    debit_account:   Address,
+    credit_account:  Address,
+    asset:           Address,
+    amount:          i128,   -- strictly positive (> 0)
+    action_tag:      Symbol,
+    ledger_sequence: u32,
+}
+```
+
+### INV-6  Double-Entry Accounting Identity
+
+```
+∀ asset: Address,
+    debit_account != credit_account
+    ∧ total_debits(asset) == total_credits(asset)
+    ∧ Σ_{a ∈ Accounts(asset)} balance_of(a, asset) == 0
+```
+
+Each contract exposes `assert_balanced(asset)` to verify on-chain that total
+debits equal total credits, the sum of net balances across all touched accounts
+is zero, and the contract's internal escrow/capital state matches its derived
+journal balance.
+

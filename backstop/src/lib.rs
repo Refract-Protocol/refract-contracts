@@ -1,6 +1,10 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    Vec,
+};
 
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
@@ -16,6 +20,20 @@ pub enum BackstopError {
     InsufficientShares = 5,
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
+    SelfTransfer = 8,
+    AccountingImbalance = 9,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalEntry {
+    pub entry_id: u64,
+    pub debit_account: Address,
+    pub credit_account: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub action_tag: Symbol,
+    pub ledger_sequence: u32,
 }
 
 #[contracttype]
@@ -71,6 +89,7 @@ impl RefractBackstop {
                 premium_income: 0,
             },
         );
+        env.storage().instance().set(&"next_entry_id", &1u64);
         Ok(())
     }
 
@@ -81,19 +100,25 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
 
-        token::Client::new(&env, &config.token).transfer(
-            &staker,
-            &env.current_contract_address(),
-            &amount,
-        );
+        let backstop_addr = env.current_contract_address();
+        Self::post_journal_entry(
+            &env,
+            backstop_addr.clone(),
+            staker.clone(),
+            config.token.clone(),
+            amount,
+            symbol_short!("deposit"),
+        )?;
+
+        token::Client::new(&env, &config.token).transfer(&staker, &backstop_addr, &amount);
 
         let key = ("shares", staker.clone());
         let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -112,8 +137,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -126,30 +151,34 @@ impl RefractBackstop {
             return Err(BackstopError::InsufficientCapital);
         }
 
+        let backstop_addr = env.current_contract_address();
+        if amount > 0 {
+            Self::post_journal_entry(
+                &env,
+                staker.clone(),
+                backstop_addr.clone(),
+                config.token.clone(),
+                amount,
+                symbol_short!("withdraw"),
+            )?;
+        }
+
         env.storage().persistent().set(&key, &(held - shares));
         state.total_shares -= shares;
         state.total_capital -= amount;
         env.storage().instance().set(&"state", &state);
 
         if amount > 0 {
-            token::Client::new(&env, &config.token).transfer(
-                &env.current_contract_address(),
-                &staker,
-                &amount,
-            );
+            token::Client::new(&env, &config.token).transfer(&backstop_addr, &staker, &amount);
         }
 
         Ok(amount)
     }
 
     /// Drain up to `amount` of backstop capital to cover a claim shortfall.
-    /// Callable only by the configured `RefractPool` (or its admin/timelock).
-    /// Returns the amount actually covered. Draining reduces `total_capital`
-    /// without burning shares, so every staker's share price drops
-    /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::read_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -157,7 +186,7 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
 
-        let mut state = Self::state(&env)?;
+        let mut state = Self::read_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
         } else {
@@ -167,29 +196,43 @@ impl RefractBackstop {
             return Ok(0);
         }
 
+        let backstop_addr = env.current_contract_address();
+        Self::post_journal_entry(
+            &env,
+            config.pool.clone(),
+            backstop_addr.clone(),
+            config.token.clone(),
+            covered,
+            symbol_short!("shortfall"),
+        )?;
+
         state.total_capital -= covered;
         env.storage().instance().set(&"state", &state);
 
-        token::Client::new(&env, &config.token).transfer(
-            &env.current_contract_address(),
-            &config.pool,
-            &covered,
-        );
+        token::Client::new(&env, &config.token).transfer(&backstop_addr, &config.pool, &covered);
 
         Ok(covered)
     }
 
-    /// Route a slice of premium income to backstop stakers. The premium share
-    /// is configured in basis points; the remainder is left for the caller
-    /// (e.g. the treasury fee-switch) to distribute.
+    /// Route a slice of premium income to backstop stakers.
     pub fn receive_premium(env: Env, amount: i128) -> Result<i128, BackstopError> {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let cut = amount * config.premium_share_bps / BPS_DENOM;
+        if cut > 0 {
+            Self::post_journal_entry(
+                &env,
+                env.current_contract_address(),
+                config.pool.clone(),
+                config.token.clone(),
+                cut,
+                symbol_short!("premium"),
+            )?;
+        }
         state.premium_income += cut;
         state.total_capital += cut;
         env.storage().instance().set(&"state", &state);
@@ -205,15 +248,171 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::read_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::read_config(&env)
     }
 
-    /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
-    /// subsequent depositors get shares proportional to the current share price.
+    /// Net double-entry journal balance `(debits - credits)` for `(account, asset)`.
+    pub fn balance_of(env: Env, account: Address, asset: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&("acct_bal", account, asset))
+            .unwrap_or(0)
+    }
+
+    /// Total gross posted volume (`total_debits == total_credits`) for `asset`.
+    pub fn total_supply(env: Env, asset: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&("tot_debit", asset))
+            .unwrap_or(0)
+    }
+
+    /// Total number of journal entries recorded.
+    pub fn journal_count(env: Env) -> u64 {
+        let next: u64 = env.storage().instance().get(&"next_entry_id").unwrap_or(1);
+        next.saturating_sub(1)
+    }
+
+    /// Fetch a specific journal entry by `entry_id`.
+    pub fn journal_entry(env: Env, entry_id: u64) -> Option<JournalEntry> {
+        env.storage().persistent().get(&("journal", entry_id))
+    }
+
+    /// Assert the double-entry accounting identity for `asset`.
+    pub fn assert_balanced(env: Env, asset: Address) -> Result<bool, BackstopError> {
+        let debits: i128 = env
+            .storage()
+            .persistent()
+            .get(&("tot_debit", asset.clone()))
+            .unwrap_or(0);
+        let credits: i128 = env
+            .storage()
+            .persistent()
+            .get(&("tot_credit", asset.clone()))
+            .unwrap_or(0);
+        if debits != credits {
+            return Err(BackstopError::AccountingImbalance);
+        }
+
+        let accounts: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&("asset_accts", asset.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut net_sum: i128 = 0;
+        for acc in accounts.iter() {
+            net_sum += Self::balance_of(env.clone(), acc, asset.clone());
+        }
+        if net_sum != 0 {
+            return Err(BackstopError::AccountingImbalance);
+        }
+
+        let state = Self::read_state(&env)?;
+        let journal_capital = Self::balance_of(env.clone(), env.current_contract_address(), asset);
+        if state.total_capital != journal_capital {
+            return Err(BackstopError::AccountingImbalance);
+        }
+
+        Ok(true)
+    }
+
+    fn post_journal_entry(
+        env: &Env,
+        debit_account: Address,
+        credit_account: Address,
+        asset: Address,
+        amount: i128,
+        action_tag: Symbol,
+    ) -> Result<u64, BackstopError> {
+        if amount <= 0 {
+            return Err(BackstopError::InvalidAmount);
+        }
+        if debit_account == credit_account {
+            return Err(BackstopError::SelfTransfer);
+        }
+
+        let entry_id: u64 = env.storage().instance().get(&"next_entry_id").unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&"next_entry_id", &(entry_id + 1));
+
+        let entry = JournalEntry {
+            entry_id,
+            debit_account: debit_account.clone(),
+            credit_account: credit_account.clone(),
+            asset: asset.clone(),
+            amount,
+            action_tag: action_tag.clone(),
+            ledger_sequence: env.ledger().sequence(),
+        };
+        env.storage()
+            .persistent()
+            .set(&("journal", entry_id), &entry);
+
+        Self::track_account(env, &asset, &debit_account);
+        Self::track_account(env, &asset, &credit_account);
+
+        let debit_bal = Self::balance_of(env.clone(), debit_account.clone(), asset.clone());
+        let credit_bal = Self::balance_of(env.clone(), credit_account.clone(), asset.clone());
+        env.storage().persistent().set(
+            &("acct_bal", debit_account.clone(), asset.clone()),
+            &(debit_bal + amount),
+        );
+        env.storage().persistent().set(
+            &("acct_bal", credit_account.clone(), asset.clone()),
+            &(credit_bal - amount),
+        );
+
+        let debits: i128 = env
+            .storage()
+            .persistent()
+            .get(&("tot_debit", asset.clone()))
+            .unwrap_or(0);
+        let credits: i128 = env
+            .storage()
+            .persistent()
+            .get(&("tot_credit", asset.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&("tot_debit", asset.clone()), &(debits + amount));
+        env.storage()
+            .persistent()
+            .set(&("tot_credit", asset.clone()), &(credits + amount));
+
+        env.events().publish(
+            (Symbol::new(env, "journal_posted"), entry_id),
+            (
+                debit_account,
+                credit_account,
+                asset,
+                amount,
+                action_tag,
+                entry.ledger_sequence,
+            ),
+        );
+
+        Ok(entry_id)
+    }
+
+    fn track_account(env: &Env, asset: &Address, account: &Address) {
+        let mut accounts: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&("asset_accts", asset.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if !accounts.contains(account) {
+            accounts.push_back(account.clone());
+            env.storage()
+                .persistent()
+                .set(&("asset_accts", asset.clone()), &accounts);
+        }
+    }
+
     fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
         if total_shares == 0 || total_capital == 0 {
             amount
@@ -222,8 +421,6 @@ impl RefractBackstop {
         }
     }
 
-    /// Mirror of `RefractPool::_quote_withdrawal`: value of `shares` at the
-    /// current share price.
     fn quote_withdrawal(shares: i128, total_shares: i128, total_capital: i128) -> i128 {
         if total_shares == 0 {
             0
@@ -232,17 +429,57 @@ impl RefractBackstop {
         }
     }
 
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn read_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn read_state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn backstop_lifecycle_maintains_double_entry_identity() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RefractBackstop);
+        let client = RefractBackstopClient::new(&env, &contract_id);
+
+        let pool = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let staker = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        sac.mint(&staker, &1_000);
+        client.initialize(&pool, &admin, &token_id, &2_000);
+
+        client.deposit(&staker, &1_000);
+        assert!(client.assert_balanced(&token_id));
+
+        client.receive_premium(&500);
+        assert!(client.assert_balanced(&token_id));
+
+        client.cover_shortfall(&pool, &300);
+        assert!(client.assert_balanced(&token_id));
+
+        client.withdraw(&staker, &500);
+        assert!(client.assert_balanced(&token_id));
+        assert_eq!(client.journal_count(), 4);
     }
 }
