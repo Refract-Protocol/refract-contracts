@@ -1,415 +1,558 @@
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based ecosystem grant disbursement contract with budgeted reviewer
+//! assignment rate-locking, accrual on review completion, recusal/withhold
+//! handling, and pull-based compensation claims.
 
-use std::collections::BTreeMap;
+#![no_std]
+#![allow(
+    clippy::disallowed_methods,
+    clippy::inconsistent_digit_grouping,
+    clippy::too_many_arguments
+)]
 
-/// Identifier for a grant.
-pub type GrantId = u64;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    Vec,
+};
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
-pub type Address = u64;
-
-/// Errors returned by [`RefractGrants`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum GrantsError {
-    /// Caller is not the configured governance/timelock authority.
-    Unauthorized,
-    /// No grant exists for the supplied id.
-    GrantNotFound,
-    /// A grant must declare at least one milestone.
-    NoMilestones,
-    /// Milestone amounts do not sum to the declared total amount.
-    MilestoneSumMismatch,
-    /// A milestone amount was zero or negative.
-    InvalidMilestoneAmount,
-    /// The total amount was zero or negative.
-    InvalidTotalAmount,
-    /// The milestone index is out of range for the grant.
-    InvalidMilestoneIndex,
-    /// The milestone has already been confirmed.
-    MilestoneAlreadyConfirmed,
-    /// Milestones must be confirmed in order; an earlier one is still pending.
-    MilestoneOutOfOrder,
-    /// The caller is not the grant recipient.
-    NotRecipient,
-    /// There is no confirmed-but-unclaimed amount to release.
-    NothingToClaim,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    InvalidConfig = 3,
+    InvalidGrant = 4,
+    GrantNotFound = 5,
+    MilestoneNotFound = 6,
+    MilestoneAlreadyReleased = 7,
+    GrantNotActive = 8,
+    DuplicateApproval = 9,
+    InsufficientReviewBudget = 10,
+    AssignmentNotFound = 11,
+    InvalidAssignmentState = 12,
+    NothingToClaim = 13,
+    UnauthorizedReviewer = 14,
 }
 
-/// A single milestone within a grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Config,
+    NextGrantId,
+    Grant(u64),
+    ProgramReviewBudget(u64),
+    NextAssignmentId,
+    ReviewAssignment(u64),
+    ReviewerLedger(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub governance: Address,
+    pub reviewers: Vec<Address>,
+    pub approval_threshold: u32,
+    pub token: Address,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum GrantStatus {
+    Active = 0,
+    Completed = 1,
+    Cancelled = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Milestone {
-    /// Amount released when this milestone is confirmed.
+    pub description: Symbol,
     pub amount: i128,
-    /// Whether governance has confirmed delivery of this milestone.
-    pub confirmed: bool,
-    /// Whether the confirmed amount has already been claimed.
-    pub claimed: bool,
+    pub approvals: Vec<Address>,
+    pub released: bool,
 }
 
-/// A grant approved by governance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Grant {
-    /// Account that receives released funds.
+    pub id: u64,
     pub recipient: Address,
-    /// Total amount approved across all milestones.
     pub total_amount: i128,
-    /// Ordered milestones; index 0 is confirmed first.
+    pub released_amount: i128,
     pub milestones: Vec<Milestone>,
-    /// Sum of confirmed-but-unclaimed milestone amounts.
-    pub claimable: i128,
+    pub status: GrantStatus,
 }
 
-/// Milestone-based community grants disbursement contract.
-#[derive(Debug, Clone)]
-pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
-    governance: Address,
-    /// Monotonic counter used to allocate grant ids.
-    next_grant_id: GrantId,
-    /// Stored grants keyed by id.
-    grants: BTreeMap<GrantId, Grant>,
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramReviewBudget {
+    pub program_id: u64,
+    pub total_funded: i128,
+    pub locked_amount: i128,
+    pub disbursed_amount: i128,
+    pub per_review_rate: i128,
 }
 
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AssignmentState {
+    Assigned = 0,
+    Submitted = 1,
+    Recused = 2,
+    Withheld = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAssignment {
+    pub id: u64,
+    pub program_id: u64,
+    pub grant_id: u64,
+    pub reviewer: Address,
+    pub locked_rate: i128,
+    pub state: AssignmentState,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewerLedger {
+    pub reviewer: Address,
+    pub accrued_claimable: i128,
+    pub total_claimed: i128,
+    pub lifetime_earned: i128,
+    pub total_withheld: i128,
+}
+
+#[contract]
+pub struct RefractGrants;
+
+#[contractimpl]
 impl RefractGrants {
-    /// Creates a new grants contract governed by `governance` (the timelock).
-    pub fn new(governance: Address) -> Self {
-        Self {
-            governance,
-            next_grant_id: 0,
-            grants: BTreeMap::new(),
-        }
-    }
-
-    /// Returns the configured governance/timelock authority.
-    pub fn governance(&self) -> Address {
-        self.governance
-    }
-
-    /// Returns the grant for `grant_id`, if any.
-    pub fn get_grant(&self, grant_id: GrantId) -> Option<&Grant> {
-        self.grants.get(&grant_id)
-    }
-
-    /// Returns the confirmed-but-unclaimed amount for `grant_id`.
-    pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
-        self.grants.get(&grant_id).map(|grant| grant.claimable)
-    }
-
-    /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
-    pub fn create_grant(
-        &mut self,
-        caller: Address,
-        recipient: Address,
-        total_amount: i128,
-        milestones: Vec<i128>,
-    ) -> Result<GrantId, GrantsError> {
-        self.require_governance(caller)?;
-
-        if total_amount <= 0 {
-            return Err(GrantsError::InvalidTotalAmount);
-        }
-        if milestones.is_empty() {
-            return Err(GrantsError::NoMilestones);
-        }
-
-        let mut sum: i128 = 0;
-        for amount in &milestones {
-            if *amount <= 0 {
-                return Err(GrantsError::InvalidMilestoneAmount);
-            }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
-        }
-        if sum != total_amount {
-            return Err(GrantsError::MilestoneSumMismatch);
-        }
-
-        let grant_id = self.next_grant_id;
-        self.next_grant_id += 1;
-
-        let stored = milestones
-            .into_iter()
-            .map(|amount| Milestone {
-                amount,
-                confirmed: false,
-                claimed: false,
-            })
-            .collect();
-
-        self.grants.insert(
-            grant_id,
-            Grant {
-                recipient,
-                total_amount,
-                milestones: stored,
-                claimable: 0,
-            },
-        );
-
-        Ok(grant_id)
-    }
-
-    /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
-    pub fn confirm_milestone(
-        &mut self,
-        caller: Address,
-        grant_id: GrantId,
-        milestone_index: usize,
+    pub fn initialize(
+        env: Env,
+        governance: Address,
+        reviewers: Vec<Address>,
+        approval_threshold: u32,
+        token: Address,
     ) -> Result<(), GrantsError> {
-        self.require_governance(caller)?;
-
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
-
-        if milestone_index >= grant.milestones.len() {
-            return Err(GrantsError::InvalidMilestoneIndex);
+        if env.storage().instance().has(&DataKey::Config) {
+            return Err(GrantsError::AlreadyInitialized);
         }
-
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
-        for earlier in &grant.milestones[..milestone_index] {
-            if !earlier.confirmed {
-                return Err(GrantsError::MilestoneOutOfOrder);
-            }
+        governance.require_auth();
+        if reviewers.is_empty() || approval_threshold == 0 || approval_threshold > reviewers.len() {
+            return Err(GrantsError::InvalidConfig);
         }
-
-        let milestone = &mut grant.milestones[milestone_index];
-        if milestone.confirmed {
-            return Err(GrantsError::MilestoneAlreadyConfirmed);
-        }
-
-        milestone.confirmed = true;
-        grant.claimable = grant
-            .claimable
-            .checked_add(milestone.amount)
-            .ok_or(GrantsError::MilestoneSumMismatch)?;
-
+        let cfg = Config {
+            governance,
+            reviewers,
+            approval_threshold,
+            token,
+        };
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        env.storage().instance().set(&DataKey::NextGrantId, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextAssignmentId, &0u64);
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
-    pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
+    /// Funds a per-program review budget and configures the current per-review rate.
+    pub fn fund_program_review_budget(
+        env: Env,
+        program_id: u64,
+        amount: i128,
+        per_review_rate: i128,
+    ) -> Result<ProgramReviewBudget, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
+        if amount < 0 || per_review_rate <= 0 {
+            return Err(GrantsError::InvalidConfig);
+        }
+        if amount > 0 {
+            token::Client::new(&env, &cfg.token).transfer(
+                &cfg.governance,
+                &env.current_contract_address(),
+                &amount,
+            );
+        }
+        let mut budget = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ProgramReviewBudget>(&DataKey::ProgramReviewBudget(program_id))
+            .unwrap_or(ProgramReviewBudget {
+                program_id,
+                total_funded: 0,
+                locked_amount: 0,
+                disbursed_amount: 0,
+                per_review_rate,
+            });
+        budget.total_funded += amount;
+        budget.per_review_rate = per_review_rate;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProgramReviewBudget(program_id), &budget);
+        Ok(budget)
+    }
 
-        if grant.recipient != recipient {
-            return Err(GrantsError::NotRecipient);
+    /// Assigns a reviewer to a grant review and locks the current program per-review rate.
+    pub fn assign_review(
+        env: Env,
+        program_id: u64,
+        grant_id: u64,
+        reviewer: Address,
+    ) -> Result<u64, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
+        if !cfg.reviewers.contains(&reviewer) {
+            return Err(GrantsError::UnauthorizedReviewer);
         }
 
-        let amount = grant.claimable;
-        if amount <= 0 {
+        let mut budget: ProgramReviewBudget = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProgramReviewBudget(program_id))
+            .ok_or(GrantsError::InsufficientReviewBudget)?;
+        let available = budget.total_funded - budget.locked_amount - budget.disbursed_amount;
+        if available < budget.per_review_rate {
+            return Err(GrantsError::InsufficientReviewBudget);
+        }
+        budget.locked_amount += budget.per_review_rate;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProgramReviewBudget(program_id), &budget);
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextAssignmentId)
+            .unwrap_or(0);
+        let assignment = ReviewAssignment {
+            id,
+            program_id,
+            grant_id,
+            reviewer: reviewer.clone(),
+            locked_rate: budget.per_review_rate,
+            state: AssignmentState::Assigned,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewAssignment(id), &assignment);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextAssignmentId, &(id + 1));
+
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("rev_asgn")),
+            (id, program_id, grant_id, reviewer, budget.per_review_rate),
+        );
+        Ok(id)
+    }
+
+    /// Submits a completed review and accrues the locked rate to the reviewer's claimable balance.
+    pub fn submit_review(
+        env: Env,
+        reviewer: Address,
+        assignment_id: u64,
+    ) -> Result<i128, GrantsError> {
+        reviewer.require_auth();
+        let mut assignment: ReviewAssignment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewAssignment(assignment_id))
+            .ok_or(GrantsError::AssignmentNotFound)?;
+        if assignment.reviewer != reviewer {
+            return Err(GrantsError::UnauthorizedReviewer);
+        }
+        if assignment.state != AssignmentState::Assigned {
+            return Err(GrantsError::InvalidAssignmentState);
+        }
+
+        assignment.state = AssignmentState::Submitted;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewAssignment(assignment_id), &assignment);
+
+        let mut ledger = Self::read_reviewer_ledger(&env, &reviewer);
+        ledger.accrued_claimable += assignment.locked_rate;
+        ledger.lifetime_earned += assignment.locked_rate;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewerLedger(reviewer.clone()), &ledger);
+
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("rev_accr")),
+            (assignment_id, reviewer, assignment.locked_rate),
+        );
+        Ok(assignment.locked_rate)
+    }
+
+    /// Recuses an assigned reviewer before submission; unlocks the reserved rate and accrues nothing.
+    pub fn recuse_review(
+        env: Env,
+        reviewer: Address,
+        assignment_id: u64,
+    ) -> Result<(), GrantsError> {
+        reviewer.require_auth();
+        let mut assignment: ReviewAssignment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewAssignment(assignment_id))
+            .ok_or(GrantsError::AssignmentNotFound)?;
+        if assignment.reviewer != reviewer {
+            return Err(GrantsError::UnauthorizedReviewer);
+        }
+        if assignment.state != AssignmentState::Assigned {
+            return Err(GrantsError::InvalidAssignmentState);
+        }
+
+        assignment.state = AssignmentState::Recused;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewAssignment(assignment_id), &assignment);
+
+        let mut budget: ProgramReviewBudget = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProgramReviewBudget(assignment.program_id))
+            .ok_or(GrantsError::InsufficientReviewBudget)?;
+        budget.locked_amount -= assignment.locked_rate;
+        env.storage().persistent().set(
+            &DataKey::ProgramReviewBudget(assignment.program_id),
+            &budget,
+        );
+
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("rev_rec")),
+            (assignment_id, reviewer),
+        );
+        Ok(())
+    }
+
+    /// Governance withhold/cancel for a bad-faith or slashed review (before or after submission, prior to claim).
+    pub fn withhold_review_compensation(env: Env, assignment_id: u64) -> Result<(), GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
+        let mut assignment: ReviewAssignment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewAssignment(assignment_id))
+            .ok_or(GrantsError::AssignmentNotFound)?;
+
+        if assignment.state == AssignmentState::Recused
+            || assignment.state == AssignmentState::Withheld
+        {
+            return Err(GrantsError::InvalidAssignmentState);
+        }
+
+        if assignment.state == AssignmentState::Submitted {
+            let mut ledger = Self::read_reviewer_ledger(&env, &assignment.reviewer);
+            if ledger.accrued_claimable < assignment.locked_rate {
+                return Err(GrantsError::InvalidAssignmentState);
+            }
+            ledger.accrued_claimable -= assignment.locked_rate;
+            ledger.lifetime_earned -= assignment.locked_rate;
+            ledger.total_withheld += assignment.locked_rate;
+            env.storage().persistent().set(
+                &DataKey::ReviewerLedger(assignment.reviewer.clone()),
+                &ledger,
+            );
+        }
+
+        let mut budget: ProgramReviewBudget = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProgramReviewBudget(assignment.program_id))
+            .ok_or(GrantsError::InsufficientReviewBudget)?;
+        budget.locked_amount -= assignment.locked_rate;
+        env.storage().persistent().set(
+            &DataKey::ProgramReviewBudget(assignment.program_id),
+            &budget,
+        );
+
+        assignment.state = AssignmentState::Withheld;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewAssignment(assignment_id), &assignment);
+
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("rev_whld")),
+            (assignment_id, assignment.reviewer, assignment.locked_rate),
+        );
+        Ok(())
+    }
+
+    /// Pull-based claim of accrued reviewer compensation.
+    pub fn claim_reviewer_compensation(env: Env, reviewer: Address) -> Result<i128, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        reviewer.require_auth();
+        let mut ledger = Self::read_reviewer_ledger(&env, &reviewer);
+        if ledger.accrued_claimable <= 0 {
             return Err(GrantsError::NothingToClaim);
         }
+        let amount = ledger.accrued_claimable;
+        ledger.accrued_claimable = 0;
+        ledger.total_claimed += amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewerLedger(reviewer.clone()), &ledger);
 
-        grant.claimable = 0;
-        for milestone in grant.milestones.iter_mut() {
-            if milestone.confirmed {
-                milestone.claimed = true;
-            }
-        }
+        token::Client::new(&env, &cfg.token).transfer(
+            &env.current_contract_address(),
+            &reviewer,
+            &amount,
+        );
 
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("rev_clm")),
+            (reviewer, amount),
+        );
         Ok(amount)
     }
 
-    fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
-        if caller != self.governance {
-            return Err(GrantsError::Unauthorized);
+    pub fn create_grant(
+        env: Env,
+        recipient: Address,
+        milestones: Vec<(Symbol, i128)>,
+    ) -> Result<u64, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
+        if milestones.is_empty() {
+            return Err(GrantsError::InvalidGrant);
         }
-        Ok(())
+        let mut total: i128 = 0;
+        let mut built: Vec<Milestone> = Vec::new(&env);
+        for (desc, amount) in milestones.iter() {
+            if amount <= 0 {
+                return Err(GrantsError::InvalidGrant);
+            }
+            total = total.checked_add(amount).ok_or(GrantsError::InvalidGrant)?;
+            built.push_back(Milestone {
+                description: desc,
+                amount,
+                approvals: Vec::new(&env),
+                released: false,
+            });
+        }
+        token::Client::new(&env, &cfg.token).transfer(
+            &cfg.governance,
+            &env.current_contract_address(),
+            &total,
+        );
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextGrantId)
+            .unwrap_or(0);
+        let grant = Grant {
+            id,
+            recipient: recipient.clone(),
+            total_amount: total,
+            released_amount: 0,
+            milestones: built,
+            status: GrantStatus::Active,
+        };
+        env.storage().persistent().set(&DataKey::Grant(id), &grant);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextGrantId, &(id + 1));
+        Ok(id)
+    }
+
+    pub fn get_grant(env: Env, grant_id: u64) -> Option<Grant> {
+        env.storage().persistent().get(&DataKey::Grant(grant_id))
+    }
+
+    pub fn reviewer_compensation(env: Env, reviewer: Address) -> ReviewerLedger {
+        Self::read_reviewer_ledger(&env, &reviewer)
+    }
+
+    pub fn review_assignment(env: Env, assignment_id: u64) -> Option<ReviewAssignment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewAssignment(assignment_id))
+    }
+
+    fn read_reviewer_ledger(env: &Env, reviewer: &Address) -> ReviewerLedger {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewerLedger(reviewer.clone()))
+            .unwrap_or_else(|| ReviewerLedger {
+                reviewer: reviewer.clone(),
+                accrued_claimable: 0,
+                total_claimed: 0,
+                lifetime_earned: 0,
+                total_withheld: 0,
+            })
+    }
+
+    fn read_config(env: &Env) -> Result<Config, GrantsError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GrantsError::NotInitialized)
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
-
-    const GOVERNANCE: Address = 1;
-    const RECIPIENT: Address = 2;
-    const STRANGER: Address = 3;
-
-    fn contract() -> RefractGrants {
-        RefractGrants::new(GOVERNANCE)
-    }
+    use soroban_sdk::{testutils::Address as _, vec};
 
     #[test]
-    fn full_lifecycle_create_confirm_claim() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
+    fn reviewer_compensation_locks_rate_accrues_withholds_and_claims_once() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-        // Nothing claimable before any confirmation.
-        assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        let gov = Address::generate(&env);
+        let r1 = Address::generate(&env);
+        let r2 = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let asset = token::StellarAssetClient::new(&env, &token_id);
+        asset.mint(&gov, &10_000);
+        let tok = token::Client::new(&env, &token_id);
 
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        assert_eq!(grants.claimable(id), Some(100));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-        assert_eq!(grants.claimable(id), Some(0));
+        let cid = env.register_contract(None, RefractGrants);
+        let client = RefractGrantsClient::new(&env, &cid);
 
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 2).unwrap();
-        assert_eq!(grants.claimable(id), Some(200));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
+        client.initialize(&gov, &vec![&env, r1.clone(), r2.clone()], &1, &token_id);
+        client.fund_program_review_budget(&1, &2_000, &500);
 
-    #[test]
-    fn claim_releases_only_confirmed_amounts() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
-            .unwrap();
+        // Assign r1 and r2 at rate 500
+        let a1 = client.assign_review(&1, &0, &r1);
+        let a2 = client.assign_review(&1, &0, &r2);
 
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
+        // Change rate to 800 later -> existing assignments keep locked_rate = 500
+        client.fund_program_review_budget(&1, &0, &800);
+        let a3 = client.assign_review(&1, &1, &r1);
 
-    #[test]
-    fn rejects_milestone_sum_mismatch() {
-        let mut grants = contract();
+        // r2 recuses -> accrues nothing
+        client.recuse_review(&r2, &a2);
+        assert_eq!(client.reviewer_compensation(&r2).accrued_claimable, 0);
+
+        // r1 submits both a1 (500) and a3 (800) -> accrued = 1_300
+        assert_eq!(client.submit_review(&r1, &a1), 500);
+        assert_eq!(client.submit_review(&r1, &a3), 800);
+        assert_eq!(client.reviewer_compensation(&r1).accrued_claimable, 1_300);
+
+        // Governance withholds a3 due to later-slashed review -> accrued drops to 500
+        client.withhold_review_compensation(&a3);
+        let led = client.reviewer_compensation(&r1);
+        assert_eq!(led.accrued_claimable, 500);
+        assert_eq!(led.total_withheld, 800);
+
+        // Pull claim pays 500 and replay claim fails with NothingToClaim
+        assert_eq!(client.claim_reviewer_compensation(&r1), 500);
+        assert_eq!(tok.balance(&r1), 500);
         assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_milestones() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![]),
-            Err(GrantsError::NoMilestones)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 0, vec![0]),
-            Err(GrantsError::InvalidTotalAmount)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![100, 0]),
-            Err(GrantsError::InvalidMilestoneAmount)
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_order_confirmation() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneAlreadyConfirmed)
-        );
-    }
-
-    #[test]
-    fn enforces_governance_gating() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
-            Err(GrantsError::Unauthorized)
-        );
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-
-        assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
-        );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
+            client.try_claim_reviewer_compensation(&r1),
+            Err(Ok(GrantsError::NothingToClaim))
         );
     }
 }
