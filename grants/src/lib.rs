@@ -1,415 +1,734 @@
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based ecosystem grant disbursement contract with reviewer bond
+//! staking, tiered bond minimums, cooldown deregistration, guardian misconduct
+//! cases, and governance-adjudicated slashing.
 
-use std::collections::BTreeMap;
+#![no_std]
+#![allow(
+    clippy::disallowed_methods,
+    clippy::inconsistent_digit_grouping,
+    clippy::too_many_arguments
+)]
 
-/// Identifier for a grant.
-pub type GrantId = u64;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Symbol, Vec,
+};
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
-pub type Address = u64;
+const BPS_DENOM: i128 = 10_000;
 
-/// Errors returned by [`RefractGrants`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum GrantsError {
-    /// Caller is not the configured governance/timelock authority.
-    Unauthorized,
-    /// No grant exists for the supplied id.
-    GrantNotFound,
-    /// A grant must declare at least one milestone.
-    NoMilestones,
-    /// Milestone amounts do not sum to the declared total amount.
-    MilestoneSumMismatch,
-    /// A milestone amount was zero or negative.
-    InvalidMilestoneAmount,
-    /// The total amount was zero or negative.
-    InvalidTotalAmount,
-    /// The milestone index is out of range for the grant.
-    InvalidMilestoneIndex,
-    /// The milestone has already been confirmed.
-    MilestoneAlreadyConfirmed,
-    /// Milestones must be confirmed in order; an earlier one is still pending.
-    MilestoneOutOfOrder,
-    /// The caller is not the grant recipient.
-    NotRecipient,
-    /// There is no confirmed-but-unclaimed amount to release.
-    NothingToClaim,
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    InvalidConfig = 3,
+    InvalidGrant = 4,
+    GrantNotFound = 5,
+    MilestoneNotFound = 6,
+    MilestoneAlreadyReleased = 7,
+    GrantNotActive = 8,
+    DuplicateApproval = 9,
+    InsufficientReviewerBond = 10,
+    ReviewerNotRegistered = 11,
+    ReviewerSuspended = 12,
+    OpenCaseBlocksDeregistration = 13,
+    CooldownNotElapsed = 14,
+    CaseNotFound = 15,
+    CaseAlreadyResolved = 16,
+    InvalidSlashBps = 17,
 }
 
-/// A single milestone within a grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Config,
+    NextGrantId,
+    Grant(u64),
+    BondPolicy,
+    TotalBondBalance,
+    ReviewerStake(Address),
+    NextCaseId,
+    ReviewCase(u64),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub governance: Address,
+    pub reviewers: Vec<Address>,
+    pub approval_threshold: u32,
+    pub token: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BondPolicy {
+    pub guardian: Address,
+    pub slash_destination: Address,
+    pub base_bond: i128,
+    pub per_review_bond: i128,
+    pub cooldown_ledgers: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewerStakeRecord {
+    pub reviewer: Address,
+    pub initial_bond: i128,
+    pub remaining_bond: i128,
+    pub total_slashed: i128,
+    pub review_count: u32,
+    pub open_cases: u32,
+    pub deregister_requested_at: u32,
+    pub deregistering: bool,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CaseResolution {
+    Open = 0,
+    Dismissed = 1,
+    Slashed = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewCase {
+    pub id: u64,
+    pub reviewer: Address,
+    pub evidence_hash: BytesN<32>,
+    pub rationale_hash: BytesN<32>,
+    pub slash_bps: u32,
+    pub slashed_amount: i128,
+    pub resolution: CaseResolution,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum GrantStatus {
+    Active = 0,
+    Completed = 1,
+    Cancelled = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Milestone {
-    /// Amount released when this milestone is confirmed.
+    pub description: Symbol,
     pub amount: i128,
-    /// Whether governance has confirmed delivery of this milestone.
-    pub confirmed: bool,
-    /// Whether the confirmed amount has already been claimed.
-    pub claimed: bool,
+    pub approvals: Vec<Address>,
+    pub released: bool,
 }
 
-/// A grant approved by governance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Grant {
-    /// Account that receives released funds.
+    pub id: u64,
     pub recipient: Address,
-    /// Total amount approved across all milestones.
     pub total_amount: i128,
-    /// Ordered milestones; index 0 is confirmed first.
+    pub released_amount: i128,
     pub milestones: Vec<Milestone>,
-    /// Sum of confirmed-but-unclaimed milestone amounts.
-    pub claimable: i128,
+    pub status: GrantStatus,
 }
 
-/// Milestone-based community grants disbursement contract.
-#[derive(Debug, Clone)]
-pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
-    governance: Address,
-    /// Monotonic counter used to allocate grant ids.
-    next_grant_id: GrantId,
-    /// Stored grants keyed by id.
-    grants: BTreeMap<GrantId, Grant>,
-}
+#[contract]
+pub struct RefractGrants;
 
+#[contractimpl]
 impl RefractGrants {
-    /// Creates a new grants contract governed by `governance` (the timelock).
-    pub fn new(governance: Address) -> Self {
-        Self {
-            governance,
-            next_grant_id: 0,
-            grants: BTreeMap::new(),
+    pub fn initialize(
+        env: Env,
+        governance: Address,
+        reviewers: Vec<Address>,
+        approval_threshold: u32,
+        token: Address,
+    ) -> Result<(), GrantsError> {
+        if env.storage().instance().has(&DataKey::Config) {
+            return Err(GrantsError::AlreadyInitialized);
         }
-    }
-
-    /// Returns the configured governance/timelock authority.
-    pub fn governance(&self) -> Address {
-        self.governance
-    }
-
-    /// Returns the grant for `grant_id`, if any.
-    pub fn get_grant(&self, grant_id: GrantId) -> Option<&Grant> {
-        self.grants.get(&grant_id)
-    }
-
-    /// Returns the confirmed-but-unclaimed amount for `grant_id`.
-    pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
-        self.grants.get(&grant_id).map(|grant| grant.claimable)
-    }
-
-    /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
-    pub fn create_grant(
-        &mut self,
-        caller: Address,
-        recipient: Address,
-        total_amount: i128,
-        milestones: Vec<i128>,
-    ) -> Result<GrantId, GrantsError> {
-        self.require_governance(caller)?;
-
-        if total_amount <= 0 {
-            return Err(GrantsError::InvalidTotalAmount);
+        governance.require_auth();
+        if reviewers.is_empty() || approval_threshold == 0 || approval_threshold > reviewers.len() {
+            return Err(GrantsError::InvalidConfig);
         }
-        if milestones.is_empty() {
-            return Err(GrantsError::NoMilestones);
-        }
-
-        let mut sum: i128 = 0;
-        for amount in &milestones {
-            if *amount <= 0 {
-                return Err(GrantsError::InvalidMilestoneAmount);
-            }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
-        }
-        if sum != total_amount {
-            return Err(GrantsError::MilestoneSumMismatch);
-        }
-
-        let grant_id = self.next_grant_id;
-        self.next_grant_id += 1;
-
-        let stored = milestones
-            .into_iter()
-            .map(|amount| Milestone {
-                amount,
-                confirmed: false,
-                claimed: false,
-            })
-            .collect();
-
-        self.grants.insert(
-            grant_id,
-            Grant {
-                recipient,
-                total_amount,
-                milestones: stored,
-                claimable: 0,
+        let cfg = Config {
+            governance: governance.clone(),
+            reviewers,
+            approval_threshold,
+            token,
+        };
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        env.storage().instance().set(&DataKey::NextGrantId, &0u64);
+        env.storage().instance().set(&DataKey::NextCaseId, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBondBalance, &0i128);
+        env.storage().instance().set(
+            &DataKey::BondPolicy,
+            &BondPolicy {
+                guardian: governance.clone(),
+                slash_destination: governance,
+                base_bond: 1_000,
+                per_review_bond: 100,
+                cooldown_ledgers: 10,
             },
         );
-
-        Ok(grant_id)
+        Ok(())
     }
 
-    /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
-    pub fn confirm_milestone(
-        &mut self,
+    pub fn set_bond_policy(
+        env: Env,
+        guardian: Address,
+        slash_destination: Address,
+        base_bond: i128,
+        per_review_bond: i128,
+        cooldown_ledgers: u32,
+    ) -> Result<BondPolicy, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
+        if base_bond <= 0 || per_review_bond < 0 {
+            return Err(GrantsError::InvalidConfig);
+        }
+        let policy = BondPolicy {
+            guardian,
+            slash_destination,
+            base_bond,
+            per_review_bond,
+            cooldown_ledgers,
+        };
+        env.storage().instance().set(&DataKey::BondPolicy, &policy);
+        Ok(policy)
+    }
+
+    /// Registers a reviewer by staking a refundable bond meeting the minimum bond tier.
+    pub fn register_reviewer(
+        env: Env,
+        reviewer: Address,
+        bond: i128,
+    ) -> Result<ReviewerStakeRecord, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        let policy = Self::read_bond_policy(&env)?;
+        reviewer.require_auth();
+
+        let existing = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ReviewerStakeRecord>(&DataKey::ReviewerStake(reviewer.clone()));
+        let review_count = existing.as_ref().map(|r| r.review_count).unwrap_or(0);
+        let current_remaining = existing.as_ref().map(|r| r.remaining_bond).unwrap_or(0);
+        let min_required =
+            policy.base_bond + (review_count as i128).saturating_mul(policy.per_review_bond);
+
+        if bond <= 0 || current_remaining + bond < min_required {
+            return Err(GrantsError::InsufficientReviewerBond);
+        }
+
+        token::Client::new(&env, &cfg.token).transfer(
+            &reviewer,
+            &env.current_contract_address(),
+            &bond,
+        );
+
+        let total_bonds: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBondBalance)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBondBalance, &(total_bonds + bond));
+
+        let record = ReviewerStakeRecord {
+            reviewer: reviewer.clone(),
+            initial_bond: existing
+                .as_ref()
+                .map(|r| r.initial_bond + bond)
+                .unwrap_or(bond),
+            remaining_bond: current_remaining + bond,
+            total_slashed: existing.as_ref().map(|r| r.total_slashed).unwrap_or(0),
+            review_count,
+            open_cases: existing.as_ref().map(|r| r.open_cases).unwrap_or(0),
+            deregister_requested_at: 0,
+            deregistering: false,
+            active: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewerStake(reviewer.clone()), &record);
+
+        let mut cfg_mut = cfg;
+        if !cfg_mut.reviewers.contains(&reviewer) {
+            cfg_mut.reviewers.push_back(reviewer.clone());
+            env.storage().instance().set(&DataKey::Config, &cfg_mut);
+        }
+
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("rev_reg")),
+            (reviewer, record.remaining_bond),
+        );
+        Ok(record)
+    }
+
+    /// Initiates reviewer deregistration cooldown; blocked if an open misconduct case exists.
+    pub fn deregister_reviewer(
+        env: Env,
+        reviewer: Address,
+    ) -> Result<ReviewerStakeRecord, GrantsError> {
+        let _cfg = Self::read_config(&env)?;
+        reviewer.require_auth();
+        let mut record: ReviewerStakeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewerStake(reviewer.clone()))
+            .ok_or(GrantsError::ReviewerNotRegistered)?;
+        if !record.active {
+            return Err(GrantsError::ReviewerNotRegistered);
+        }
+        if record.open_cases > 0 {
+            return Err(GrantsError::OpenCaseBlocksDeregistration);
+        }
+        record.deregistering = true;
+        record.deregister_requested_at = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewerStake(reviewer), &record);
+        Ok(record)
+    }
+
+    /// Completes deregistration after the cooldown window and refunds the un-slashed bond.
+    pub fn finalize_deregister(env: Env, reviewer: Address) -> Result<i128, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        let policy = Self::read_bond_policy(&env)?;
+        reviewer.require_auth();
+        let mut record: ReviewerStakeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewerStake(reviewer.clone()))
+            .ok_or(GrantsError::ReviewerNotRegistered)?;
+        if !record.deregistering || !record.active {
+            return Err(GrantsError::ReviewerNotRegistered);
+        }
+        if record.open_cases > 0 {
+            return Err(GrantsError::OpenCaseBlocksDeregistration);
+        }
+        let now = env.ledger().sequence();
+        if now
+            < record
+                .deregister_requested_at
+                .saturating_add(policy.cooldown_ledgers)
+        {
+            return Err(GrantsError::CooldownNotElapsed);
+        }
+
+        let refund = record.remaining_bond;
+        record.remaining_bond = 0;
+        record.active = false;
+        record.deregistering = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewerStake(reviewer.clone()), &record);
+
+        let total_bonds: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBondBalance)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBondBalance, &(total_bonds - refund));
+
+        if refund > 0 {
+            token::Client::new(&env, &cfg.token).transfer(
+                &env.current_contract_address(),
+                &reviewer,
+                &refund,
+            );
+        }
+        Ok(refund)
+    }
+
+    /// Guardian-callable misconduct case opening; locks reviewer's bond and suspends reviews.
+    pub fn open_review_case(
+        env: Env,
         caller: Address,
-        grant_id: GrantId,
-        milestone_index: usize,
-    ) -> Result<(), GrantsError> {
-        self.require_governance(caller)?;
-
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
-
-        if milestone_index >= grant.milestones.len() {
-            return Err(GrantsError::InvalidMilestoneIndex);
+        reviewer: Address,
+        evidence_hash: BytesN<32>,
+    ) -> Result<u64, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        let policy = Self::read_bond_policy(&env)?;
+        caller.require_auth();
+        if caller != policy.guardian && caller != cfg.governance {
+            return Err(GrantsError::InvalidConfig);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
-        for earlier in &grant.milestones[..milestone_index] {
-            if !earlier.confirmed {
-                return Err(GrantsError::MilestoneOutOfOrder);
-            }
-        }
+        let mut record: ReviewerStakeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewerStake(reviewer.clone()))
+            .ok_or(GrantsError::ReviewerNotRegistered)?;
+        record.open_cases += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewerStake(reviewer.clone()), &record);
 
-        let milestone = &mut grant.milestones[milestone_index];
-        if milestone.confirmed {
-            return Err(GrantsError::MilestoneAlreadyConfirmed);
-        }
+        let case_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextCaseId)
+            .unwrap_or(0);
+        let review_case = ReviewCase {
+            id: case_id,
+            reviewer: reviewer.clone(),
+            evidence_hash: evidence_hash.clone(),
+            rationale_hash: BytesN::from_array(&env, &[0u8; 32]),
+            slash_bps: 0,
+            slashed_amount: 0,
+            resolution: CaseResolution::Open,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewCase(case_id), &review_case);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextCaseId, &(case_id + 1));
 
-        milestone.confirmed = true;
-        grant.claimable = grant
-            .claimable
-            .checked_add(milestone.amount)
-            .ok_or(GrantsError::MilestoneSumMismatch)?;
-
-        Ok(())
+        env.events().publish(
+            (symbol_short!("grants"), symbol_short!("case_opn")),
+            (case_id, reviewer, evidence_hash),
+        );
+        Ok(case_id)
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
-    pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
+    /// Governance-adjudicated resolution of an open misconduct case (`Dismissed` when `slash_bps == 0`
+    /// or `Slashed` when `slash_bps > 0`). Enforces `total_slashed <= initial_bond`.
+    pub fn adjudicate_review_case(
+        env: Env,
+        case_id: u64,
+        slash_bps: u32,
+        rationale_hash: BytesN<32>,
+    ) -> Result<ReviewCase, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        let policy = Self::read_bond_policy(&env)?;
+        cfg.governance.require_auth();
 
-        if grant.recipient != recipient {
-            return Err(GrantsError::NotRecipient);
+        if slash_bps as i128 > BPS_DENOM {
+            return Err(GrantsError::InvalidSlashBps);
         }
 
-        let amount = grant.claimable;
-        if amount <= 0 {
-            return Err(GrantsError::NothingToClaim);
+        let mut review_case: ReviewCase = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewCase(case_id))
+            .ok_or(GrantsError::CaseNotFound)?;
+        if review_case.resolution != CaseResolution::Open {
+            return Err(GrantsError::CaseAlreadyResolved);
         }
 
-        grant.claimable = 0;
-        for milestone in grant.milestones.iter_mut() {
-            if milestone.confirmed {
-                milestone.claimed = true;
+        let mut record: ReviewerStakeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewerStake(review_case.reviewer.clone()))
+            .ok_or(GrantsError::ReviewerNotRegistered)?;
+
+        record.open_cases = record.open_cases.saturating_sub(1);
+        review_case.rationale_hash = rationale_hash.clone();
+        review_case.slash_bps = slash_bps;
+
+        if slash_bps == 0 {
+            review_case.resolution = CaseResolution::Dismissed;
+            env.events().publish(
+                (symbol_short!("grants"), symbol_short!("case_dis")),
+                (case_id, review_case.reviewer.clone(), rationale_hash),
+            );
+        } else {
+            let raw_slash = record.initial_bond.saturating_mul(slash_bps as i128) / BPS_DENOM;
+            let slash_amount = raw_slash.min(record.remaining_bond);
+            record.remaining_bond -= slash_amount;
+            record.total_slashed += slash_amount;
+            review_case.slashed_amount = slash_amount;
+            review_case.resolution = CaseResolution::Slashed;
+
+            let total_bonds: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalBondBalance)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalBondBalance, &(total_bonds - slash_amount));
+
+            if slash_amount > 0 {
+                token::Client::new(&env, &cfg.token).transfer(
+                    &env.current_contract_address(),
+                    &policy.slash_destination,
+                    &slash_amount,
+                );
             }
+            env.events().publish(
+                (symbol_short!("grants"), symbol_short!("case_sls")),
+                (
+                    case_id,
+                    review_case.reviewer.clone(),
+                    slash_bps,
+                    slash_amount,
+                    rationale_hash,
+                ),
+            );
         }
 
-        Ok(amount)
+        env.storage().persistent().set(
+            &DataKey::ReviewerStake(review_case.reviewer.clone()),
+            &record,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReviewCase(case_id), &review_case);
+        Ok(review_case)
     }
 
-    fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
-        if caller != self.governance {
-            return Err(GrantsError::Unauthorized);
+    pub fn create_grant(
+        env: Env,
+        recipient: Address,
+        milestones: Vec<(Symbol, i128)>,
+    ) -> Result<u64, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        cfg.governance.require_auth();
+        if milestones.is_empty() {
+            return Err(GrantsError::InvalidGrant);
         }
-        Ok(())
+        let mut total: i128 = 0;
+        let mut built: Vec<Milestone> = Vec::new(&env);
+        for (desc, amount) in milestones.iter() {
+            if amount <= 0 {
+                return Err(GrantsError::InvalidGrant);
+            }
+            total = total.checked_add(amount).ok_or(GrantsError::InvalidGrant)?;
+            built.push_back(Milestone {
+                description: desc,
+                amount,
+                approvals: Vec::new(&env),
+                released: false,
+            });
+        }
+        token::Client::new(&env, &cfg.token).transfer(
+            &cfg.governance,
+            &env.current_contract_address(),
+            &total,
+        );
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextGrantId)
+            .unwrap_or(0);
+        let grant = Grant {
+            id,
+            recipient: recipient.clone(),
+            total_amount: total,
+            released_amount: 0,
+            milestones: built,
+            status: GrantStatus::Active,
+        };
+        env.storage().persistent().set(&DataKey::Grant(id), &grant);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextGrantId, &(id + 1));
+        Ok(id)
+    }
+
+    pub fn approve_milestone(
+        env: Env,
+        reviewer: Address,
+        grant_id: u64,
+        milestone_idx: u32,
+    ) -> Result<bool, GrantsError> {
+        let cfg = Self::read_config(&env)?;
+        if !cfg.reviewers.contains(&reviewer) {
+            return Err(GrantsError::InvalidConfig);
+        }
+        reviewer.require_auth();
+
+        let policy = Self::read_bond_policy(&env)?;
+        if let Some(mut stake) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ReviewerStakeRecord>(&DataKey::ReviewerStake(reviewer.clone()))
+        {
+            if stake.open_cases > 0 || stake.deregistering || !stake.active {
+                return Err(GrantsError::ReviewerSuspended);
+            }
+            let min_required = policy.base_bond
+                + (stake.review_count as i128).saturating_mul(policy.per_review_bond);
+            if stake.remaining_bond < min_required {
+                return Err(GrantsError::InsufficientReviewerBond);
+            }
+            stake.review_count += 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::ReviewerStake(reviewer.clone()), &stake);
+        }
+
+        let mut grant: Grant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Grant(grant_id))
+            .ok_or(GrantsError::GrantNotFound)?;
+        if grant.status != GrantStatus::Active {
+            return Err(GrantsError::GrantNotActive);
+        }
+        let mut ms = grant
+            .milestones
+            .get(milestone_idx)
+            .ok_or(GrantsError::MilestoneNotFound)?;
+        if ms.released {
+            return Err(GrantsError::MilestoneAlreadyReleased);
+        }
+        if ms.approvals.contains(&reviewer) {
+            return Err(GrantsError::DuplicateApproval);
+        }
+
+        ms.approvals.push_back(reviewer);
+        let reached = ms.approvals.len() >= cfg.approval_threshold;
+        let mut released_now = false;
+        if reached {
+            ms.released = true;
+            grant.released_amount += ms.amount;
+            token::Client::new(&env, &cfg.token).transfer(
+                &env.current_contract_address(),
+                &grant.recipient,
+                &ms.amount,
+            );
+            released_now = true;
+        }
+        grant.milestones.set(milestone_idx, ms);
+        if grant.milestones.iter().all(|m| m.released) {
+            grant.status = GrantStatus::Completed;
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Grant(grant_id), &grant);
+        Ok(released_now)
+    }
+
+    pub fn reviewer_stake(env: Env, reviewer: Address) -> Option<ReviewerStakeRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewerStake(reviewer))
+    }
+
+    pub fn review_case(env: Env, case_id: u64) -> Option<ReviewCase> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewCase(case_id))
+    }
+
+    pub fn total_bond_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalBondBalance)
+            .unwrap_or(0)
+    }
+
+    fn read_bond_policy(env: &Env) -> Result<BondPolicy, GrantsError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::BondPolicy)
+            .ok_or(GrantsError::NotInitialized)
+    }
+
+    fn read_config(env: &Env) -> Result<Config, GrantsError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GrantsError::NotInitialized)
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
-
-    const GOVERNANCE: Address = 1;
-    const RECIPIENT: Address = 2;
-    const STRANGER: Address = 3;
-
-    fn contract() -> RefractGrants {
-        RefractGrants::new(GOVERNANCE)
-    }
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        vec,
+    };
 
     #[test]
-    fn full_lifecycle_create_confirm_claim() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
+    fn reviewer_staking_suspends_on_open_case_prevents_double_slash_and_refunds_after_cooldown() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-        // Nothing claimable before any confirmation.
-        assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        let gov = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let slash_dest = Address::generate(&env);
+        let r1 = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let asset = token::StellarAssetClient::new(&env, &token_id);
+        asset.mint(&gov, &10_000);
+        asset.mint(&r1, &5_000);
+        let tok = token::Client::new(&env, &token_id);
 
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        assert_eq!(grants.claimable(id), Some(100));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-        assert_eq!(grants.claimable(id), Some(0));
+        let cid = env.register_contract(None, RefractGrants);
+        let client = RefractGrantsClient::new(&env, &cid);
 
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 2).unwrap();
-        assert_eq!(grants.claimable(id), Some(200));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
+        client.initialize(&gov, &vec![&env, r1.clone()], &1, &token_id);
+        client.set_bond_policy(&guardian, &slash_dest, &1_000, &200, &5);
 
-    #[test]
-    fn claim_releases_only_confirmed_amounts() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
-            .unwrap();
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn rejects_milestone_sum_mismatch() {
-        let mut grants = contract();
+        // Bond below minimum tier (1_000) is rejected
         assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_milestones() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![]),
-            Err(GrantsError::NoMilestones)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 0, vec![0]),
-            Err(GrantsError::InvalidTotalAmount)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![100, 0]),
-            Err(GrantsError::InvalidMilestoneAmount)
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_order_confirmation() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
+            client.try_register_reviewer(&r1, &500),
+            Err(Ok(GrantsError::InsufficientReviewerBond))
         );
 
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneAlreadyConfirmed)
-        );
-    }
+        // Register with 2_000 bond
+        client.register_reviewer(&r1, &2_000);
+        assert_eq!(client.total_bond_balance(), 2_000);
 
-    #[test]
-    fn enforces_governance_gating() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
-            Err(GrantsError::Unauthorized)
+        let gid = client.create_grant(
+            &recipient,
+            &vec![&env, (symbol_short!("m1"), 500), (symbol_short!("m2"), 500)],
         );
 
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
+        // Guardian opens two cases against r1 -> suspends milestone approval and blocks deregistration
+        let c1 = client.open_review_case(&guardian, &r1, &BytesN::from_array(&env, &[1u8; 32]));
+        let c2 = client.open_review_case(&guardian, &r1, &BytesN::from_array(&env, &[2u8; 32]));
         assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
+            client.try_approve_milestone(&r1, &gid, &0),
+            Err(Ok(GrantsError::ReviewerSuspended))
         );
-    }
-
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-
-        assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
         assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
+            client.try_deregister_reviewer(&r1),
+            Err(Ok(GrantsError::OpenCaseBlocksDeregistration))
         );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
 
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
+        // Adjudicate c1 with 6_000 bps (60% of 2_000 = 1_200 slashed)
+        let res1 =
+            client.adjudicate_review_case(&c1, &6_000, &BytesN::from_array(&env, &[3u8; 32]));
+        assert_eq!(res1.slashed_amount, 1_200);
+        assert_eq!(tok.balance(&slash_dest), 1_200);
+
+        // Adjudicate c2 with 8_000 bps -> capped at remaining_bond (800) so total_slashed <= initial_bond
+        let res2 =
+            client.adjudicate_review_case(&c2, &8_000, &BytesN::from_array(&env, &[4u8; 32]));
+        assert_eq!(res2.slashed_amount, 800);
+        assert_eq!(client.total_bond_balance(), 0);
+
+        // Top up bond by 1_500, deregister, and verify cooldown + refund invariant
+        client.register_reviewer(&r1, &1_500);
+        client.deregister_reviewer(&r1);
         assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
+            client.try_finalize_deregister(&r1),
+            Err(Ok(GrantsError::CooldownNotElapsed))
         );
+        env.ledger().with_mut(|l| l.sequence_number = 6);
+        assert_eq!(client.finalize_deregister(&r1), 1_500);
+        assert_eq!(client.total_bond_balance(), 0);
     }
 }
