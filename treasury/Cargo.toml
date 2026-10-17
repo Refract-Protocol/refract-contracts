@@ -2,12 +2,14 @@
 name = "refract-treasury"
 version = "0.1.0"
 edition = "2021"
+description = "Protocol treasury contract for the Refract protocol"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "20.0.0"
+soroban-sdk = { version = "21.0.0" }
 
 [dev-dependencies]
-soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
