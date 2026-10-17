@@ -213,3 +213,21 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Grantee Performance Bonds & Slashing Specification (`RefractGrants`)
+
+### INV-BOND-1  Escrow and Bond Custody Isolation
+Milestone escrow balances (`escrow_custody_balance`) and grantee performance bond balances (`bond_custody_balance`) are tracked in disjoint tagged journal accounts (`AccountingTag::MilestoneEscrow` vs `AccountingTag::BondCustody`) and never cross-contaminate:
+```
+∀ grant: Grant,
+    grant.bond.posted_amount == grant.bond.slashed_amount + grant.bond.released_amount + grant.bond.remaining()
+```
+
+### INV-BOND-2  Unbonded Grants Cannot Unlock Milestones
+When a bond sizing rule (`BondSizingRule::Fixed` or `BondSizingRule::Bps`) produces `required_amount > 0`, the grant starts in `GrantStatus::AcceptedUnfunded` (`BondState::Unposted`). All calls to `confirm_milestone` fail with `GrantsError::BondNotPosted` until `post_bond` is executed in an allowlisted SEP-41 asset.
+
+### INV-BOND-3  Bounded, Idempotent, Timelock-Gated Slashing
+`slash_bond(caller, grant_id, milestone_index, slash_bps, reason)` requires `caller == governance`, enforces `slash_bps <= max_slash_bps <= 10_000`, rejects any milestone index already in `slashed_milestones` (`MilestoneAlreadySlashed`), caps the slash at `grant.bond.remaining()`, and routes the slashed amount to `SlashDestination` without double-counting active bond custody in `RefractTreasury::nav_balance`.
+
