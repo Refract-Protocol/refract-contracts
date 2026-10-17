@@ -1,6 +1,9 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+};
 
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
@@ -16,6 +19,7 @@ pub enum BackstopError {
     InsufficientShares = 5,
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
+    ExceedsRescuableExcess = 8,
 }
 
 #[contracttype]
@@ -81,8 +85,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::config_internal(&env)?;
+        let mut state = Self::state_internal(&env)?;
 
         let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
         if shares <= 0 {
@@ -112,8 +116,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::config_internal(&env)?;
+        let mut state = Self::state_internal(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -143,13 +147,9 @@ impl RefractBackstop {
     }
 
     /// Drain up to `amount` of backstop capital to cover a claim shortfall.
-    /// Callable only by the configured `RefractPool` (or its admin/timelock).
-    /// Returns the amount actually covered. Draining reduces `total_capital`
-    /// without burning shares, so every staker's share price drops
-    /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::config_internal(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -157,7 +157,7 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
 
-        let mut state = Self::state(&env)?;
+        let mut state = Self::state_internal(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
         } else {
@@ -179,15 +179,13 @@ impl RefractBackstop {
         Ok(covered)
     }
 
-    /// Route a slice of premium income to backstop stakers. The premium share
-    /// is configured in basis points; the remainder is left for the caller
-    /// (e.g. the treasury fee-switch) to distribute.
+    /// Route a slice of premium income to backstop stakers.
     pub fn receive_premium(env: Env, amount: i128) -> Result<i128, BackstopError> {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::config_internal(&env)?;
+        let mut state = Self::state_internal(&env)?;
 
         let cut = amount * config.premium_share_bps / BPS_DENOM;
         state.premium_income += cut;
@@ -195,6 +193,64 @@ impl RefractBackstop {
         env.storage().instance().set(&"state", &state);
 
         Ok(cut)
+    }
+
+    /// Returns the total accounted liabilities for `token` (staker capital for the configured
+    /// asset, or `0` for any foreign/untracked token).
+    pub fn accounted_liabilities(env: Env, token: Address) -> Result<i128, BackstopError> {
+        let config = Self::config_internal(&env)?;
+        let state = Self::state_internal(&env)?;
+        if token == config.token {
+            Ok(state.total_capital)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Returns `max(0, token.balance(self) - accounted_liabilities(token))`.
+    pub fn rescuable_excess(env: Env, token: Address) -> Result<i128, BackstopError> {
+        let liabilities = Self::accounted_liabilities(env.clone(), token.clone())?;
+        let actual = token::Client::new(&env, &token).balance(&env.current_contract_address());
+        Ok((actual - liabilities).max(0))
+    }
+
+    /// Governance/timelock-gated token rescue path (`#259`).
+    /// Sweeps at most `rescuable_excess(token)` to `to` and asserts post-transfer solvency.
+    pub fn rescue(
+        env: Env,
+        caller: Address,
+        token: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<i128, BackstopError> {
+        caller.require_auth();
+        let config = Self::config_internal(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(BackstopError::InvalidAmount);
+        }
+
+        let liabilities = Self::accounted_liabilities(env.clone(), token.clone())?;
+        let token_client = token::Client::new(&env, &token);
+        let pre_balance = token_client.balance(&env.current_contract_address());
+        let excess = (pre_balance - liabilities).max(0);
+        if amount > excess {
+            return Err(BackstopError::ExceedsRescuableExcess);
+        }
+
+        token_client.transfer(&env.current_contract_address(), &to, &amount);
+
+        let post_balance = token_client.balance(&env.current_contract_address());
+        assert!(
+            post_balance >= liabilities,
+            "post-rescue balance violated accounted liabilities"
+        );
+
+        env.events()
+            .publish((symbol_short!("rescued"), token, to), (amount, caller));
+        Ok(amount)
     }
 
     pub fn shares_of(env: Env, staker: Address) -> i128 {
@@ -205,15 +261,13 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::state_internal(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::config_internal(&env)
     }
 
-    /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
-    /// subsequent depositors get shares proportional to the current share price.
     fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
         if total_shares == 0 || total_capital == 0 {
             amount
@@ -222,8 +276,6 @@ impl RefractBackstop {
         }
     }
 
-    /// Mirror of `RefractPool::_quote_withdrawal`: value of `shares` at the
-    /// current share price.
     fn quote_withdrawal(shares: i128, total_shares: i128, total_capital: i128) -> i128 {
         if total_shares == 0 {
             0
@@ -232,17 +284,79 @@ impl RefractBackstop {
         }
     }
 
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn config_internal(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn state_internal(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+
+    #[test]
+    fn rescue_sweeps_foreign_and_excess_tokens_without_touching_staked_liabilities() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let pool = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let staker = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let foreign = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+
+        let usdc_sac = StellarAssetClient::new(&env, &usdc);
+        let foreign_sac = StellarAssetClient::new(&env, &foreign);
+        let usdc_token = token::Client::new(&env, &usdc);
+        let foreign_token = token::Client::new(&env, &foreign);
+
+        let contract_id = env.register_contract(None, RefractBackstop);
+        let client = RefractBackstopClient::new(&env, &contract_id);
+        client.initialize(&pool, &admin, &usdc, &2_000);
+
+        // Staker deposits 1,000 USDC (accounted liability = 1,000)
+        usdc_sac.mint(&staker, &1_000);
+        client.deposit(&staker, &1_000);
+
+        // Someone accidentally transfers 250 USDC directly and 500 FOREIGN tokens
+        usdc_sac.mint(&contract_id, &250);
+        foreign_sac.mint(&contract_id, &500);
+
+        assert_eq!(client.accounted_liabilities(&usdc), 1_000);
+        assert_eq!(client.rescuable_excess(&usdc), 250);
+        assert_eq!(client.accounted_liabilities(&foreign), 0);
+        assert_eq!(client.rescuable_excess(&foreign), 500);
+
+        // Attempting to rescue 251 USDC (touching 1 unit of staked liability) fails
+        assert_eq!(
+            client.try_rescue(&admin, &usdc, &recipient, &251),
+            Err(Ok(BackstopError::ExceedsRescuableExcess))
+        );
+
+        // Rescuing exact 250 USDC excess and 500 FOREIGN succeeds
+        client.rescue(&admin, &usdc, &recipient, &250);
+        client.rescue(&admin, &foreign, &recipient, &500);
+
+        assert_eq!(usdc_token.balance(&recipient), 250);
+        assert_eq!(foreign_token.balance(&recipient), 500);
+        assert_eq!(usdc_token.balance(&contract_id), 1_000);
     }
 }

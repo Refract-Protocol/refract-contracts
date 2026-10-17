@@ -1,4 +1,4 @@
-﻿# Refract Protocol Incident Response Runbook: Admin Key Compromise
+# Refract Protocol Incident Response Runbook: Admin Key Compromise
 
 **Document Version:** 1.0.0  
 **Scope:** `RefractPool`, `RefractPolicyRegistry`, `RefractOracle`, `RefractIncidentResponse`  
@@ -111,3 +111,17 @@ A formal simulation of this tabletop runbook was implemented and verified in `in
 ### Lessons Learned & Gaps Identified:
 - **Pre-authorization Requirement**: Cross-contract invocations require that either the caller is the current admin or contracts support a registered Guardian role. Protocols must deploy the incident response coordinator at genesis so its address is pre-wired into recovery keys.
 - **Off-chain Key Hygiene**: Emergency guardian keys must be kept on segregated cold storage (air-gapped hardware or multi-party computation multisig) to ensure the guardian key cannot be compromised simultaneously with the operational admin key.
+
+---
+
+## 6. Governance-Gated Token Rescue Procedure (`#259`)
+
+When tokens are accidentally transferred directly to `RefractBackstop`, `RefractBountyEscrow`, `RefractGrants`, or `RefractTreasury` (or when an unconfigured foreign SEP-41 asset is misrouted to a contract), operators can recover the excess without touching accounted protocol liabilities:
+
+1. **Verify Rescuable Excess**:
+   - Query `accounted_liabilities(token)` and `rescuable_excess(token)` on the target contract.
+   - Confirm `rescuable_excess(token) == token.balance(contract) - accounted_liabilities(token) > 0`.
+2. **Schedule Timelock Proposal**:
+   - Construct a governance/timelock operation invoking `rescue(caller, token, to, amount)` where `caller` is the contract's governance/timelock authority and `amount <= rescuable_excess(token)`.
+3. **Execute & Verify**:
+   - After the timelock delay elapses, execute the operation and verify the emitted `rescued` event `(token, to, amount, caller)` and that `token.balance(contract) >= accounted_liabilities(token)`.
