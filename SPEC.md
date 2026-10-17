@@ -213,3 +213,103 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. `RefractBackstop` Specification (`backstop/src/lib.rs`)
+
+### 8.1 Storage-Visible State & Error Codes
+```
+BackstopConfig {
+    pool:              Address  -- authorized RefractPool caller for cover_shortfall
+    admin:             Address  -- governance / timelock authority
+    token:             Address  -- SEP-41 settlement token (USDC, 1e7 fixed-point)
+    premium_share_bps: i128     -- share of premium income routed to stakers (0..=10_000)
+}
+
+BackstopState {
+    total_shares:   i128  -- total outstanding backstop shares
+    total_capital:  i128  -- total USDC capital held in the backstop tranche
+    premium_income: i128  -- cumulative premium income credited to the backstop
+}
+```
+Error codes (`#[repr(u32)]`): `AlreadyInitialized = 1`, `NotInitialized = 2`, `Unauthorized = 3`, `InvalidAmount = 4`, `InsufficientShares = 5`, `InsufficientCapital = 6`, `InvalidPremiumShare = 7`.
+
+### 8.2 Normative Clauses
+- **`SPEC-BS-01` (Initialization & Basis-Point Bounds)**: When `initialize(pool, admin, token, premium_share_bps)` is called on an uninitialized instance with `0 <= premium_share_bps <= 10_000`, the contract MUST persist `BackstopConfig` and zeroed `BackstopState`; if already initialized it MUST return `BackstopError::AlreadyInitialized`, and if `premium_share_bps < 0` or `premium_share_bps > 10_000` it MUST return `BackstopError::InvalidPremiumShare`.
+- **`SPEC-BS-02` (Pro-Rata Share Minting on Deposit)**: When `deposit(staker, amount)` is called with `amount > 0`, the contract MUST require `staker.require_auth()`, mint `amount` shares if `total_shares == 0 || total_capital == 0` or `(amount * total_shares) / total_capital` shares otherwise, and increase `total_shares` by `shares` and `total_capital` by `amount`; if `amount <= 0` or computed `shares <= 0`, it MUST return `BackstopError::InvalidAmount`.
+- **`SPEC-BS-03` (Pro-Rata Capital Redemption on Withdraw)**: When `withdraw(staker, shares)` is called with `0 < shares <= shares_of(staker)`, the contract MUST require `staker.require_auth()`, burn `shares`, and transfer `amount = (shares * total_capital) / total_shares` to `staker`; if `shares <= 0` it MUST return `BackstopError::InvalidAmount`, and if `shares > shares_of(staker)` it MUST return `BackstopError::InsufficientShares`.
+- **`SPEC-BS-04` (Authorized Shortfall Absorption & Loss Socialization)**: When `cover_shortfall(caller, amount)` is called with `amount > 0`, the contract MUST require `caller.require_auth()` and verify `caller == config.pool || caller == config.admin` (returning `BackstopError::Unauthorized` otherwise), transfer `covered = min(amount, total_capital)` to `config.pool`, and decrement `total_capital` by `covered` without burning shares.
+- **`SPEC-BS-05` (Premium Share Routing)**: When `receive_premium(amount)` is called with `amount > 0`, the contract MUST compute `cut = (amount * config.premium_share_bps) / 10_000` and increment both `premium_income` and `total_capital` by `cut`; if `amount <= 0` it MUST return `BackstopError::InvalidAmount`.
+
+---
+
+## 9. `RefractBountyEscrow` Specification (`bounty/src/lib.rs`)
+
+### 9.1 Storage-Visible State & Error Codes
+```
+DataKey::Governance -> Address       -- governance / timelock payout authority
+DataKey::Token      -> Address       -- SEP-41 token used for funding and payouts
+DataKey::Balance    -> i128          -- current escrowed funds in 1e7 fixed-point
+DataKey::Award(h)   -> AwardRecord {
+    researcher:  Address,
+    amount:      i128,
+    report_hash: BytesN<32>,
+    timestamp:   u64,
+}
+```
+Error codes (`#[repr(u32)]`): `AlreadyInitialized = 1`, `NotInitialized = 2`, `InvalidAmount = 3`, `InsufficientBalance = 4`, `Unauthorized = 5`, `DuplicateReport = 6`.
+
+### 9.2 Normative Clauses
+- **`SPEC-BN-01` (One-Time Initialization)**: When `initialize(governance, token)` is called on an uninitialized contract, the contract MUST store `Governance`, `Token`, and `Balance = 0`; any subsequent call to `initialize` MUST return `BountyError::AlreadyInitialized`.
+- **`SPEC-BN-02` (Permissionless Escrow Funding)**: When `fund(from, amount)` is called with `amount > 0`, the contract MUST require `from.require_auth()`, transfer `amount` of `Token` from `from` to the contract, and increment `Balance` by `amount`; if `amount <= 0` it MUST return `BountyError::InvalidAmount`.
+- **`SPEC-BN-03` (Governance-Gated Award & Solvency Check)**: When `award(caller, researcher, amount, report_hash)` is called, the contract MUST require `caller.require_auth()` and verify `caller == governance` (returning `BountyError::Unauthorized` otherwise), verify `amount > 0` (`BountyError::InvalidAmount`), verify `amount <= Balance` (`BountyError::InsufficientBalance`), transfer `amount` to `researcher`, and decrement `Balance` by `amount`.
+- **`SPEC-BN-04` (Immutable Disclosure Commitment & Replay Prevention)**: When `award` succeeds for `report_hash`, the contract MUST persist an immutable `AwardRecord` under `DataKey::Award(report_hash)`; any subsequent `award` call with the same `report_hash` MUST return `BountyError::DuplicateReport`.
+
+---
+
+## 10. `RefractGrants` Specification (`grants/src/lib.rs`)
+
+### 10.1 Storage-Visible State & Error Codes
+```
+Grant {
+    recipient:    Address         -- designated grantee account
+    total_amount: i128            -- total approved grant amount (1e7 fixed-point)
+    milestones:   Vec<Milestone>  -- ordered milestones (amount, confirmed, claimed)
+    claimable:    i128            -- sum of confirmed-but-unclaimed milestone amounts
+}
+```
+Error codes: `Unauthorized`, `GrantNotFound`, `NoMilestones`, `MilestoneSumMismatch`, `InvalidMilestoneAmount`, `InvalidTotalAmount`, `InvalidMilestoneIndex`, `MilestoneAlreadyConfirmed`, `MilestoneOutOfOrder`, `NotRecipient`, `NothingToClaim`.
+
+### 10.2 Normative Clauses
+- **`SPEC-GR-01` (Governance-Gated Creation & Partition Invariant)**: When `create_grant(caller, recipient, total_amount, milestones)` is called, the contract MUST verify `caller == governance` (`GrantsError::Unauthorized`), `total_amount > 0` (`GrantsError::InvalidTotalAmount`), `!milestones.is_empty()` (`GrantsError::NoMilestones`), every milestone `amount > 0` (`GrantsError::InvalidMilestoneAmount`), and `Σ milestones == total_amount` (`GrantsError::MilestoneSumMismatch`).
+- **`SPEC-GR-02` (Sequential Milestone Confirmation)**: When `confirm_milestone(caller, grant_id, milestone_index)` is called, the contract MUST verify `caller == governance` (`GrantsError::Unauthorized`), verify `grant_id` exists (`GrantsError::GrantNotFound`) and `milestone_index < milestones.len()` (`GrantsError::InvalidMilestoneIndex`), require all earlier milestones `0..milestone_index` to be `confirmed == true` (`GrantsError::MilestoneOutOfOrder`), and reject already-confirmed milestones (`GrantsError::MilestoneAlreadyConfirmed`).
+- **`SPEC-GR-03` (Incremental Claimable Accrual)**: Confirming milestone `i` MUST set `milestones[i].confirmed = true` and increment `grant.claimable` by `milestones[i].amount` without releasing unconfirmed milestones.
+- **`SPEC-GR-04` (Recipient-Only Permissionless Claim)**: When `claim(recipient, grant_id)` is called, the contract MUST verify `grant.recipient == recipient` (`GrantsError::NotRecipient`) and `grant.claimable > 0` (`GrantsError::NothingToClaim`), reset `grant.claimable = 0`, mark all confirmed milestones as `claimed = true`, and return the released amount.
+- **`SPEC-GR-05` (Double-Claim Prevention)**: Calling `claim(recipient, grant_id)` immediately after a claim when no additional milestone has been confirmed MUST return `GrantsError::NothingToClaim`.
+
+---
+
+## 11. `RefractTreasury` Specification (`treasury/src/lib.rs`)
+
+### 11.1 Storage-Visible State
+```
+DataKey::Admin -> Address  -- admin / timelock authority authorized to withdraw funds
+```
+(*Non-normative note*: token deposits occur via standard SEP-41 token transfers to the treasury contract address.)
+
+### 11.2 Normative Clauses
+- **`SPEC-TR-01` (Single Initialization)**: When `initialize(admin)` is called on an uninitialized treasury, the contract MUST store `DataKey::Admin = admin`; calling `initialize` a second time MUST trap/fail (`already initialized`).
+- **`SPEC-TR-02` (Admin-Gated Withdrawal Authorization)**: When `withdraw(caller, token, amount, to)` is called, the contract MUST require `caller.require_auth()` and verify `caller == admin`; any call where `caller != admin` MUST trap/fail (`unauthorized`).
+- **`SPEC-TR-03` (Positive Outflow & Exact Custody Conservation)**: When `withdraw(caller, token, amount, to)` is called by `admin`, the contract MUST require `amount > 0` (`amount must be positive`) and transfer exactly `amount` of `token` from the treasury contract address to `to`.
+
+---
+
+## 12. Conformance Suite & Clause Traceability Gate
+
+Every normative clause (`SPEC-BS-01`..`SPEC-TR-03`) is mapped in [`tests/conformance/clauses.toml`](./tests/conformance/clauses.toml) and verified by [`tests/conformance/conformance_tests.rs`](./tests/conformance/conformance_tests.rs) and [`scripts/check_spec_conformance.py`](./scripts/check_spec_conformance.py):
+
+```bash
+python3 scripts/check_spec_conformance.py
+```
+

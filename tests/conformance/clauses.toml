@@ -1,0 +1,112 @@
+# Machine-readable mapping from SPEC.md normative clauses (§8–§11) to executable conformance tests.
+# Verified by `python3 scripts/check_spec_conformance.py`.
+
+[clauses.SPEC-BS-01]
+contract = "RefractBackstop"
+summary = "Initialization and premium_share_bps bounds (0..=10_000)"
+tests = ["tests/conformance/conformance_tests.rs::spec_bs_01_initialize_and_bps_bounds"]
+
+[clauses.SPEC-BS-02]
+contract = "RefractBackstop"
+summary = "Pro-rata share minting on deposit and rejection of non-positive amounts"
+tests = ["tests/conformance/conformance_tests.rs::spec_bs_02_pro_rata_deposit_and_invalid_amount"]
+
+[clauses.SPEC-BS-03]
+contract = "RefractBackstop"
+summary = "Pro-rata capital redemption on withdraw and insufficient shares guard"
+tests = ["tests/conformance/conformance_tests.rs::spec_bs_03_pro_rata_withdraw_and_insufficient_shares"]
+
+[clauses.SPEC-BS-04]
+contract = "RefractBackstop"
+summary = "Authorized shortfall absorption and loss socialization across shares"
+tests = ["tests/conformance/conformance_tests.rs::spec_bs_04_cover_shortfall_auth_and_haircut"]
+
+[clauses.SPEC-BS-05]
+contract = "RefractBackstop"
+summary = "Premium share routing in basis points and non-positive amount rejection"
+tests = ["tests/conformance/conformance_tests.rs::spec_bs_05_receive_premium_bps_routing"]
+
+[clauses.SPEC-BN-01]
+contract = "RefractBountyEscrow"
+summary = "One-time initialization and rejection of re-initialization"
+tests = ["tests/conformance/conformance_tests.rs::spec_bn_01_initialize_once"]
+
+[clauses.SPEC-BN-02]
+contract = "RefractBountyEscrow"
+summary = "Permissionless escrow funding and rejection of non-positive amounts"
+tests = ["tests/conformance/conformance_tests.rs::spec_bn_02_fund_escrow_and_invalid_amount"]
+
+[clauses.SPEC-BN-03]
+contract = "RefractBountyEscrow"
+summary = "Governance-gated award and escrow solvency check"
+tests = ["tests/conformance/conformance_tests.rs::spec_bn_03_governance_award_and_solvency"]
+
+[clauses.SPEC-BN-04]
+contract = "RefractBountyEscrow"
+summary = "Immutable disclosure commitment record and duplicate report_hash rejection"
+tests = ["tests/conformance/conformance_tests.rs::spec_bn_04_duplicate_report_rejected"]
+
+[clauses.SPEC-GR-01]
+contract = "RefractGrants"
+summary = "Governance-gated grant creation and milestone sum partition invariant"
+tests = [
+    "tests/conformance/conformance_tests.rs::spec_gr_01_create_grant_partition_and_bounds",
+    "grants/src/lib.rs::rejects_milestone_sum_mismatch",
+    "grants/src/lib.rs::rejects_zero_milestones",
+    "grants/src/lib.rs::rejects_non_positive_amounts",
+]
+
+[clauses.SPEC-GR-02]
+contract = "RefractGrants"
+summary = "Sequential milestone confirmation and governance authorization"
+tests = [
+    "tests/conformance/conformance_tests.rs::spec_gr_02_sequential_confirmation_and_auth",
+    "grants/src/lib.rs::rejects_out_of_order_confirmation",
+    "grants/src/lib.rs::enforces_governance_gating",
+]
+
+[clauses.SPEC-GR-03]
+contract = "RefractGrants"
+summary = "Incremental claimable accrual on milestone confirmation"
+tests = [
+    "tests/conformance/conformance_tests.rs::spec_gr_03_incremental_claimable_accrual",
+    "grants/src/lib.rs::claim_releases_only_confirmed_amounts",
+]
+
+[clauses.SPEC-GR-04]
+contract = "RefractGrants"
+summary = "Recipient-only permissionless claim releasing confirmed amounts"
+tests = [
+    "tests/conformance/conformance_tests.rs::spec_gr_04_recipient_only_claim",
+    "grants/src/lib.rs::claim_is_recipient_only",
+    "grants/src/lib.rs::full_lifecycle_create_confirm_claim",
+]
+
+[clauses.SPEC-GR-05]
+contract = "RefractGrants"
+summary = "Double-claim prevention when claimable is zero"
+tests = [
+    "tests/conformance/conformance_tests.rs::spec_gr_05_double_claim_prevented",
+    "grants/src/lib.rs::full_lifecycle_create_confirm_claim",
+]
+
+[clauses.SPEC-TR-01]
+contract = "RefractTreasury"
+summary = "Single initialization of treasury admin"
+tests = ["tests/conformance/conformance_tests.rs::spec_tr_01_single_initialization"]
+
+[clauses.SPEC-TR-02]
+contract = "RefractTreasury"
+summary = "Admin-gated withdrawal authorization"
+tests = [
+    "tests/conformance/conformance_tests.rs::spec_tr_02_admin_gated_withdrawal",
+    "treasury/src/lib.rs::withdraw_is_admin_gated",
+]
+
+[clauses.SPEC-TR-03]
+contract = "RefractTreasury"
+summary = "Positive outflow enforcement and exact custody balance conservation"
+tests = [
+    "tests/conformance/conformance_tests.rs::spec_tr_03_positive_outflow_and_conservation",
+    "treasury/src/lib.rs::withdraw_is_admin_gated",
+]
