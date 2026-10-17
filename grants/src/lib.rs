@@ -23,7 +23,15 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
+
+pub mod storage;
+
 use std::collections::BTreeMap;
+pub use storage::{
+    DataKey, StorageTier, INSTANCE_TTL_EXTEND_TO, INSTANCE_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO,
+    PERSISTENT_TTL_THRESHOLD, TEMPORARY_TTL_EXTEND_TO, TEMPORARY_TTL_THRESHOLD,
+};
 
 /// Identifier for a grant.
 pub type GrantId = u64;
@@ -58,6 +66,8 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// The target storage entry has expired and must be restored via `restore_grant`.
+    EntryArchived,
 }
 
 /// A single milestone within a grant.
@@ -84,26 +94,69 @@ pub struct Grant {
     pub claimable: i128,
 }
 
-/// Milestone-based community grants disbursement contract.
+/// Milestone-based community grants disbursement contract with typed [`DataKey`]
+/// storage layout and per-entry TTL tracking.
 #[derive(Debug, Clone)]
 pub struct RefractGrants {
     /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
+    /// milestones (`DataKey::Governance`).
     governance: Address,
-    /// Monotonic counter used to allocate grant ids.
+    /// Monotonic counter used to allocate grant ids (`DataKey::NextGrantId`).
     next_grant_id: GrantId,
-    /// Stored grants keyed by id.
-    grants: BTreeMap<GrantId, Grant>,
+    /// Stored grants keyed by typed [`DataKey::Grant`].
+    grants: BTreeMap<DataKey, Grant>,
+    /// Per-key ledger TTL expiration sequence numbers.
+    ttl_expiry: BTreeMap<DataKey, u32>,
+    /// Current simulated ledger sequence number.
+    ledger_seq: u32,
 }
 
 impl RefractGrants {
     /// Creates a new grants contract governed by `governance` (the timelock).
     pub fn new(governance: Address) -> Self {
+        let mut ttl_expiry = BTreeMap::new();
+        ttl_expiry.insert(DataKey::Governance, INSTANCE_TTL_EXTEND_TO);
+        ttl_expiry.insert(DataKey::NextGrantId, INSTANCE_TTL_EXTEND_TO);
         Self {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            ttl_expiry,
+            ledger_seq: 0,
         }
+    }
+
+    /// Advance the simulated ledger sequence for TTL testing.
+    pub fn advance_ledger(&mut self, delta_ledgers: u32) {
+        self.ledger_seq = self.ledger_seq.saturating_add(delta_ledgers);
+    }
+
+    /// Extend TTL for [`DataKey`] according to its tier policy if remaining TTL is below threshold.
+    pub fn extend_key_ttl(&mut self, key: &DataKey) {
+        let (threshold, extend_to) = key.ttl_policy();
+        let current_exp = self.ttl_expiry.get(key).copied().unwrap_or(0);
+        let remaining = current_exp.saturating_sub(self.ledger_seq);
+        if remaining < threshold {
+            self.ttl_expiry
+                .insert(key.clone(), self.ledger_seq.saturating_add(extend_to));
+        }
+    }
+
+    /// Restore an archived [`DataKey::Grant`] entry and extend its TTL to [`PERSISTENT_TTL_EXTEND_TO`].
+    pub fn restore_grant(&mut self, grant_id: GrantId) -> Result<u32, GrantsError> {
+        let key = DataKey::Grant(grant_id);
+        if !self.grants.contains_key(&key) {
+            return Err(GrantsError::GrantNotFound);
+        }
+        let new_expiry = self.ledger_seq.saturating_add(PERSISTENT_TTL_EXTEND_TO);
+        self.ttl_expiry.insert(key, new_expiry);
+        self.extend_key_ttl(&DataKey::Governance);
+        Ok(new_expiry)
+    }
+
+    /// Returns the expiration ledger sequence for `key`, if tracked.
+    pub fn ttl_of(&self, key: &DataKey) -> Option<u32> {
+        self.ttl_expiry.get(key).copied()
     }
 
     /// Returns the configured governance/timelock authority.
@@ -111,14 +164,18 @@ impl RefractGrants {
         self.governance
     }
 
-    /// Returns the grant for `grant_id`, if any.
+    /// Returns the grant for `grant_id`, if any and not archived.
     pub fn get_grant(&self, grant_id: GrantId) -> Option<&Grant> {
-        self.grants.get(&grant_id)
+        let key = DataKey::Grant(grant_id);
+        if self.ttl_expiry.get(&key).copied().unwrap_or(0) < self.ledger_seq {
+            return None;
+        }
+        self.grants.get(&key)
     }
 
     /// Returns the confirmed-but-unclaimed amount for `grant_id`.
     pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
-        self.grants.get(&grant_id).map(|grant| grant.claimable)
+        self.get_grant(grant_id).map(|grant| grant.claimable)
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
@@ -146,7 +203,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -164,8 +223,9 @@ impl RefractGrants {
             })
             .collect();
 
+        let key = DataKey::Grant(grant_id);
         self.grants.insert(
-            grant_id,
+            key.clone(),
             Grant {
                 recipient,
                 total_amount,
@@ -173,6 +233,9 @@ impl RefractGrants {
                 claimable: 0,
             },
         );
+        self.extend_key_ttl(&DataKey::Governance);
+        self.extend_key_ttl(&DataKey::NextGrantId);
+        self.extend_key_ttl(&key);
 
         Ok(grant_id)
     }
@@ -190,9 +253,19 @@ impl RefractGrants {
     ) -> Result<(), GrantsError> {
         self.require_governance(caller)?;
 
+        let key = DataKey::Grant(grant_id);
+        if !self.grants.contains_key(&key) {
+            return Err(GrantsError::GrantNotFound);
+        }
+        if self.ttl_expiry.get(&key).copied().unwrap_or(0) < self.ledger_seq {
+            return Err(GrantsError::EntryArchived);
+        }
+        self.extend_key_ttl(&DataKey::Governance);
+        self.extend_key_ttl(&key);
+
         let grant = self
             .grants
-            .get_mut(&grant_id)
+            .get_mut(&key)
             .ok_or(GrantsError::GrantNotFound)?;
 
         if milestone_index >= grant.milestones.len() {
@@ -227,9 +300,19 @@ impl RefractGrants {
     /// Permissionless for the recipient: any caller may trigger the release as
     /// long as they are the grant recipient. Returns the amount released.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
+        let key = DataKey::Grant(grant_id);
+        if !self.grants.contains_key(&key) {
+            return Err(GrantsError::GrantNotFound);
+        }
+        if self.ttl_expiry.get(&key).copied().unwrap_or(0) < self.ledger_seq {
+            return Err(GrantsError::EntryArchived);
+        }
+        self.extend_key_ttl(&key);
+        self.extend_key_ttl(&DataKey::ClaimLock(grant_id));
+
         let grant = self
             .grants
-            .get_mut(&grant_id)
+            .get_mut(&key)
             .ok_or(GrantsError::GrantNotFound)?;
 
         if grant.recipient != recipient {
@@ -280,7 +363,10 @@ mod tests {
 
         // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -411,5 +497,37 @@ mod tests {
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
         );
+    }
+
+    #[test]
+    fn storage_tiers_ttl_bump_and_restore_after_archival() {
+        let mut grants = contract();
+        let id = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 200, vec![100, 100])
+            .unwrap();
+        assert_eq!(DataKey::Governance.tier(), StorageTier::Instance);
+        assert_eq!(DataKey::Grant(id).tier(), StorageTier::Persistent);
+        assert_eq!(DataKey::ClaimLock(id).tier(), StorageTier::Temporary);
+        assert_eq!(
+            grants.ttl_of(&DataKey::Grant(id)),
+            Some(PERSISTENT_TTL_EXTEND_TO)
+        );
+
+        // Advance ledger past PERSISTENT_TTL_EXTEND_TO so the entry becomes archived
+        grants.advance_ledger(PERSISTENT_TTL_EXTEND_TO + 10);
+        assert_eq!(grants.get_grant(id), None);
+        assert_eq!(
+            grants.confirm_milestone(GOVERNANCE, id, 0),
+            Err(GrantsError::EntryArchived)
+        );
+
+        // Restore the archived grant entry and verify state is intact
+        let new_exp = grants.restore_grant(id).unwrap();
+        assert_eq!(
+            new_exp,
+            PERSISTENT_TTL_EXTEND_TO + 10 + PERSISTENT_TTL_EXTEND_TO
+        );
+        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
     }
 }

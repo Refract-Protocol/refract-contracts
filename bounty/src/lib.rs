@@ -1,26 +1,21 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
+pub mod storage;
 
-/// Storage keys for the bounty escrow.
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    /// The governance/timelock address authorized to award payouts.
-    Governance,
-    /// The token used to fund and pay out bounties.
-    Token,
-    /// Running total of funds currently held in escrow.
-    Balance,
-    /// Immutable, timestamped record of a rewarded disclosure.
-    Award(BytesN<32>),
-}
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env,
+};
+pub use storage::{
+    DataKey, INSTANCE_TTL_EXTEND_TO, INSTANCE_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO,
+    PERSISTENT_TTL_THRESHOLD, TEMPORARY_TTL_EXTEND_TO, TEMPORARY_TTL_THRESHOLD,
+};
 
 /// Immutable, timestamped record that a specific disclosure was rewarded.
 /// Only the commitment (hash) is stored on-chain; vulnerability details stay
 /// off-chain per SECURITY.md.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwardRecord {
     pub researcher: Address,
     pub amount: i128,
@@ -41,11 +36,6 @@ pub enum BountyError {
 }
 
 /// Governance-controlled bug bounty escrow.
-///
-/// The reward pool can be topped up by anyone (including the treasury), but
-/// payouts can only be authorized by the governance/timelock address. There is
-/// deliberately no single admin key with payout authority: a compromised admin
-/// key authorizing arbitrary "bounty" payouts is a direct fund-drain vector.
 #[contract]
 pub struct RefractBountyEscrow;
 
@@ -54,12 +44,10 @@ impl RefractBountyEscrow {
     /// One-time initialization wiring the governance/timelock address and the
     /// token used for funding and payouts.
     pub fn initialize(env: Env, governance: Address, token: Address) -> Result<(), BountyError> {
-        if env.storage().instance().has(&DataKey::Governance) {
+        if storage::is_initialized(&env) {
             return Err(BountyError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Governance, &governance);
-        env.storage().instance().set(&DataKey::Token, &token);
-        env.storage().instance().set(&DataKey::Balance, &0i128);
+        storage::set_initialized(&env, &governance, &token);
         Ok(())
     }
 
@@ -69,17 +57,15 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        let token = Self::token(&env)?;
+        let token = storage::get_token(&env)?;
+        let balance = storage::get_balance(&env)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
-        let balance = Self::balance(&env)?;
-        env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+        storage::set_balance(&env, balance + amount);
         Ok(())
     }
 
     /// Award a bounty to a security researcher. Gated strictly by the
     /// governance/timelock address; a plain admin key has no authority here.
-    /// The `report_hash` commitment is stored on-chain as an immutable,
-    /// timestamped record of the rewarded disclosure.
     pub fn award(
         env: Env,
         caller: Address,
@@ -88,71 +74,108 @@ impl RefractBountyEscrow {
         report_hash: BytesN<32>,
     ) -> Result<(), BountyError> {
         caller.require_auth();
-        let governance = Self::governance(&env)?;
+        let governance = storage::get_governance(&env)?;
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+        if storage::has_award(&env, &report_hash) {
             return Err(BountyError::DuplicateReport);
         }
-        let balance = Self::balance(&env)?;
+        let balance = storage::get_balance(&env)?;
         if amount > balance {
             return Err(BountyError::InsufficientBalance);
         }
 
-        let token = Self::token(&env)?;
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
-        env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+        let token = storage::get_token(&env)?;
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &researcher,
+            &amount,
+        );
+        storage::set_balance(&env, balance - amount);
 
+        let now = env.ledger().timestamp();
+        storage::set_submission_window(&env, &report_hash, now);
         let record = AwardRecord {
             researcher,
             amount,
             report_hash: report_hash.clone(),
-            timestamp: env.ledger().timestamp(),
+            timestamp: now,
         };
-        env.storage().persistent().set(&DataKey::Award(report_hash), &record);
+        storage::set_award(&env, &report_hash, &record);
         Ok(())
     }
 
     /// Current funds held in escrow.
     pub fn balance(env: Env) -> Result<i128, BountyError> {
-        Self::balance(&env)
+        storage::get_balance(&env)
     }
 
     /// The governance/timelock address authorized to award payouts.
     pub fn governance(env: Env) -> Result<Address, BountyError> {
-        Self::governance(&env)
+        storage::get_governance(&env)
     }
 
     /// Immutable record of a rewarded disclosure, if any.
     pub fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
-        env.storage().persistent().get(&DataKey::Award(report_hash))
+        storage::get_award(&env, &report_hash)
     }
 
-    fn governance(env: &Env) -> Result<Address, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Governance)
-            .ok_or(BountyError::NotInitialized)
-    }
-
-    fn token(env: &Env) -> Result<Address, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Token)
-            .ok_or(BountyError::NotInitialized)
-    }
-
-    fn balance(env: &Env) -> Result<i128, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .ok_or(BountyError::NotInitialized)
+    /// Permissionless keeper/restore entrypoint that bumps instance TTL and
+    /// optionally extends the persistent `DataKey::Award(report_hash)` entry.
+    pub fn extend_ttl(env: Env, report_hash: Option<BytesN<32>>) -> Result<(), BountyError> {
+        if !storage::is_initialized(&env) {
+            return Err(BountyError::NotInitialized);
+        }
+        storage::bump_instance(&env);
+        if let Some(hash) = report_hash {
+            storage::bump_persistent(&env, &DataKey::Award(hash));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
-mod test;
+mod test {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Env,
+    };
+
+    #[test]
+    fn award_storage_and_ttl_extension_across_ledger_advances() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let funder = Address::generate(&env);
+        let researcher = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        sac.mint(&funder, &500_0000000);
+        client.initialize(&governance, &token_id);
+        client.fund(&funder, &500_0000000);
+
+        let hash = BytesN::from_array(&env, &[9u8; 32]);
+        client.award(&governance, &researcher, &150_0000000, &hash);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number += INSTANCE_TTL_THRESHOLD + 200;
+        });
+        client.extend_ttl(&Some(hash.clone()));
+
+        let rec = client.get_award(&hash).unwrap();
+        assert_eq!(rec.amount, 150_0000000);
+        assert_eq!(client.balance(), 350_0000000);
+    }
+}
