@@ -24,6 +24,7 @@
 //! mechanics once a milestone is confirmed on-chain.
 
 #![allow(clippy::too_many_arguments)]
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros, clippy::bool_assert_comparison))]
 
 pub mod normalization;
 pub use normalization::{
@@ -96,6 +97,16 @@ pub enum GrantsError {
     DuplicateReviewReward,
     /// Reviewer compensation amount per review must be strictly positive.
     InvalidCompensationAmount,
+    /// Reviewer stake amount must be strictly positive.
+    InvalidStakeAmount,
+    /// Reviewer slash amount must be strictly positive.
+    InvalidSlashAmount,
+    /// Reviewer stake is insufficient for the requested operation.
+    InsufficientStake,
+    /// Reviewer has active assigned reviews that prevent unstaking.
+    ActiveReviewsPending,
+    /// Reviewer stake record was not found for the specified program.
+    ReviewerStakeNotFound,
 }
 
 pub type GrantError = GrantsError;
@@ -116,6 +127,16 @@ pub struct ReviewerCompensation {
     pub amount_per_review: i128,
     pub total_earned: i128,
     pub claimed: i128,
+}
+
+/// Reviewer economic stake record per funding program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerStake {
+    pub reviewer: Address,
+    pub program_id: u64,
+    pub staked: i128,
+    pub slashed: i128,
+    pub active_reviews: u32,
 }
 
 /// A line-item budget entry for granular expenditure tracking.
@@ -188,6 +209,8 @@ pub struct RefractGrants {
     reviewer_compensations: BTreeMap<Address, ReviewerCompensation>,
     /// Tracks which grants have already accrued reviewer reward: (grant_id) -> reviewer address.
     reviewed_grants: BTreeMap<GrantId, Address>,
+    /// Stored reviewer stakes keyed by (reviewer address, program id).
+    reviewer_stakes: BTreeMap<(Address, u64), ReviewerStake>,
 }
 
 impl RefractGrants {
@@ -204,6 +227,7 @@ impl RefractGrants {
             program_review_rewards: BTreeMap::new(),
             reviewer_compensations: BTreeMap::new(),
             reviewed_grants: BTreeMap::new(),
+            reviewer_stakes: BTreeMap::new(),
         }
     }
 
@@ -975,6 +999,12 @@ impl RefractGrants {
             .checked_add(reward_amount)
             .ok_or(GrantsError::InconsistentState)?;
 
+        if let Some(stake) = self.reviewer_stakes.get_mut(&(reviewer, program_id)) {
+            if stake.active_reviews > 0 {
+                stake.active_reviews -= 1;
+            }
+        }
+
         self.reviewed_grants.insert(grant_id, reviewer);
         Ok(reward_amount)
     }
@@ -1015,6 +1045,187 @@ impl RefractGrants {
         token_decimals: u32,
     ) -> Result<i128, GrantsError> {
         let protocol_amount = self.claim_reviewer_rewards(reviewer)?;
+        normalization::to_token_units(protocol_amount, token_decimals)
+            .map_err(|_| GrantsError::NormalizationError)
+    }
+
+    /// Stakes tokens for a reviewer in a specific program before reviewing evaluations.
+    pub fn stake_for_review(
+        &mut self,
+        reviewer: Address,
+        program_id: u64,
+        amount: i128,
+    ) -> Result<(), GrantsError> {
+        if amount <= 0 {
+            return Err(GrantsError::InvalidStakeAmount);
+        }
+        let program = self.programs.get(&program_id).ok_or(GrantsError::ProgramNotFound)?;
+        if !program.is_active {
+            return Err(GrantsError::ProgramInactive);
+        }
+
+        let stake = self
+            .reviewer_stakes
+            .entry((reviewer, program_id))
+            .or_insert_with(|| ReviewerStake {
+                reviewer,
+                program_id,
+                staked: 0,
+                slashed: 0,
+                active_reviews: 0,
+            });
+
+        stake.staked = stake
+            .staked
+            .checked_add(amount)
+            .ok_or(GrantsError::InconsistentState)?;
+
+        Ok(())
+    }
+
+    /// Slashes a bad-faith or collusive reviewer's stake into the protocol.
+    ///
+    /// Governance-gated.
+    /// Enforces invariant: slashed <= staked.
+    pub fn slash_reviewer(
+        &mut self,
+        governance: Address,
+        reviewer: Address,
+        program_id: u64,
+        slash_amount: i128,
+    ) -> Result<i128, GrantsError> {
+        self.require_governance(governance)?;
+        if slash_amount <= 0 {
+            return Err(GrantsError::InvalidSlashAmount);
+        }
+        let stake = self
+            .reviewer_stakes
+            .get_mut(&(reviewer, program_id))
+            .ok_or(GrantsError::ReviewerStakeNotFound)?;
+
+        let available = stake
+            .staked
+            .checked_sub(stake.slashed)
+            .ok_or(GrantsError::InconsistentState)?;
+
+        if available <= 0 || slash_amount > available {
+            return Err(GrantsError::InsufficientStake);
+        }
+
+        stake.slashed = stake
+            .slashed
+            .checked_add(slash_amount)
+            .ok_or(GrantsError::InconsistentState)?;
+
+        Ok(slash_amount)
+    }
+
+    /// Unstakes remaining available stake for a reviewer in a program.
+    ///
+    /// Prohibits unstaking if there are active assigned reviews.
+    pub fn unstake_review(
+        &mut self,
+        reviewer: Address,
+        program_id: u64,
+    ) -> Result<i128, GrantsError> {
+        let stake = self
+            .reviewer_stakes
+            .get_mut(&(reviewer, program_id))
+            .ok_or(GrantsError::ReviewerStakeNotFound)?;
+
+        if stake.active_reviews > 0 {
+            return Err(GrantsError::ActiveReviewsPending);
+        }
+
+        let available = stake
+            .staked
+            .checked_sub(stake.slashed)
+            .ok_or(GrantsError::InconsistentState)?;
+
+        if available <= 0 {
+            return Err(GrantsError::InsufficientStake);
+        }
+
+        stake.staked = stake.slashed;
+
+        Ok(available)
+    }
+
+    /// Returns the reviewer stake record for a reviewer in a program.
+    pub fn get_reviewer_stake(&self, reviewer: Address, program_id: u64) -> Option<&ReviewerStake> {
+        self.reviewer_stakes.get(&(reviewer, program_id))
+    }
+
+    /// Assigns an active review to a reviewer for a program. Governance-gated.
+    /// Requires that the reviewer has staked and has available stake > 0.
+    pub fn assign_review(
+        &mut self,
+        governance: Address,
+        reviewer: Address,
+        program_id: u64,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(governance)?;
+        let stake = self
+            .reviewer_stakes
+            .get_mut(&(reviewer, program_id))
+            .ok_or(GrantsError::ReviewerStakeNotFound)?;
+
+        let available = stake
+            .staked
+            .checked_sub(stake.slashed)
+            .ok_or(GrantsError::InconsistentState)?;
+        if available <= 0 {
+            return Err(GrantsError::InsufficientStake);
+        }
+
+        stake.active_reviews = stake
+            .active_reviews
+            .checked_add(1)
+            .ok_or(GrantsError::InconsistentState)?;
+        Ok(())
+    }
+
+    /// Marks an active review completed for a reviewer without slashing. Governance-gated.
+    pub fn complete_review(
+        &mut self,
+        governance: Address,
+        reviewer: Address,
+        program_id: u64,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(governance)?;
+        let stake = self
+            .reviewer_stakes
+            .get_mut(&(reviewer, program_id))
+            .ok_or(GrantsError::ReviewerStakeNotFound)?;
+
+        if stake.active_reviews > 0 {
+            stake.active_reviews -= 1;
+        }
+        Ok(())
+    }
+
+    /// Unstakes remaining available stake converted to native token units.
+    pub fn unstake_review_canonical(
+        &mut self,
+        reviewer: Address,
+        program_id: u64,
+        token_decimals: u32,
+    ) -> Result<i128, GrantsError> {
+        let protocol_amount = self.unstake_review(reviewer, program_id)?;
+        normalization::to_token_units(protocol_amount, token_decimals)
+            .map_err(|_| GrantsError::NormalizationError)
+    }
+
+    /// Slashes a bad-faith reviewer's stake converted to native token units.
+    pub fn slash_reviewer_canonical(
+        &mut self,
+        governance: Address,
+        reviewer: Address,
+        program_id: u64,
+        slash_amount: i128,
+        token_decimals: u32,
+    ) -> Result<i128, GrantsError> {
+        let protocol_amount = self.slash_reviewer(governance, reviewer, program_id, slash_amount)?;
         normalization::to_token_units(protocol_amount, token_decimals)
             .map_err(|_| GrantsError::NormalizationError)
     }
@@ -1102,6 +1313,11 @@ impl RefractGrants {
                 return Err(GrantsError::InconsistentState);
             }
         }
+        for stake in self.reviewer_stakes.values() {
+            if stake.staked < 0 || stake.slashed < 0 || stake.slashed > stake.staked {
+                return Err(GrantsError::InconsistentState);
+            }
+        }
         Ok(())
     }
 
@@ -1134,6 +1350,7 @@ pub mod contract {
         ProgramReviewReward(u64),
         ReviewerComp(Address),
         ReviewedGrant(u64),
+        ReviewerStake(Address, u64),
     }
 
     #[contracttype]
@@ -1169,6 +1386,16 @@ pub mod contract {
         pub amount_per_review: i128,
         pub total_earned: i128,
         pub claimed: i128,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ReviewerStake {
+        pub reviewer: Address,
+        pub program_id: u64,
+        pub staked: i128,
+        pub slashed: i128,
+        pub active_reviews: u32,
     }
 
     #[contracttype]
@@ -1223,6 +1450,11 @@ pub mod contract {
         CategoryNotFound = 24,
         DuplicateReviewReward = 25,
         InvalidCompensationAmount = 26,
+        InvalidStakeAmount = 27,
+        InvalidSlashAmount = 28,
+        InsufficientStake = 29,
+        ActiveReviewsPending = 30,
+        ReviewerStakeNotFound = 31,
     }
 
     pub use self::GrantsContractError as GrantContractError;
@@ -2272,6 +2504,14 @@ pub mod contract {
             env.storage().persistent().set(&GrantsDataKey::ReviewerComp(reviewer.clone()), &record);
             env.storage().persistent().set(&GrantsDataKey::ReviewedGrant(grant_id), &reviewer);
 
+            let stake_key = GrantsDataKey::ReviewerStake(reviewer.clone(), program_id);
+            if let Some(mut stake) = env.storage().persistent().get::<_, ReviewerStake>(&stake_key) {
+                if stake.active_reviews > 0 {
+                    stake.active_reviews -= 1;
+                    env.storage().persistent().set(&stake_key, &stake);
+                }
+            }
+
             env.events().publish(
                 (symbol_short!("grant"), symbol_short!("rev_acc")),
                 (reviewer, program_id, grant_id, reward_amount),
@@ -2329,6 +2569,247 @@ pub mod contract {
             token_decimals: u32,
         ) -> Result<i128, GrantsContractError> {
             let protocol_amount = Self::claim_reviewer_rewards(env, reviewer)?;
+            normalization::to_token_units(protocol_amount, token_decimals)
+                .map_err(|_| GrantsContractError::NormalizationError)
+        }
+
+        pub fn stake_for_review(
+            env: Env,
+            reviewer: Address,
+            program_id: u64,
+            amount: i128,
+        ) -> Result<(), GrantsContractError> {
+            reviewer.require_auth();
+            if amount <= 0 {
+                return Err(GrantsContractError::InvalidStakeAmount);
+            }
+            let program: ProgramInfo = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Program(program_id))
+                .ok_or(GrantsContractError::ProgramNotFound)?;
+            if !program.is_active {
+                return Err(GrantsContractError::ProgramInactive);
+            }
+
+            let key = GrantsDataKey::ReviewerStake(reviewer.clone(), program_id);
+            let mut stake: ReviewerStake = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(ReviewerStake {
+                    reviewer: reviewer.clone(),
+                    program_id,
+                    staked: 0,
+                    slashed: 0,
+                    active_reviews: 0,
+                });
+
+            stake.staked = stake
+                .staked
+                .checked_add(amount)
+                .ok_or(GrantsContractError::InconsistentState)?;
+
+            env.storage().persistent().set(&key, &stake);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("stk_rev")),
+                (reviewer, program_id, amount),
+            );
+            Ok(())
+        }
+
+        pub fn slash_reviewer(
+            env: Env,
+            governance: Address,
+            reviewer: Address,
+            program_id: u64,
+            slash_amount: i128,
+        ) -> Result<i128, GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if slash_amount <= 0 {
+                return Err(GrantsContractError::InvalidSlashAmount);
+            }
+
+            let key = GrantsDataKey::ReviewerStake(reviewer.clone(), program_id);
+            let mut stake: ReviewerStake = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(GrantsContractError::ReviewerStakeNotFound)?;
+
+            let available = stake
+                .staked
+                .checked_sub(stake.slashed)
+                .ok_or(GrantsContractError::InconsistentState)?;
+
+            if available <= 0 || slash_amount > available {
+                return Err(GrantsContractError::InsufficientStake);
+            }
+
+            stake.slashed = stake
+                .slashed
+                .checked_add(slash_amount)
+                .ok_or(GrantsContractError::InconsistentState)?;
+
+            env.storage().persistent().set(&key, &stake);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("slash")),
+                (reviewer, program_id, slash_amount),
+            );
+            Ok(slash_amount)
+        }
+
+        pub fn unstake_review(
+            env: Env,
+            reviewer: Address,
+            program_id: u64,
+        ) -> Result<i128, GrantsContractError> {
+            reviewer.require_auth();
+            let key = GrantsDataKey::ReviewerStake(reviewer.clone(), program_id);
+            let mut stake: ReviewerStake = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(GrantsContractError::ReviewerStakeNotFound)?;
+
+            if stake.active_reviews > 0 {
+                return Err(GrantsContractError::ActiveReviewsPending);
+            }
+
+            let available = stake
+                .staked
+                .checked_sub(stake.slashed)
+                .ok_or(GrantsContractError::InconsistentState)?;
+
+            if available <= 0 {
+                return Err(GrantsContractError::InsufficientStake);
+            }
+
+            stake.staked = stake.slashed;
+            env.storage().persistent().set(&key, &stake);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("unstk")),
+                (reviewer, program_id, available),
+            );
+            Ok(available)
+        }
+
+        pub fn get_reviewer_stake(
+            env: Env,
+            reviewer: Address,
+            program_id: u64,
+        ) -> Result<ReviewerStake, GrantsContractError> {
+            env.storage()
+                .persistent()
+                .get(&GrantsDataKey::ReviewerStake(reviewer, program_id))
+                .ok_or(GrantsContractError::ReviewerStakeNotFound)
+        }
+
+        pub fn assign_review(
+            env: Env,
+            governance: Address,
+            reviewer: Address,
+            program_id: u64,
+        ) -> Result<(), GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+
+            let key = GrantsDataKey::ReviewerStake(reviewer.clone(), program_id);
+            let mut stake: ReviewerStake = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(GrantsContractError::ReviewerStakeNotFound)?;
+
+            let available = stake
+                .staked
+                .checked_sub(stake.slashed)
+                .ok_or(GrantsContractError::InconsistentState)?;
+            if available <= 0 {
+                return Err(GrantsContractError::InsufficientStake);
+            }
+
+            stake.active_reviews = stake
+                .active_reviews
+                .checked_add(1)
+                .ok_or(GrantsContractError::InconsistentState)?;
+            env.storage().persistent().set(&key, &stake);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("asgn_rev")),
+                (reviewer, program_id),
+            );
+            Ok(())
+        }
+
+        pub fn complete_review(
+            env: Env,
+            governance: Address,
+            reviewer: Address,
+            program_id: u64,
+        ) -> Result<(), GrantsContractError> {
+            governance.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if governance != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+
+            let key = GrantsDataKey::ReviewerStake(reviewer.clone(), program_id);
+            let mut stake: ReviewerStake = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(GrantsContractError::ReviewerStakeNotFound)?;
+
+            if stake.active_reviews > 0 {
+                stake.active_reviews -= 1;
+            }
+            env.storage().persistent().set(&key, &stake);
+            Ok(())
+        }
+
+        pub fn unstake_review_canonical(
+            env: Env,
+            reviewer: Address,
+            program_id: u64,
+            token_decimals: u32,
+        ) -> Result<i128, GrantsContractError> {
+            let protocol_amount = Self::unstake_review(env, reviewer, program_id)?;
+            normalization::to_token_units(protocol_amount, token_decimals)
+                .map_err(|_| GrantsContractError::NormalizationError)
+        }
+
+        pub fn slash_reviewer_canonical(
+            env: Env,
+            governance: Address,
+            reviewer: Address,
+            program_id: u64,
+            slash_amount: i128,
+            token_decimals: u32,
+        ) -> Result<i128, GrantsContractError> {
+            let protocol_amount = Self::slash_reviewer(env, governance, reviewer, program_id, slash_amount)?;
             normalization::to_token_units(protocol_amount, token_decimals)
                 .map_err(|_| GrantsContractError::NormalizationError)
         }
@@ -2440,6 +2921,7 @@ pub use contract::{
     GrantsDataKey, LicensingAttestation, MilestoneRecord, ProgramInfo, ProgramRegistry,
     RefractGrantsContract, RefractGrantsContractClient,
     ReviewerCompensation as ContractReviewerCompensation,
+    ReviewerStake as ContractReviewerStake,
 };
 
 #[cfg(test)]
@@ -2887,6 +3369,117 @@ mod tests {
         // Integrity verification succeeds
         assert!(grants.verify_integrity().is_ok());
     }
+
+    #[test]
+    fn test_reviewer_staking_and_slashing_lifecycle() {
+        let mut grants = contract();
+        const REVIEWER: Address = 6;
+        const REVIEWER2: Address = 7;
+
+        let criteria_hash = [11u8; 32];
+        let pid = grants
+            .create_program(GOVERNANCE, 20_000, criteria_hash, 100, 500)
+            .unwrap();
+
+        // 1. Invalid stake inputs
+        assert_eq!(
+            grants.stake_for_review(REVIEWER, pid, 0),
+            Err(GrantsError::InvalidStakeAmount)
+        );
+        assert_eq!(
+            grants.stake_for_review(REVIEWER, pid, -100),
+            Err(GrantsError::InvalidStakeAmount)
+        );
+        assert_eq!(
+            grants.stake_for_review(REVIEWER, 999, 500),
+            Err(GrantsError::ProgramNotFound)
+        );
+
+        // 2. Stake valid amount
+        grants.stake_for_review(REVIEWER, pid, 500).unwrap();
+        grants.stake_for_review(REVIEWER, pid, 200).unwrap();
+
+        let stake = grants.get_reviewer_stake(REVIEWER, pid).unwrap();
+        assert_eq!(stake.staked, 700);
+        assert_eq!(stake.slashed, 0);
+        assert_eq!(stake.active_reviews, 0);
+
+        // Unstaked reviewer has no stake
+        assert!(grants.get_reviewer_stake(REVIEWER2, pid).is_none());
+
+        // 3. Assign review
+        assert_eq!(
+            grants.assign_review(STRANGER, REVIEWER, pid),
+            Err(GrantsError::Unauthorized)
+        );
+        assert_eq!(
+            grants.assign_review(GOVERNANCE, REVIEWER2, pid),
+            Err(GrantsError::ReviewerStakeNotFound)
+        );
+
+        grants.assign_review(GOVERNANCE, REVIEWER, pid).unwrap();
+        let stake = grants.get_reviewer_stake(REVIEWER, pid).unwrap();
+        assert_eq!(stake.active_reviews, 1);
+
+        // 4. Invariant: Cannot unstake while active reviews are pending
+        assert_eq!(
+            grants.unstake_review(REVIEWER, pid),
+            Err(GrantsError::ActiveReviewsPending)
+        );
+
+        // Complete review without slashing
+        grants.complete_review(GOVERNANCE, REVIEWER, pid).unwrap();
+        let stake = grants.get_reviewer_stake(REVIEWER, pid).unwrap();
+        assert_eq!(stake.active_reviews, 0);
+
+        // 5. Bad faith review and Slashing
+        assert_eq!(
+            grants.slash_reviewer(STRANGER, REVIEWER, pid, 200),
+            Err(GrantsError::Unauthorized)
+        );
+        assert_eq!(
+            grants.slash_reviewer(GOVERNANCE, REVIEWER, pid, 0),
+            Err(GrantsError::InvalidSlashAmount)
+        );
+        assert_eq!(
+            grants.slash_reviewer(GOVERNANCE, REVIEWER, pid, -50),
+            Err(GrantsError::InvalidSlashAmount)
+        );
+        // Exceeding available stake (700) rejected
+        assert_eq!(
+            grants.slash_reviewer(GOVERNANCE, REVIEWER, pid, 800),
+            Err(GrantsError::InsufficientStake)
+        );
+
+        // Valid slash: slash 300
+        let slashed = grants.slash_reviewer(GOVERNANCE, REVIEWER, pid, 300).unwrap();
+        assert_eq!(slashed, 300);
+
+        let stake = grants.get_reviewer_stake(REVIEWER, pid).unwrap();
+        assert_eq!(stake.staked, 700);
+        assert_eq!(stake.slashed, 300);
+        // Invariant check: slashed <= staked (300 <= 700)
+        assert!(stake.slashed <= stake.staked);
+
+        // 6. Unstake remaining available stake (700 - 300 = 400)
+        let unstaked = grants.unstake_review(REVIEWER, pid).unwrap();
+        assert_eq!(unstaked, 400);
+
+        let stake = grants.get_reviewer_stake(REVIEWER, pid).unwrap();
+        assert_eq!(stake.staked, 300);
+        assert_eq!(stake.slashed, 300);
+        // Invariant check: slashed <= staked (300 <= 300)
+        assert!(stake.slashed <= stake.staked);
+
+        // Nothing left to unstake
+        assert_eq!(
+            grants.unstake_review(REVIEWER, pid),
+            Err(GrantsError::InsufficientStake)
+        );
+
+        // Verify integrity
+        assert!(grants.verify_integrity().is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -3292,6 +3885,98 @@ mod soroban_grants_tests {
         assert_eq!(comp_final.claimed, 500);
 
         // Verify integrity
+        assert!(client.verify_integrity());
+    }
+
+    #[test]
+    fn test_soroban_reviewer_staking_and_slashing() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RefractGrantsContract);
+        let client = RefractGrantsContractClient::new(&env, &contract_id);
+
+        let gov = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        client.initialize(&gov);
+
+        let criteria = BytesN::from_array(&env, &[101u8; 32]);
+        let round_start = 1000u64;
+        let round_end = 2000u64;
+        let budget = 25_000i128;
+
+        let pid = client.create_program(&gov, &budget, &criteria, &round_start, &round_end);
+
+        // 1. Invalid stake inputs
+        let bad_stake = client.try_stake_for_review(&reviewer, &pid, &0);
+        assert_eq!(bad_stake, Err(Ok(GrantsContractError::InvalidStakeAmount)));
+
+        let bad_stake_neg = client.try_stake_for_review(&reviewer, &pid, &-500);
+        assert_eq!(bad_stake_neg, Err(Ok(GrantsContractError::InvalidStakeAmount)));
+
+        let bad_prog = client.try_stake_for_review(&reviewer, &999, &1000);
+        assert_eq!(bad_prog, Err(Ok(GrantsContractError::ProgramNotFound)));
+
+        // 2. Stake tokens
+        client.stake_for_review(&reviewer, &pid, &600);
+        client.stake_for_review(&reviewer, &pid, &400);
+
+        let stake = client.get_reviewer_stake(&reviewer, &pid);
+        assert_eq!(stake.staked, 1000);
+        assert_eq!(stake.slashed, 0);
+        assert_eq!(stake.active_reviews, 0);
+
+        // 3. Assign review
+        let unauth_asgn = client.try_assign_review(&stranger, &reviewer, &pid);
+        assert_eq!(unauth_asgn, Err(Ok(GrantsContractError::Unauthorized)));
+
+        client.assign_review(&gov, &reviewer, &pid);
+        let stake = client.get_reviewer_stake(&reviewer, &pid);
+        assert_eq!(stake.active_reviews, 1);
+
+        // 4. Invariant: Cannot unstake while active reviews are pending
+        let unstk_err = client.try_unstake_review(&reviewer, &pid);
+        assert_eq!(unstk_err, Err(Ok(GrantsContractError::ActiveReviewsPending)));
+
+        // Complete review
+        client.complete_review(&gov, &reviewer, &pid);
+        let stake = client.get_reviewer_stake(&reviewer, &pid);
+        assert_eq!(stake.active_reviews, 0);
+
+        // 5. Slashing
+        let unauth_slash = client.try_slash_reviewer(&stranger, &reviewer, &pid, &300);
+        assert_eq!(unauth_slash, Err(Ok(GrantsContractError::Unauthorized)));
+
+        let bad_slash = client.try_slash_reviewer(&gov, &reviewer, &pid, &0);
+        assert_eq!(bad_slash, Err(Ok(GrantsContractError::InvalidSlashAmount)));
+
+        let over_slash = client.try_slash_reviewer(&gov, &reviewer, &pid, &1500);
+        assert_eq!(over_slash, Err(Ok(GrantsContractError::InsufficientStake)));
+
+        // Valid slash
+        let slashed = client.slash_reviewer(&gov, &reviewer, &pid, &400);
+        assert_eq!(slashed, 400);
+
+        let stake = client.get_reviewer_stake(&reviewer, &pid);
+        assert_eq!(stake.staked, 1000);
+        assert_eq!(stake.slashed, 400);
+        assert!(stake.slashed <= stake.staked);
+
+        // 6. Unstake remaining available stake (1000 - 400 = 600)
+        let unstaked = client.unstake_review(&reviewer, &pid);
+        assert_eq!(unstaked, 600);
+
+        let stake = client.get_reviewer_stake(&reviewer, &pid);
+        assert_eq!(stake.staked, 400);
+        assert_eq!(stake.slashed, 400);
+        assert!(stake.slashed <= stake.staked);
+
+        let no_stake_err = client.try_unstake_review(&reviewer, &pid);
+        assert_eq!(no_stake_err, Err(Ok(GrantsContractError::InsufficientStake)));
+
+        // Integrity verification succeeds
         assert!(client.verify_integrity());
     }
 }
