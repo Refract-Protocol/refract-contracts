@@ -1,4 +1,4 @@
-﻿# Refract Protocol Pre-Mainnet Security Audit Tracking & Remediation Package
+# Refract Protocol Pre-Mainnet Security Audit Tracking & Remediation Package
 
 **Document Version:** 1.0.0  
 **Scope:** Core Smart Contracts (`RefractPool`, `RefractPolicyRegistry`, `RefractOracle`)  
@@ -13,18 +13,21 @@
 This document forms the official scoping specification and engagement tracking board for the independent third-party security audit required prior to Refract Protocol's mainnet deployment.
 
 ### 1.1 In-Scope Target Contracts
-The audit scope encompasses the three core contracts that hold capital, manage coverage obligations, or supply parametric trigger data:
+The audit scope encompasses both the three core settlement contracts and the four governance-adjacent capital custody and disbursement contracts:
 
 | Contract Crate | Path | Primary Responsibilities | Target Lines |
 | :--- | :--- | :--- | :--- |
 | **`refract-pool`** | `pool/src/lib.rs` | Capital custody, share accounting, policy underwriting, premium calculations, and automated claims settlement. | ~1,050 lines |
 | **`refract-policy`** | `policy/src/lib.rs` | Global policy indexation, holder registry, and policy status tracking. | ~390 lines |
 | **`refract-oracle`** | `oracle/src/lib.rs` | Parametric event feeds, relayer authorization, threshold evaluations, and staleness validation. | ~310 lines |
+| **`refract-backstop`** | `backstop/src/lib.rs` | First/second-loss backstop tranche, O(1) accumulator-index premium distribution, unstake cooldowns, and pool shortfall absorption. | ~430 lines |
+| **`refract-bounty`** | `bounty/src/lib.rs` | Governance-gated bug bounty disclosure escrow (`Created -> Funded -> Approved -> Paid / Refunded`) keyed by `report_hash`. | ~360 lines |
+| **`refract-grants`** | `grants/src/lib.rs` | `#![no_std]` Soroban milestone-based community grants escrow and sequential confirmation contract. | ~410 lines |
+| **`refract-treasury`** | `treasury/src/lib.rs` | Role-separated (`admin` / `manager`) protocol custody vault with per-epoch spending limits and drift-free token accounting. | ~340 lines |
 
 ### 1.2 Out-of-Scope Boundaries
 - Off-chain frontend web applications and indexers.
 - External token implementations (standard Stellar Asset Contract / USDC wrapper is assumed secure).
-- Proposed or unmerged governance/DAO contracts (deferred to Phase 2 audit post-landing).
 
 ### 1.3 Key Protocol Invariants (For Auditor Verification)
 1. **Solvency Invariant**: At all ledger timestamps, total pooled capital must satisfy:
@@ -32,12 +35,20 @@ The audit scope encompasses the three core contracts that hold capital, manage c
 2. **Payout Determinism**: Payouts from `process_claim` can **only** be credited to the original `policy.holder` recorded at creation time; zero funds may be redirected by third-party callers.
 3. **No Phantom Dilution**: Liquidity provider shares can never be minted without corresponding USDC capital deposits (`amount * total_shares / total_capital`).
 4. **Oracle Staleness Rejection**: Readings older than 1,800 seconds (30 minutes) or dated with future timestamps must be rejected unconditionally.
+5. **Governance-Adjacent Accounting & State-Machine Invariants (`INV-BS-01`..`INV-TR-03`)**: Full formal assertions, rounding rules, trust assumptions, and test mappings for `RefractBackstop`, `RefractBountyEscrow`, `RefractGrants`, and `RefractTreasury` are specified in [`docs/INVARIANTS.md`](./docs/INVARIANTS.md).
+
+### 1.4 Audit Readiness Checklist for Governance-Adjacent Contracts (`backstop`, `bounty`, `grants`, `treasury`)
+- [x] **Workspace & Build Integration (#195)**: All four crates registered in root `Cargo.toml` and building cleanly under `#![no_std]`.
+- [x] **Formal Invariants & Trust Assumptions (#223)**: Per-contract invariants (`INV-BS-01`..`INV-TR-03`) and test traceability matrix published in [`docs/INVARIANTS.md`](./docs/INVARIANTS.md).
+- [x] **Soroban Contract Implementations (#196, #197, #198, #199)**: Storage keys, `require_auth` guards, token transfers, TTL extensions, and unit test suites implemented.
+- [ ] **Cross-Contract Timelock & Pool Wiring (#200, #201, #202)**: End-to-end governance → timelock → contract integration verification prior to final freeze commit.
 
 ---
 
 ## 2. Auditor Deliverable Packet & Cross-References
 
 Auditors should review the following accompanying documentation prepared during the pre-audit hardening phase:
+- **`docs/INVARIANTS.md`**: Executable accounting invariants, state-machine properties, trust assumptions, and test-mapping matrix for `backstop`, `bounty`, `grants`, and `treasury`.
 - **`GRIEFING_ANALYSIS.md`**: Formal analysis of permissionless entrypoints (`process_claim`, `expire_policy`) and Soroban resource fee attribution.
 - **`INCIDENT_RESPONSE.md`**: Post-incident pause-and-migrate runbook and multi-contract atomic emergency lockdown procedures.
 - **`clippy.toml` & Static Gate**: Strict Soroban linting rules rejecting runtime panics (`unwrap`, `expect`) in favor of typed `Result<T, E>`.
