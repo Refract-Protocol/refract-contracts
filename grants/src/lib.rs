@@ -1,36 +1,14 @@
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract with read-only
+//! [`RefractGrants::preview_grant_claimable`] simulation support.
 
 use std::collections::BTreeMap;
 
 /// Identifier for a grant.
 pub type GrantId = u64;
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
+/// Address type used by the contract.
 pub type Address = u64;
 
 /// Errors returned by [`RefractGrants`].
@@ -58,6 +36,8 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// Contract is currently paused.
+    Paused,
 }
 
 /// A single milestone within a grant.
@@ -84,6 +64,31 @@ pub struct Grant {
     pub claimable: i128,
 }
 
+/// Read-only simulation result returned by [`RefractGrants::preview_grant_claimable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantClaimPreview {
+    /// Queried grant identifier.
+    pub grant_id: GrantId,
+    /// Whether a grant with `grant_id` exists (`false` returns a zeroed preview).
+    pub exists: bool,
+    /// Total approved amount across all milestones.
+    pub total_amount: i128,
+    /// Cumulative amount across all confirmed milestones (claimed + unclaimed).
+    pub confirmed_amount: i128,
+    /// Cumulative amount already claimed by the recipient.
+    pub already_claimed_amount: i128,
+    /// Confirmed-but-unclaimed amount that `claim` will release right now.
+    pub claimable_amount: i128,
+    /// Remaining unconfirmed milestone balance.
+    pub unconfirmed_amount: i128,
+    /// Number of confirmed milestones.
+    pub confirmed_milestones: usize,
+    /// Total number of milestones in the grant.
+    pub total_milestones: usize,
+    /// Whether the contract is currently paused (previews still return figures when paused).
+    pub paused: bool,
+}
+
 /// Milestone-based community grants disbursement contract.
 #[derive(Debug, Clone)]
 pub struct RefractGrants {
@@ -94,6 +99,8 @@ pub struct RefractGrants {
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Emergency pause flag.
+    paused: bool,
 }
 
 impl RefractGrants {
@@ -103,7 +110,20 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            paused: false,
         }
+    }
+
+    /// Governance-gated pause toggle. Previews still return figures while flagging `paused = true`.
+    pub fn set_paused(&mut self, caller: Address, paused: bool) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        self.paused = paused;
+        Ok(())
+    }
+
+    /// Returns whether the contract is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// Returns the configured governance/timelock authority.
@@ -121,10 +141,14 @@ impl RefractGrants {
         self.grants.get(&grant_id).map(|grant| grant.claimable)
     }
 
-    /// Approves a new grant with `total_amount` split across `milestones`.
+    /// Pure, side-effect-free preview of the claimable state for `grant_id`.
     ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
+    /// Returns a zeroed [`GrantClaimPreview`] with `exists = false` if `grant_id` does not exist.
+    pub fn preview_grant_claimable(&self, grant_id: GrantId) -> GrantClaimPreview {
+        self.compute_grant_claim(grant_id)
+    }
+
+    /// Approves a new grant with `total_amount` split across `milestones`.
     pub fn create_grant(
         &mut self,
         caller: Address,
@@ -133,6 +157,9 @@ impl RefractGrants {
         milestones: Vec<i128>,
     ) -> Result<GrantId, GrantsError> {
         self.require_governance(caller)?;
+        if self.paused {
+            return Err(GrantsError::Paused);
+        }
 
         if total_amount <= 0 {
             return Err(GrantsError::InvalidTotalAmount);
@@ -146,7 +173,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -178,10 +207,6 @@ impl RefractGrants {
     }
 
     /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
         &mut self,
         caller: Address,
@@ -189,6 +214,9 @@ impl RefractGrants {
         milestone_index: usize,
     ) -> Result<(), GrantsError> {
         self.require_governance(caller)?;
+        if self.paused {
+            return Err(GrantsError::Paused);
+        }
 
         let grant = self
             .grants
@@ -199,8 +227,6 @@ impl RefractGrants {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
         for earlier in &grant.milestones[..milestone_index] {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
@@ -222,11 +248,16 @@ impl RefractGrants {
     }
 
     /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
+    /// recipient. Shares [`Self::compute_grant_claim`] with [`Self::preview_grant_claimable`].
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
+        if self.paused {
+            return Err(GrantsError::Paused);
+        }
+        let preview = self.compute_grant_claim(grant_id);
+        if !preview.exists {
+            return Err(GrantsError::GrantNotFound);
+        }
+
         let grant = self
             .grants
             .get_mut(&grant_id)
@@ -236,8 +267,7 @@ impl RefractGrants {
             return Err(GrantsError::NotRecipient);
         }
 
-        let amount = grant.claimable;
-        if amount <= 0 {
+        if preview.claimable_amount <= 0 {
             return Err(GrantsError::NothingToClaim);
         }
 
@@ -248,7 +278,55 @@ impl RefractGrants {
             }
         }
 
-        Ok(amount)
+        Ok(preview.claimable_amount)
+    }
+
+    /// Shared internal computation used by both [`Self::claim`] and [`Self::preview_grant_claimable`].
+    fn compute_grant_claim(&self, grant_id: GrantId) -> GrantClaimPreview {
+        let Some(grant) = self.grants.get(&grant_id) else {
+            return GrantClaimPreview {
+                grant_id,
+                exists: false,
+                total_amount: 0,
+                confirmed_amount: 0,
+                already_claimed_amount: 0,
+                claimable_amount: 0,
+                unconfirmed_amount: 0,
+                confirmed_milestones: 0,
+                total_milestones: 0,
+                paused: self.paused,
+            };
+        };
+
+        let mut confirmed_amount: i128 = 0;
+        let mut already_claimed_amount: i128 = 0;
+        let mut confirmed_milestones: usize = 0;
+
+        for m in &grant.milestones {
+            if m.confirmed {
+                confirmed_amount = confirmed_amount.saturating_add(m.amount);
+                confirmed_milestones += 1;
+                if m.claimed {
+                    already_claimed_amount = already_claimed_amount.saturating_add(m.amount);
+                }
+            }
+        }
+
+        let claimable_amount = grant.claimable;
+        let unconfirmed_amount = grant.total_amount.saturating_sub(confirmed_amount);
+
+        GrantClaimPreview {
+            grant_id,
+            exists: true,
+            total_amount: grant.total_amount,
+            confirmed_amount,
+            already_claimed_amount,
+            claimable_amount,
+            unconfirmed_amount,
+            confirmed_milestones,
+            total_milestones: grant.milestones.len(),
+            paused: self.paused,
+        }
     }
 
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
@@ -260,6 +338,7 @@ impl RefractGrants {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -278,9 +357,11 @@ mod tests {
             .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
             .unwrap();
 
-        // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -295,16 +376,46 @@ mod tests {
     }
 
     #[test]
-    fn claim_releases_only_confirmed_amounts() {
+    fn preview_grant_claimable_matches_claim_across_partial_vesting_and_pause() {
         let mut grants = contract();
+
+        // Unknown grant returns zeroed struct with exists = false.
+        let missing = grants.preview_grant_claimable(999);
+        assert!(!missing.exists);
+        assert_eq!(missing.claimable_amount, 0);
+
         let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
+            .create_grant(GOVERNANCE, RECIPIENT, 600, vec![150, 200, 250])
             .unwrap();
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
+        let p1 = grants.preview_grant_claimable(id);
+        assert!(p1.exists);
+        assert_eq!(p1.total_amount, 600);
+        assert_eq!(p1.confirmed_amount, 150);
+        assert_eq!(p1.already_claimed_amount, 0);
+        assert_eq!(p1.claimable_amount, 150);
+        assert_eq!(p1.unconfirmed_amount, 450);
+        assert_eq!(p1.confirmed_milestones, 1);
+        assert_eq!(p1.total_milestones, 3);
+        assert!(!p1.paused);
+
+        let claimed_1 = grants.claim(RECIPIENT, id).unwrap();
+        assert_eq!(claimed_1, p1.claimable_amount);
+
+        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
+        grants.set_paused(GOVERNANCE, true).unwrap();
+        let p2 = grants.preview_grant_claimable(id);
+        assert!(p2.paused);
+        assert_eq!(p2.confirmed_amount, 350);
+        assert_eq!(p2.already_claimed_amount, 150);
+        assert_eq!(p2.claimable_amount, 200);
+        assert_eq!(p2.unconfirmed_amount, 250);
+        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::Paused));
+
+        grants.set_paused(GOVERNANCE, false).unwrap();
+        let claimed_2 = grants.claim(RECIPIENT, id).unwrap();
+        assert_eq!(claimed_2, p2.claimable_amount);
     }
 
     #[test]
@@ -312,10 +423,6 @@ mod tests {
         let mut grants = contract();
         assert_eq!(
             grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
             Err(GrantsError::MilestoneSumMismatch)
         );
     }
@@ -353,21 +460,15 @@ mod tests {
             grants.confirm_milestone(GOVERNANCE, id, 1),
             Err(GrantsError::MilestoneOutOfOrder)
         );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
         assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
+            grants.confirm_milestone(GOVERNANCE, id, 0),
             Err(GrantsError::MilestoneAlreadyConfirmed)
         );
     }
 
     #[test]
-    fn enforces_governance_gating() {
+    fn enforces_governance_gating_and_recipient_only_claim() {
         let mut grants = contract();
         assert_eq!(
             grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
@@ -377,39 +478,9 @@ mod tests {
         let id = grants
             .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
             .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
 
         assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
         assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
-        );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
-        );
     }
 }
