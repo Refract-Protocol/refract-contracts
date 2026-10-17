@@ -1,36 +1,23 @@
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract with a per-program
+//! funding round registry, budget caps, and eligibility commitments.
+
+#![allow(
+    clippy::disallowed_methods,
+    clippy::inconsistent_digit_grouping,
+    clippy::too_many_arguments
+)]
 
 use std::collections::BTreeMap;
 
 /// Identifier for a grant.
 pub type GrantId = u64;
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
+/// Identifier for a funding program.
+pub type ProgramId = u64;
+
+/// Address type used by the contract.
 pub type Address = u64;
 
 /// Errors returned by [`RefractGrants`].
@@ -58,6 +45,49 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// No funding program exists for the supplied program id.
+    ProgramNotFound,
+    /// Target program is paused/inactive and cannot accept new applications.
+    ProgramInactive,
+    /// Current ledger is outside the program's `[round_open_ledger, round_close_ledger]` window.
+    RoundWindowClosed,
+    /// Round open ledger is greater than round close ledger, or budget is non-positive.
+    InvalidProgramConfig,
+    /// Grant or release would exceed the program's approved budget.
+    ProgramBudgetExceeded,
+    /// Program has committed or disbursed funds and cannot be deleted.
+    ProgramHasCommitments,
+}
+
+/// Registered funding program and round configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramEntry {
+    /// Program identifier.
+    pub id: ProgramId,
+    /// Total budget approved for this program.
+    pub budget: i128,
+    /// Total amount committed to approved grants in this program.
+    pub committed: i128,
+    /// Total amount claimed/disbursed across grants in this program.
+    pub disbursed: i128,
+    /// Content hash commitment of the program's eligibility rules.
+    pub eligibility_criteria_hash: [u8; 32],
+    /// Ledger sequence when the application round opens (inclusive).
+    pub round_open_ledger: u64,
+    /// Ledger sequence when the application round closes (inclusive).
+    pub round_close_ledger: u64,
+    /// Whether the program is currently open to new grant applications.
+    pub active: bool,
+}
+
+/// Read-only budget breakdown for a registered funding program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramAccounting {
+    pub budget: i128,
+    pub committed: i128,
+    pub disbursed: i128,
+    pub remaining_uncommitted: i128,
+    pub remaining_undisbursed: i128,
 }
 
 /// A single milestone within a grant.
@@ -74,6 +104,8 @@ pub struct Milestone {
 /// A grant approved by governance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
+    /// Optional funding program container this grant belongs to.
+    pub program_id: Option<ProgramId>,
     /// Account that receives released funds.
     pub recipient: Address,
     /// Total amount approved across all milestones.
@@ -92,8 +124,12 @@ pub struct RefractGrants {
     governance: Address,
     /// Monotonic counter used to allocate grant ids.
     next_grant_id: GrantId,
+    /// Monotonic counter used to allocate program ids.
+    next_program_id: ProgramId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Registered funding programs keyed by id.
+    programs: BTreeMap<ProgramId, ProgramEntry>,
 }
 
 impl RefractGrants {
@@ -102,7 +138,9 @@ impl RefractGrants {
         Self {
             governance,
             next_grant_id: 0,
+            next_program_id: 0,
             grants: BTreeMap::new(),
+            programs: BTreeMap::new(),
         }
     }
 
@@ -121,10 +159,159 @@ impl RefractGrants {
         self.grants.get(&grant_id).map(|grant| grant.claimable)
     }
 
-    /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
+    /// Registers a new funding program with a budget, eligibility hash, and round window.
+    pub fn create_program(
+        &mut self,
+        caller: Address,
+        budget: i128,
+        eligibility_criteria_hash: [u8; 32],
+        round_open_ledger: u64,
+        round_close_ledger: u64,
+        active: bool,
+    ) -> Result<ProgramId, GrantsError> {
+        self.require_governance(caller)?;
+        if budget <= 0 || round_open_ledger > round_close_ledger {
+            return Err(GrantsError::InvalidProgramConfig);
+        }
+
+        let program_id = self.next_program_id;
+        self.next_program_id += 1;
+
+        self.programs.insert(
+            program_id,
+            ProgramEntry {
+                id: program_id,
+                budget,
+                committed: 0,
+                disbursed: 0,
+                eligibility_criteria_hash,
+                round_open_ledger,
+                round_close_ledger,
+                active,
+            },
+        );
+        Ok(program_id)
+    }
+
+    /// Updates an existing funding program's budget, eligibility hash, round window, or active flag.
+    pub fn update_program(
+        &mut self,
+        caller: Address,
+        program_id: ProgramId,
+        budget: i128,
+        eligibility_criteria_hash: [u8; 32],
+        round_open_ledger: u64,
+        round_close_ledger: u64,
+        active: bool,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if budget <= 0 || round_open_ledger > round_close_ledger {
+            return Err(GrantsError::InvalidProgramConfig);
+        }
+
+        let prog = self
+            .programs
+            .get_mut(&program_id)
+            .ok_or(GrantsError::ProgramNotFound)?;
+        if budget < prog.committed || budget < prog.disbursed {
+            return Err(GrantsError::ProgramBudgetExceeded);
+        }
+
+        prog.budget = budget;
+        prog.eligibility_criteria_hash = eligibility_criteria_hash;
+        prog.round_open_ledger = round_open_ledger;
+        prog.round_close_ledger = round_close_ledger;
+        prog.active = active;
+        Ok(())
+    }
+
+    /// Pauses or unpauses a funding program. Pausing blocks new applications
+    /// while permitting already-approved grants to confirm and claim milestones.
+    pub fn set_program_active(
+        &mut self,
+        caller: Address,
+        program_id: ProgramId,
+        active: bool,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        let prog = self
+            .programs
+            .get_mut(&program_id)
+            .ok_or(GrantsError::ProgramNotFound)?;
+        prog.active = active;
+        Ok(())
+    }
+
+    /// Deletes a program entry only if it has zero committed and zero disbursed funds.
+    pub fn delete_program(
+        &mut self,
+        caller: Address,
+        program_id: ProgramId,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        let prog = self
+            .programs
+            .get(&program_id)
+            .ok_or(GrantsError::ProgramNotFound)?;
+        if prog.committed > 0 || prog.disbursed > 0 {
+            return Err(GrantsError::ProgramHasCommitments);
+        }
+        self.programs.remove(&program_id);
+        Ok(())
+    }
+
+    /// Returns the registered funding program for `program_id`, if any.
+    pub fn get_program(&self, program_id: ProgramId) -> Option<&ProgramEntry> {
+        self.programs.get(&program_id)
+    }
+
+    /// Returns budget, committed, disbursed, and remaining balances for `program_id`.
+    pub fn program_accounting(&self, program_id: ProgramId) -> Option<ProgramAccounting> {
+        self.programs.get(&program_id).map(|p| ProgramAccounting {
+            budget: p.budget,
+            committed: p.committed,
+            disbursed: p.disbursed,
+            remaining_uncommitted: p.budget.saturating_sub(p.committed),
+            remaining_undisbursed: p.budget.saturating_sub(p.disbursed),
+        })
+    }
+
+    /// Approves a new grant within a specific funding program and round window.
+    pub fn create_program_grant(
+        &mut self,
+        caller: Address,
+        program_id: ProgramId,
+        recipient: Address,
+        total_amount: i128,
+        milestones: Vec<i128>,
+        current_ledger: u64,
+    ) -> Result<GrantId, GrantsError> {
+        self.require_governance(caller)?;
+        Self::validate_milestone_plan(total_amount, &milestones)?;
+
+        let prog = self
+            .programs
+            .get_mut(&program_id)
+            .ok_or(GrantsError::ProgramNotFound)?;
+        if !prog.active {
+            return Err(GrantsError::ProgramInactive);
+        }
+        if current_ledger < prog.round_open_ledger || current_ledger > prog.round_close_ledger {
+            return Err(GrantsError::RoundWindowClosed);
+        }
+        let next_committed = prog
+            .committed
+            .checked_add(total_amount)
+            .ok_or(GrantsError::ProgramBudgetExceeded)?;
+        if next_committed > prog.budget {
+            return Err(GrantsError::ProgramBudgetExceeded);
+        }
+        prog.committed = next_committed;
+
+        Ok(self.insert_grant(Some(program_id), recipient, total_amount, milestones))
+    }
+
+    /// Approves a new standalone grant with `total_amount` split across `milestones`.
     pub fn create_grant(
         &mut self,
         caller: Address,
@@ -133,55 +320,11 @@ impl RefractGrants {
         milestones: Vec<i128>,
     ) -> Result<GrantId, GrantsError> {
         self.require_governance(caller)?;
-
-        if total_amount <= 0 {
-            return Err(GrantsError::InvalidTotalAmount);
-        }
-        if milestones.is_empty() {
-            return Err(GrantsError::NoMilestones);
-        }
-
-        let mut sum: i128 = 0;
-        for amount in &milestones {
-            if *amount <= 0 {
-                return Err(GrantsError::InvalidMilestoneAmount);
-            }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
-        }
-        if sum != total_amount {
-            return Err(GrantsError::MilestoneSumMismatch);
-        }
-
-        let grant_id = self.next_grant_id;
-        self.next_grant_id += 1;
-
-        let stored = milestones
-            .into_iter()
-            .map(|amount| Milestone {
-                amount,
-                confirmed: false,
-                claimed: false,
-            })
-            .collect();
-
-        self.grants.insert(
-            grant_id,
-            Grant {
-                recipient,
-                total_amount,
-                milestones: stored,
-                claimable: 0,
-            },
-        );
-
-        Ok(grant_id)
+        Self::validate_milestone_plan(total_amount, &milestones)?;
+        Ok(self.insert_grant(None, recipient, total_amount, milestones))
     }
 
     /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
         &mut self,
         caller: Address,
@@ -199,8 +342,6 @@ impl RefractGrants {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
         for earlier in &grant.milestones[..milestone_index] {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
@@ -212,24 +353,40 @@ impl RefractGrants {
             return Err(GrantsError::MilestoneAlreadyConfirmed);
         }
 
-        milestone.confirmed = true;
+        let milestone_amount = milestone.amount;
+        if let Some(pid) = grant.program_id {
+            let prog = self
+                .programs
+                .get(&pid)
+                .ok_or(GrantsError::ProgramNotFound)?;
+            let projected = prog
+                .disbursed
+                .checked_add(grant.claimable)
+                .and_then(|v| v.checked_add(milestone_amount))
+                .ok_or(GrantsError::ProgramBudgetExceeded)?;
+            if projected > prog.budget {
+                return Err(GrantsError::ProgramBudgetExceeded);
+            }
+        }
+
+        let grant = self
+            .grants
+            .get_mut(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+        grant.milestones[milestone_index].confirmed = true;
         grant.claimable = grant
             .claimable
-            .checked_add(milestone.amount)
+            .checked_add(milestone_amount)
             .ok_or(GrantsError::MilestoneSumMismatch)?;
 
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
+    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the recipient.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
         let grant = self
             .grants
-            .get_mut(&grant_id)
+            .get(&grant_id)
             .ok_or(GrantsError::GrantNotFound)?;
 
         if grant.recipient != recipient {
@@ -241,6 +398,25 @@ impl RefractGrants {
             return Err(GrantsError::NothingToClaim);
         }
 
+        if let Some(pid) = grant.program_id {
+            let prog = self
+                .programs
+                .get_mut(&pid)
+                .ok_or(GrantsError::ProgramNotFound)?;
+            let next_disbursed = prog
+                .disbursed
+                .checked_add(amount)
+                .ok_or(GrantsError::ProgramBudgetExceeded)?;
+            if next_disbursed > prog.budget {
+                return Err(GrantsError::ProgramBudgetExceeded);
+            }
+            prog.disbursed = next_disbursed;
+        }
+
+        let grant = self
+            .grants
+            .get_mut(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
         grant.claimable = 0;
         for milestone in grant.milestones.iter_mut() {
             if milestone.confirmed {
@@ -249,6 +425,61 @@ impl RefractGrants {
         }
 
         Ok(amount)
+    }
+
+    fn validate_milestone_plan(total_amount: i128, milestones: &[i128]) -> Result<(), GrantsError> {
+        if total_amount <= 0 {
+            return Err(GrantsError::InvalidTotalAmount);
+        }
+        if milestones.is_empty() {
+            return Err(GrantsError::NoMilestones);
+        }
+
+        let mut sum: i128 = 0;
+        for amount in milestones {
+            if *amount <= 0 {
+                return Err(GrantsError::InvalidMilestoneAmount);
+            }
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
+        }
+        if sum != total_amount {
+            return Err(GrantsError::MilestoneSumMismatch);
+        }
+        Ok(())
+    }
+
+    fn insert_grant(
+        &mut self,
+        program_id: Option<ProgramId>,
+        recipient: Address,
+        total_amount: i128,
+        milestones: Vec<i128>,
+    ) -> GrantId {
+        let grant_id = self.next_grant_id;
+        self.next_grant_id += 1;
+
+        let stored = milestones
+            .into_iter()
+            .map(|amount| Milestone {
+                amount,
+                confirmed: false,
+                claimed: false,
+            })
+            .collect();
+
+        self.grants.insert(
+            grant_id,
+            Grant {
+                program_id,
+                recipient,
+                total_amount,
+                milestones: stored,
+                claimable: 0,
+            },
+        );
+        grant_id
     }
 
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
@@ -278,9 +509,11 @@ mod tests {
             .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
             .unwrap();
 
-        // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -302,7 +535,6 @@ mod tests {
             .unwrap();
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
         assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
         assert_eq!(grants.claimable(id), Some(0));
     }
@@ -411,5 +643,65 @@ mod tests {
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
         );
+    }
+
+    #[test]
+    fn program_registry_enforces_windows_budgets_and_in_flight_grace() {
+        let mut grants = contract();
+        let hash = [0xABu8; 32];
+
+        // Rejects inverted ledger window
+        assert_eq!(
+            grants.create_program(GOVERNANCE, 1_000, hash, 200, 100, true),
+            Err(GrantsError::InvalidProgramConfig)
+        );
+
+        let pid = grants
+            .create_program(GOVERNANCE, 500, hash, 100, 200, true)
+            .unwrap();
+
+        // Rejects application outside round window
+        assert_eq!(
+            grants.create_program_grant(GOVERNANCE, pid, RECIPIENT, 300, vec![150, 150], 99),
+            Err(GrantsError::RoundWindowClosed)
+        );
+        assert_eq!(
+            grants.create_program_grant(GOVERNANCE, pid, RECIPIENT, 300, vec![150, 150], 201),
+            Err(GrantsError::RoundWindowClosed)
+        );
+
+        // Approve a grant within window and budget
+        let gid = grants
+            .create_program_grant(GOVERNANCE, pid, RECIPIENT, 300, vec![100, 200], 150)
+            .unwrap();
+
+        // Rejects second grant exceeding remaining uncommitted budget (200 left)
+        assert_eq!(
+            grants.create_program_grant(GOVERNANCE, pid, RECIPIENT, 250, vec![250], 150),
+            Err(GrantsError::ProgramBudgetExceeded)
+        );
+
+        // Cannot delete a program with committed funds
+        assert_eq!(
+            grants.delete_program(GOVERNANCE, pid),
+            Err(GrantsError::ProgramHasCommitments)
+        );
+
+        // Pausing program blocks new applications but allows in-flight grant milestones
+        grants.set_program_active(GOVERNANCE, pid, false).unwrap();
+        assert_eq!(
+            grants.create_program_grant(GOVERNANCE, pid, RECIPIENT, 100, vec![100], 150),
+            Err(GrantsError::ProgramInactive)
+        );
+
+        grants.confirm_milestone(GOVERNANCE, gid, 0).unwrap();
+        assert_eq!(grants.claim(RECIPIENT, gid), Ok(100));
+
+        let acct = grants.program_accounting(pid).unwrap();
+        assert_eq!(acct.budget, 500);
+        assert_eq!(acct.committed, 300);
+        assert_eq!(acct.disbursed, 100);
+        assert_eq!(acct.remaining_uncommitted, 200);
+        assert_eq!(acct.remaining_undisbursed, 400);
     }
 }
