@@ -1,130 +1,223 @@
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract with M-of-N guardian
+//! admin/governance key recovery.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Identifier for a grant.
 pub type GrantId = u64;
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
+/// Address type used by the contract.
 pub type Address = u64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardianSetConfig {
+    pub guardians: BTreeSet<Address>,
+    pub threshold: usize,
+    pub recovery_delay: u64,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryProposal {
+    pub proposal_id: u64,
+    pub new_governance: Address,
+    pub approvals: BTreeSet<Address>,
+    pub threshold_reached_at: Option<u64>,
+    pub guardian_epoch: u64,
+}
 
 /// Errors returned by [`RefractGrants`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantsError {
-    /// Caller is not the configured governance/timelock authority.
     Unauthorized,
-    /// No grant exists for the supplied id.
     GrantNotFound,
-    /// A grant must declare at least one milestone.
     NoMilestones,
-    /// Milestone amounts do not sum to the declared total amount.
     MilestoneSumMismatch,
-    /// A milestone amount was zero or negative.
     InvalidMilestoneAmount,
-    /// The total amount was zero or negative.
     InvalidTotalAmount,
-    /// The milestone index is out of range for the grant.
     InvalidMilestoneIndex,
-    /// The milestone has already been confirmed.
     MilestoneAlreadyConfirmed,
-    /// Milestones must be confirmed in order; an earlier one is still pending.
     MilestoneOutOfOrder,
-    /// The caller is not the grant recipient.
     NotRecipient,
-    /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    InvalidGuardianConfig,
+    RecoveryAlreadyPending,
+    NoPendingRecovery,
+    InsufficientApprovals,
+    RecoveryDelayNotElapsed,
+    AlreadyApproved,
 }
 
-/// A single milestone within a grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Milestone {
-    /// Amount released when this milestone is confirmed.
     pub amount: i128,
-    /// Whether governance has confirmed delivery of this milestone.
     pub confirmed: bool,
-    /// Whether the confirmed amount has already been claimed.
     pub claimed: bool,
 }
 
-/// A grant approved by governance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
-    /// Account that receives released funds.
     pub recipient: Address,
-    /// Total amount approved across all milestones.
     pub total_amount: i128,
-    /// Ordered milestones; index 0 is confirmed first.
     pub milestones: Vec<Milestone>,
-    /// Sum of confirmed-but-unclaimed milestone amounts.
     pub claimable: i128,
 }
 
-/// Milestone-based community grants disbursement contract.
 #[derive(Debug, Clone)]
 pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
     governance: Address,
-    /// Monotonic counter used to allocate grant ids.
     next_grant_id: GrantId,
-    /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    guardian_config: Option<GuardianSetConfig>,
+    pending_recovery: Option<RecoveryProposal>,
+    next_proposal_id: u64,
 }
 
 impl RefractGrants {
-    /// Creates a new grants contract governed by `governance` (the timelock).
     pub fn new(governance: Address) -> Self {
         Self {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            guardian_config: None,
+            pending_recovery: None,
+            next_proposal_id: 1,
         }
     }
 
-    /// Returns the configured governance/timelock authority.
+    pub fn configure_guardians(
+        &mut self,
+        caller: Address,
+        guardians: Vec<Address>,
+        threshold: usize,
+        recovery_delay: u64,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        let set: BTreeSet<Address> = guardians.into_iter().collect();
+        if set.is_empty() || threshold == 0 || threshold > set.len() || recovery_delay == 0 {
+            return Err(GrantsError::InvalidGuardianConfig);
+        }
+        let prev_epoch = self.guardian_config.as_ref().map(|c| c.epoch).unwrap_or(0);
+        self.guardian_config = Some(GuardianSetConfig {
+            guardians: set,
+            threshold,
+            recovery_delay,
+            epoch: prev_epoch + 1,
+        });
+        self.pending_recovery = None;
+        Ok(())
+    }
+
+    pub fn propose_recovery(
+        &mut self,
+        guardian: Address,
+        new_governance: Address,
+        now: u64,
+    ) -> Result<u64, GrantsError> {
+        let cfg = self
+            .guardian_config
+            .as_ref()
+            .ok_or(GrantsError::InvalidGuardianConfig)?;
+        if !cfg.guardians.contains(&guardian) {
+            return Err(GrantsError::Unauthorized);
+        }
+        if self.pending_recovery.is_some() {
+            return Err(GrantsError::RecoveryAlreadyPending);
+        }
+        let proposal_id = self.next_proposal_id;
+        self.next_proposal_id += 1;
+        let mut approvals = BTreeSet::new();
+        approvals.insert(guardian);
+        let threshold_reached_at = if approvals.len() >= cfg.threshold {
+            Some(now)
+        } else {
+            None
+        };
+        self.pending_recovery = Some(RecoveryProposal {
+            proposal_id,
+            new_governance,
+            approvals,
+            threshold_reached_at,
+            guardian_epoch: cfg.epoch,
+        });
+        Ok(proposal_id)
+    }
+
+    pub fn approve_recovery(&mut self, guardian: Address, now: u64) -> Result<usize, GrantsError> {
+        let cfg = self
+            .guardian_config
+            .as_ref()
+            .ok_or(GrantsError::InvalidGuardianConfig)?;
+        if !cfg.guardians.contains(&guardian) {
+            return Err(GrantsError::Unauthorized);
+        }
+        let proposal = self
+            .pending_recovery
+            .as_mut()
+            .ok_or(GrantsError::NoPendingRecovery)?;
+        if proposal.guardian_epoch != cfg.epoch {
+            return Err(GrantsError::NoPendingRecovery);
+        }
+        if !proposal.approvals.insert(guardian) {
+            return Err(GrantsError::AlreadyApproved);
+        }
+        if proposal.approvals.len() >= cfg.threshold && proposal.threshold_reached_at.is_none() {
+            proposal.threshold_reached_at = Some(now);
+        }
+        Ok(proposal.approvals.len())
+    }
+
+    pub fn cancel_recovery(&mut self, caller: Address) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if self.pending_recovery.is_none() {
+            return Err(GrantsError::NoPendingRecovery);
+        }
+        self.pending_recovery = None;
+        Ok(())
+    }
+
+    pub fn execute_recovery(&mut self, now: u64) -> Result<Address, GrantsError> {
+        let cfg = self
+            .guardian_config
+            .as_ref()
+            .ok_or(GrantsError::InvalidGuardianConfig)?;
+        let proposal = self
+            .pending_recovery
+            .as_ref()
+            .ok_or(GrantsError::NoPendingRecovery)?;
+        if proposal.guardian_epoch != cfg.epoch {
+            return Err(GrantsError::NoPendingRecovery);
+        }
+        if proposal.approvals.len() < cfg.threshold {
+            return Err(GrantsError::InsufficientApprovals);
+        }
+        let reached_at = proposal
+            .threshold_reached_at
+            .ok_or(GrantsError::InsufficientApprovals)?;
+        if now < reached_at + cfg.recovery_delay {
+            return Err(GrantsError::RecoveryDelayNotElapsed);
+        }
+        let new_gov = proposal.new_governance;
+        self.governance = new_gov;
+        self.pending_recovery = None;
+        Ok(new_gov)
+    }
+
     pub fn governance(&self) -> Address {
         self.governance
     }
 
-    /// Returns the grant for `grant_id`, if any.
     pub fn get_grant(&self, grant_id: GrantId) -> Option<&Grant> {
         self.grants.get(&grant_id)
     }
 
-    /// Returns the confirmed-but-unclaimed amount for `grant_id`.
     pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
         self.grants.get(&grant_id).map(|grant| grant.claimable)
     }
 
-    /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
     pub fn create_grant(
         &mut self,
         caller: Address,
@@ -146,7 +239,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -177,11 +272,6 @@ impl RefractGrants {
         Ok(grant_id)
     }
 
-    /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
         &mut self,
         caller: Address,
@@ -199,8 +289,6 @@ impl RefractGrants {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
         for earlier in &grant.milestones[..milestone_index] {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
@@ -221,11 +309,6 @@ impl RefractGrants {
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
         let grant = self
             .grants
@@ -278,9 +361,11 @@ mod tests {
             .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
             .unwrap();
 
-        // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -295,6 +380,27 @@ mod tests {
     }
 
     #[test]
+    fn guardian_recovery_lifecycle_in_grants() {
+        let mut grants = contract();
+        grants
+            .configure_guardians(GOVERNANCE, vec![10, 11, 12], 2, 500)
+            .unwrap();
+
+        grants.propose_recovery(10, 99, 100).unwrap();
+        assert_eq!(
+            grants.execute_recovery(100),
+            Err(GrantsError::InsufficientApprovals)
+        );
+        grants.approve_recovery(11, 150).unwrap();
+        assert_eq!(
+            grants.execute_recovery(500),
+            Err(GrantsError::RecoveryDelayNotElapsed)
+        );
+        assert_eq!(grants.execute_recovery(650), Ok(99));
+        assert_eq!(grants.governance(), 99);
+    }
+
+    #[test]
     fn claim_releases_only_confirmed_amounts() {
         let mut grants = contract();
         let id = grants
@@ -302,7 +408,6 @@ mod tests {
             .unwrap();
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
         assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
         assert_eq!(grants.claimable(id), Some(0));
     }

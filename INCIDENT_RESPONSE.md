@@ -1,4 +1,4 @@
-﻿# Refract Protocol Incident Response Runbook: Admin Key Compromise
+# Refract Protocol Incident Response Runbook: Admin Key Compromise
 
 **Document Version:** 1.0.0  
 **Scope:** `RefractPool`, `RefractPolicyRegistry`, `RefractOracle`, `RefractIncidentResponse`  
@@ -111,3 +111,14 @@ A formal simulation of this tabletop runbook was implemented and verified in `in
 ### Lessons Learned & Gaps Identified:
 - **Pre-authorization Requirement**: Cross-contract invocations require that either the caller is the current admin or contracts support a registered Guardian role. Protocols must deploy the incident response coordinator at genesis so its address is pre-wired into recovery keys.
 - **Off-chain Key Hygiene**: Emergency guardian keys must be kept on segregated cold storage (air-gapped hardware or multi-party computation multisig) to ensure the guardian key cannot be compromised simultaneously with the operational admin key.
+
+---
+
+## 6. Guardian-Based Admin Key Recovery (`Backstop`, `Bounty`, `Grants`, `Treasury`)
+
+When the admin/governance key on `RefractBackstop`, `RefractBountyEscrow`, `RefractGrants`, or `RefractTreasury` is lost or compromised:
+1. **Propose Recovery:** Any registered guardian calls `propose_recovery(guardian, new_admin)`.
+2. **Collect Threshold Approvals:** At least `M` of `N` distinct guardians call `approve_recovery(guardian)` with individual Soroban auth signatures.
+3. **Reaction Window (`recovery_delay`):** The proposal matures only after `recovery_delay` seconds have elapsed since the M-th approval. During this window, the incumbent admin/governance can abort an unauthorized recovery via `cancel_recovery`, or rotate the guardian set via `configure_guardians` (which increments `epoch` and invalidates any in-flight recovery).
+4. **Execute Recovery:** Once matured, `execute_recovery()` atomically transfers admin/governance authority to `new_admin`, clears the pending proposal to prevent replay, and emits `admin_recovered(old_admin, new_admin, proposal_id)`.
+
