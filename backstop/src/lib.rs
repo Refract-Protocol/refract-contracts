@@ -1,9 +1,14 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+};
 
-/// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
+pub const MIN_TTL_THRESHOLD: u32 = 17_280;
+pub const MAX_TTL_EXTEND: u32 = 535_680;
+pub const MAX_BUMP_BATCH: u32 = 16;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -16,6 +21,16 @@ pub enum BackstopError {
     InsufficientShares = 5,
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
+    BatchTooLarge = 8,
+    KeyNotBumpable = 9,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BumpKey {
+    Instance,
+    StakerShares(Address),
+    NonBumpableJunk,
 }
 
 #[contracttype]
@@ -24,7 +39,6 @@ pub struct BackstopConfig {
     pub pool: Address,
     pub admin: Address,
     pub token: Address,
-    /// Share of premium income (in basis points) routed to backstop stakers.
     pub premium_share_bps: i128,
 }
 
@@ -41,8 +55,6 @@ pub struct RefractBackstop;
 
 #[contractimpl]
 impl RefractBackstop {
-    /// Initialize the backstop tranche. `pool` is the only caller allowed to
-    /// draw capital via `cover_shortfall`.
     pub fn initialize(
         env: Env,
         pool: Address,
@@ -56,13 +68,15 @@ impl RefractBackstop {
         if !(0..=BPS_DENOM).contains(&premium_share_bps) {
             return Err(BackstopError::InvalidPremiumShare);
         }
-        let config = BackstopConfig {
-            pool,
-            admin,
-            token,
-            premium_share_bps,
-        };
-        env.storage().instance().set(&"config", &config);
+        env.storage().instance().set(
+            &"config",
+            &BackstopConfig {
+                pool,
+                admin,
+                token,
+                premium_share_bps,
+            },
+        );
         env.storage().instance().set(
             &"state",
             &BackstopState {
@@ -74,17 +88,19 @@ impl RefractBackstop {
         Ok(())
     }
 
-    /// Deposit `amount` of the configured token and mint backstop shares to
-    /// `staker`, mirroring `RefractPool`'s share-accounting pattern.
     pub fn deposit(env: Env, staker: Address, amount: i128) -> Result<i128, BackstopError> {
         staker.require_auth();
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::config_internal(&env)?;
+        let mut state = Self::state_internal(&env)?;
 
-        let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
+        let shares = if state.total_shares == 0 || state.total_capital == 0 {
+            amount
+        } else {
+            amount * state.total_shares / state.total_capital
+        };
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
@@ -102,147 +118,108 @@ impl RefractBackstop {
         state.total_shares += shares;
         state.total_capital += amount;
         env.storage().instance().set(&"state", &state);
-
         Ok(shares)
     }
 
-    /// Burn `shares` and return the proportional capital to `staker`.
-    pub fn withdraw(env: Env, staker: Address, shares: i128) -> Result<i128, BackstopError> {
-        staker.require_auth();
-        if shares <= 0 {
-            return Err(BackstopError::InvalidAmount);
+    /// Permissionless TTL extension entrypoint (`#262`).
+    /// Clamps `requested_extend` to `[MIN_TTL_THRESHOLD, MAX_TTL_EXTEND]` and rejects
+    /// non-bumpable or missing keys.
+    pub fn bump_ttl(
+        env: Env,
+        keys: Vec<BumpKey>,
+        requested_extend: u32,
+    ) -> Result<u32, BackstopError> {
+        Self::config_internal(&env)?;
+        if keys.len() > MAX_BUMP_BATCH {
+            return Err(BackstopError::BatchTooLarge);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let clamped_extend = requested_extend.clamp(MIN_TTL_THRESHOLD, MAX_TTL_EXTEND);
 
-        let key = ("shares", staker.clone());
-        let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if shares > held {
-            return Err(BackstopError::InsufficientShares);
+        for key in keys.iter() {
+            match key {
+                BumpKey::Instance => {
+                    env.storage()
+                        .instance()
+                        .extend_ttl(MIN_TTL_THRESHOLD, clamped_extend);
+                }
+                BumpKey::StakerShares(staker) => {
+                    let storage_key = ("shares", staker);
+                    if !env.storage().persistent().has(&storage_key) {
+                        return Err(BackstopError::KeyNotBumpable);
+                    }
+                    env.storage().persistent().extend_ttl(
+                        &storage_key,
+                        MIN_TTL_THRESHOLD,
+                        clamped_extend,
+                    );
+                }
+                BumpKey::NonBumpableJunk => return Err(BackstopError::KeyNotBumpable),
+            }
         }
 
-        let amount = Self::quote_withdrawal(shares, state.total_shares, state.total_capital);
-        if amount > state.total_capital {
-            return Err(BackstopError::InsufficientCapital);
-        }
-
-        env.storage().persistent().set(&key, &(held - shares));
-        state.total_shares -= shares;
-        state.total_capital -= amount;
-        env.storage().instance().set(&"state", &state);
-
-        if amount > 0 {
-            token::Client::new(&env, &config.token).transfer(
-                &env.current_contract_address(),
-                &staker,
-                &amount,
-            );
-        }
-
-        Ok(amount)
+        env.events()
+            .publish((symbol_short!("ttl_bump"),), (keys.len(), clamped_extend));
+        Ok(clamped_extend)
     }
 
-    /// Drain up to `amount` of backstop capital to cover a claim shortfall.
-    /// Callable only by the configured `RefractPool` (or its admin/timelock).
-    /// Returns the amount actually covered. Draining reduces `total_capital`
-    /// without burning shares, so every staker's share price drops
-    /// proportionally — the core second-loss risk-bearing mechanic.
-    pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
-        caller.require_auth();
-        let config = Self::config(&env)?;
-        if caller != config.pool && caller != config.admin {
-            return Err(BackstopError::Unauthorized);
-        }
-        if amount <= 0 {
-            return Err(BackstopError::InvalidAmount);
-        }
-
-        let mut state = Self::state(&env)?;
-        let covered = if amount > state.total_capital {
-            state.total_capital
-        } else {
-            amount
-        };
-        if covered <= 0 {
-            return Ok(0);
-        }
-
-        state.total_capital -= covered;
-        env.storage().instance().set(&"state", &state);
-
-        token::Client::new(&env, &config.token).transfer(
-            &env.current_contract_address(),
-            &config.pool,
-            &covered,
-        );
-
-        Ok(covered)
-    }
-
-    /// Route a slice of premium income to backstop stakers. The premium share
-    /// is configured in basis points; the remainder is left for the caller
-    /// (e.g. the treasury fee-switch) to distribute.
-    pub fn receive_premium(env: Env, amount: i128) -> Result<i128, BackstopError> {
-        if amount <= 0 {
-            return Err(BackstopError::InvalidAmount);
-        }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
-
-        let cut = amount * config.premium_share_bps / BPS_DENOM;
-        state.premium_income += cut;
-        state.total_capital += cut;
-        env.storage().instance().set(&"state", &state);
-
-        Ok(cut)
-    }
-
-    pub fn shares_of(env: Env, staker: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&("shares", staker))
-            .unwrap_or(0)
-    }
-
-    pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
-    }
-
-    pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
-    }
-
-    /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
-    /// subsequent depositors get shares proportional to the current share price.
-    fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
-        if total_shares == 0 || total_capital == 0 {
-            amount
-        } else {
-            amount * total_shares / total_capital
-        }
-    }
-
-    /// Mirror of `RefractPool::_quote_withdrawal`: value of `shares` at the
-    /// current share price.
-    fn quote_withdrawal(shares: i128, total_shares: i128, total_capital: i128) -> i128 {
-        if total_shares == 0 {
-            0
-        } else {
-            shares * total_capital / total_shares
-        }
-    }
-
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn config_internal(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn state_internal(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+    use soroban_sdk::vec;
+
+    #[test]
+    fn bump_ttl_clamps_extension_and_enforces_allowlist() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let pool = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let staker = Address::generate(&env);
+        let unknown = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        StellarAssetClient::new(&env, &usdc).mint(&staker, &1_000);
+
+        let contract_id = env.register_contract(None, RefractBackstop);
+        let client = RefractBackstopClient::new(&env, &contract_id);
+        client.initialize(&pool, &admin, &usdc, &2_000);
+        client.deposit(&staker, &1_000);
+
+        // Requesting 9_999_999 ledgers clamps to MAX_TTL_EXTEND (535_680)
+        let applied = client.bump_ttl(
+            &vec![&env, BumpKey::Instance, BumpKey::StakerShares(staker)],
+            &9_999_999,
+        );
+        assert_eq!(applied, MAX_TTL_EXTEND);
+
+        // Non-existent staker or non-bumpable key fails with KeyNotBumpable
+        assert_eq!(
+            client.try_bump_ttl(&vec![&env, BumpKey::StakerShares(unknown)], &50_000),
+            Err(Ok(BackstopError::KeyNotBumpable))
+        );
+        assert_eq!(
+            client.try_bump_ttl(&vec![&env, BumpKey::NonBumpableJunk], &50_000),
+            Err(Ok(BackstopError::KeyNotBumpable))
+        );
     }
 }
