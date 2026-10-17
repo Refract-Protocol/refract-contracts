@@ -1,0 +1,18 @@
+[package]
+name = "snapshot-tests"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "snapshot_tests"
+path = "snapshot_tests.rs"
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+refract-treasury = { path = "../treasury" }
+refract-bounty = { path = "../bounty" }
+refract-backstop = { path = "../backstop" }
+refract-grants = { path = "../grants" }

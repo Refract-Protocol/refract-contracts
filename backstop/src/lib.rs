@@ -6,7 +6,7 @@ pub use normalization::{
     Rounding, PROTOCOL_DECIMALS, PROTOCOL_SCALE,
 };
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env};
 
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
@@ -64,9 +64,9 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidPremiumShare);
         }
         let config = BackstopConfig {
-            pool,
-            admin,
-            token,
+            pool: pool.clone(),
+            admin: admin.clone(),
+            token: token.clone(),
             premium_share_bps,
         };
         env.storage().instance().set(&"config", &config);
@@ -78,6 +78,12 @@ impl RefractBackstop {
                 premium_income: 0,
             },
         );
+
+        env.events().publish(
+            (symbol_short!("backstop"), symbol_short!("init")),
+            (pool, admin, token, premium_share_bps),
+        );
+
         Ok(())
     }
 
@@ -109,6 +115,11 @@ impl RefractBackstop {
         state.total_shares += shares;
         state.total_capital += amount;
         env.storage().instance().set(&"state", &state);
+
+        env.events().publish(
+            (symbol_short!("backstop"), symbol_short!("deposit")),
+            (staker, amount, shares),
+        );
 
         Ok(shares)
     }
@@ -146,6 +157,11 @@ impl RefractBackstop {
             );
         }
 
+        env.events().publish(
+            (symbol_short!("backstop"), symbol_short!("withdraw")),
+            (staker, shares, amount),
+        );
+
         Ok(amount)
     }
 
@@ -181,6 +197,11 @@ impl RefractBackstop {
             &env.current_contract_address(),
             &config.pool,
             &covered,
+        );
+
+        env.events().publish(
+            (symbol_short!("backstop"), symbol_short!("cover")),
+            (caller, covered),
         );
 
         Ok(covered)

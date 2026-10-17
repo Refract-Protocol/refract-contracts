@@ -12,7 +12,7 @@ use soroban_sdk::{
 
 /// Storage keys for the treasury contract.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
     OperatingBalance(Address), // token -> amount
@@ -55,6 +55,10 @@ impl RefractTreasury {
             return Err(TreasuryError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("init")),
+            (admin,),
+        );
         Ok(())
     }
 
@@ -81,6 +85,10 @@ impl RefractTreasury {
         env.storage()
             .instance()
             .set(&DataKey::TimelockContract, &timelock);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("timelock")),
+            (admin, timelock),
+        );
         Ok(())
     }
 
@@ -116,7 +124,12 @@ impl RefractTreasury {
             .ok_or(TreasuryError::InvalidAmount)?;
         env.storage()
             .instance()
-            .set(&DataKey::ReserveBalance(token), &new_reserve);
+            .set(&DataKey::ReserveBalance(token.clone()), &new_reserve);
+
+        env.events().publish(
+            (symbol_short!("reserve"), symbol_short!("deposit")),
+            (from, token, amount),
+        );
 
         Ok(())
     }
@@ -254,7 +267,12 @@ impl RefractTreasury {
         let new_operating = operating - amount;
         env.storage()
             .instance()
-            .set(&DataKey::OperatingBalance(token), &new_operating);
+            .set(&DataKey::OperatingBalance(token.clone()), &new_operating);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("withdraw")),
+            (caller, token, amount, to),
+        );
 
         Ok(())
     }

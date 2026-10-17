@@ -283,6 +283,227 @@ impl RefractGrants {
     }
 }
 
+pub mod contract {
+    use super::*;
+    use soroban_sdk::{
+        contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
+    };
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum GrantsDataKey {
+        Governance,
+        NextGrantId,
+        Grant(u64),
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct MilestoneRecord {
+        pub amount: i128,
+        pub confirmed: bool,
+        pub claimed: bool,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct GrantRecord {
+        pub recipient: Address,
+        pub total_amount: i128,
+        pub milestones: Vec<MilestoneRecord>,
+        pub claimable: i128,
+    }
+
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+    #[repr(u32)]
+    pub enum GrantsContractError {
+        Unauthorized = 1,
+        GrantNotFound = 2,
+        NoMilestones = 3,
+        MilestoneSumMismatch = 4,
+        InvalidMilestoneAmount = 5,
+        InvalidTotalAmount = 6,
+        InvalidMilestoneIndex = 7,
+        MilestoneAlreadyConfirmed = 8,
+        MilestoneOutOfOrder = 9,
+        NotRecipient = 10,
+        NothingToClaim = 11,
+        NormalizationError = 12,
+    }
+
+    #[contract]
+    pub struct RefractGrantsContract;
+
+    #[contractimpl]
+    impl RefractGrantsContract {
+        pub fn initialize(env: Env, governance: Address) -> Result<(), GrantsContractError> {
+            if env.storage().instance().has(&GrantsDataKey::Governance) {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            env.storage().instance().set(&GrantsDataKey::Governance, &governance);
+            env.storage().instance().set(&GrantsDataKey::NextGrantId, &0u64);
+            env.events().publish((symbol_short!("grant"), symbol_short!("init")), (governance,));
+            Ok(())
+        }
+
+        pub fn create_grant(
+            env: Env,
+            caller: Address,
+            recipient: Address,
+            total_amount: i128,
+            milestones: Vec<i128>,
+        ) -> Result<u64, GrantsContractError> {
+            caller.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if caller != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if total_amount <= 0 {
+                return Err(GrantsContractError::InvalidTotalAmount);
+            }
+            if milestones.is_empty() {
+                return Err(GrantsContractError::NoMilestones);
+            }
+            let mut sum: i128 = 0;
+            let mut stored_milestones = Vec::new(&env);
+            for i in 0..milestones.len() {
+                let amt = milestones.get(i).unwrap_or(0);
+                if amt <= 0 {
+                    return Err(GrantsContractError::InvalidMilestoneAmount);
+                }
+                sum = sum.checked_add(amt).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+                stored_milestones.push_back(MilestoneRecord {
+                    amount: amt,
+                    confirmed: false,
+                    claimed: false,
+                });
+            }
+            if sum != total_amount {
+                return Err(GrantsContractError::MilestoneSumMismatch);
+            }
+            let next_id: u64 = env.storage().instance().get(&GrantsDataKey::NextGrantId).unwrap_or(0);
+            let grant_id = next_id;
+            env.storage().instance().set(&GrantsDataKey::NextGrantId, &(next_id + 1));
+
+            let record = GrantRecord {
+                recipient: recipient.clone(),
+                total_amount,
+                milestones: stored_milestones,
+                claimable: 0,
+            };
+            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &record);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("create")),
+                (grant_id, recipient, total_amount),
+            );
+            Ok(grant_id)
+        }
+
+        pub fn confirm_milestone(
+            env: Env,
+            caller: Address,
+            grant_id: u64,
+            milestone_index: u32,
+        ) -> Result<(), GrantsContractError> {
+            caller.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if caller != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            let mut grant: GrantRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Grant(grant_id))
+                .ok_or(GrantsContractError::GrantNotFound)?;
+            let idx = milestone_index;
+            if idx >= grant.milestones.len() {
+                return Err(GrantsContractError::InvalidMilestoneIndex);
+            }
+            for i in 0..idx {
+                let m = grant.milestones.get(i).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+                if !m.confirmed {
+                    return Err(GrantsContractError::MilestoneOutOfOrder);
+                }
+            }
+            let mut target_m = grant.milestones.get(idx).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+            if target_m.confirmed {
+                return Err(GrantsContractError::MilestoneAlreadyConfirmed);
+            }
+            target_m.confirmed = true;
+            grant.claimable = grant.claimable.checked_add(target_m.amount).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            grant.milestones.set(idx, target_m);
+            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("confirm")),
+                (grant_id, milestone_index),
+            );
+            Ok(())
+        }
+
+        pub fn claim(
+            env: Env,
+            recipient: Address,
+            grant_id: u64,
+        ) -> Result<i128, GrantsContractError> {
+            recipient.require_auth();
+            let mut grant: GrantRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Grant(grant_id))
+                .ok_or(GrantsContractError::GrantNotFound)?;
+            if grant.recipient != recipient {
+                return Err(GrantsContractError::NotRecipient);
+            }
+            let amount = grant.claimable;
+            if amount <= 0 {
+                return Err(GrantsContractError::NothingToClaim);
+            }
+            grant.claimable = 0;
+            for i in 0..grant.milestones.len() {
+                let mut m = grant.milestones.get(i).ok_or(GrantsContractError::GrantNotFound)?;
+                if m.confirmed {
+                    m.claimed = true;
+                    grant.milestones.set(i, m);
+                }
+            }
+            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("claim")),
+                (grant_id, recipient, amount),
+            );
+            Ok(amount)
+        }
+
+        pub fn claim_canonical(
+            env: Env,
+            recipient: Address,
+            grant_id: u64,
+            token_decimals: u32,
+        ) -> Result<i128, GrantsContractError> {
+            let protocol_amount = Self::claim(env, recipient, grant_id)?;
+            normalization::to_token_units(protocol_amount, token_decimals)
+                .map_err(|_| GrantsContractError::NormalizationError)
+        }
+    }
+}
+
+pub use contract::{
+    GrantRecord, GrantsContractError, GrantsDataKey, MilestoneRecord, RefractGrantsContract,
+    RefractGrantsContractClient,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,11 +6,11 @@ pub use normalization::{
     Rounding, PROTOCOL_DECIMALS, PROTOCOL_SCALE,
 };
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env};
 
 /// Storage keys for the bounty escrow.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DataKey {
     /// The governance/timelock address authorized to award payouts.
     Governance,
@@ -67,6 +67,12 @@ impl RefractBountyEscrow {
         env.storage().instance().set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Balance, &0i128);
+
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("init")),
+            (governance, token),
+        );
+
         Ok(())
     }
 
@@ -80,6 +86,12 @@ impl RefractBountyEscrow {
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
         let balance = Self::get_balance(&env)?;
         env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("fund")),
+            (from, amount),
+        );
+
         Ok(())
     }
 
@@ -115,12 +127,18 @@ impl RefractBountyEscrow {
         env.storage().instance().set(&DataKey::Balance, &(balance - amount));
 
         let record = AwardRecord {
-            researcher,
+            researcher: researcher.clone(),
             amount,
             report_hash: report_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&DataKey::Award(report_hash), &record);
+        env.storage().persistent().set(&DataKey::Award(report_hash.clone()), &record);
+
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("award")),
+            (researcher, amount, report_hash),
+        );
+
         Ok(())
     }
 
