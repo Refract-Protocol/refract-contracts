@@ -23,7 +23,9 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
-use std::collections::BTreeMap;
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
+
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Identifier for a grant.
 pub type GrantId = u64;
@@ -58,6 +60,10 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// A required storage entry has been archived and must be restored before operating.
+    EntryArchived,
+    /// Restored entries failed post-restore accounting consistency validation.
+    InconsistentRestoredState,
 }
 
 /// A single milestone within a grant.
@@ -94,6 +100,10 @@ pub struct RefractGrants {
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Grants whose persistent entries have been archived and await restoration.
+    archived_grants: BTreeSet<GrantId>,
+    /// Running counter of cumulative funds claimed across all grants.
+    total_disbursed: i128,
 }
 
 impl RefractGrants {
@@ -103,6 +113,8 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            archived_grants: BTreeSet::new(),
+            total_disbursed: 0,
         }
     }
 
@@ -114,6 +126,20 @@ impl RefractGrants {
     /// Returns the grant for `grant_id`, if any.
     pub fn get_grant(&self, grant_id: GrantId) -> Option<&Grant> {
         self.grants.get(&grant_id)
+    }
+
+    /// Asserts that `grant_id` is live and not archived before reading or mutating.
+    pub fn require_live_grant(&self, grant_id: GrantId) -> Result<&Grant, GrantsError> {
+        if self.archived_grants.contains(&grant_id) {
+            return Err(GrantsError::EntryArchived);
+        }
+        if let Some(grant) = self.grants.get(&grant_id) {
+            return Ok(grant);
+        }
+        if grant_id < self.next_grant_id {
+            return Err(GrantsError::EntryArchived);
+        }
+        Err(GrantsError::GrantNotFound)
     }
 
     /// Returns the confirmed-but-unclaimed amount for `grant_id`.
@@ -146,7 +172,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -190,10 +218,14 @@ impl RefractGrants {
     ) -> Result<(), GrantsError> {
         self.require_governance(caller)?;
 
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
+        if self.archived_grants.contains(&grant_id) {
+            return Err(GrantsError::EntryArchived);
+        }
+        let grant = match self.grants.get_mut(&grant_id) {
+            Some(g) => g,
+            None if grant_id < self.next_grant_id => return Err(GrantsError::EntryArchived),
+            None => return Err(GrantsError::GrantNotFound),
+        };
 
         if milestone_index >= grant.milestones.len() {
             return Err(GrantsError::InvalidMilestoneIndex);
@@ -227,10 +259,14 @@ impl RefractGrants {
     /// Permissionless for the recipient: any caller may trigger the release as
     /// long as they are the grant recipient. Returns the amount released.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
+        if self.archived_grants.contains(&grant_id) {
+            return Err(GrantsError::EntryArchived);
+        }
+        let grant = match self.grants.get_mut(&grant_id) {
+            Some(g) => g,
+            None if grant_id < self.next_grant_id => return Err(GrantsError::EntryArchived),
+            None => return Err(GrantsError::GrantNotFound),
+        };
 
         if grant.recipient != recipient {
             return Err(GrantsError::NotRecipient);
@@ -247,8 +283,91 @@ impl RefractGrants {
                 milestone.claimed = true;
             }
         }
+        self.total_disbursed = self
+            .total_disbursed
+            .checked_add(amount)
+            .ok_or(GrantsError::InconsistentRestoredState)?;
 
         Ok(amount)
+    }
+
+    /// Marks an existing grant entry as archived (evicted from live persistent storage).
+    pub fn archive_grant_entry(&mut self, grant_id: GrantId) -> Result<Grant, GrantsError> {
+        let removed = self
+            .grants
+            .remove(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+        self.archived_grants.insert(grant_id);
+        Ok(removed)
+    }
+
+    /// Restores an archived grant entry and validates its internal milestone accounting.
+    pub fn restore_grant_entry(
+        &mut self,
+        grant_id: GrantId,
+        grant: Grant,
+    ) -> Result<(), GrantsError> {
+        if grant_id >= self.next_grant_id {
+            return Err(GrantsError::InconsistentRestoredState);
+        }
+        Self::validate_grant_invariants(&grant)?;
+        self.archived_grants.remove(&grant_id);
+        self.grants.insert(grant_id, grant);
+        Ok(())
+    }
+
+    /// Post-restore consistency verification ensuring no allocated grant ID remains
+    /// archived and all milestone/disbursement totals match `total_disbursed`.
+    pub fn verify_post_restore(&self) -> Result<i128, GrantsError> {
+        if !self.archived_grants.is_empty() {
+            return Err(GrantsError::EntryArchived);
+        }
+        let mut expected_disbursed: i128 = 0;
+        for id in 0..self.next_grant_id {
+            let grant = self.grants.get(&id).ok_or(GrantsError::EntryArchived)?;
+            let claimed = Self::validate_grant_invariants(grant)?;
+            expected_disbursed = expected_disbursed
+                .checked_add(claimed)
+                .ok_or(GrantsError::InconsistentRestoredState)?;
+        }
+        if expected_disbursed != self.total_disbursed {
+            return Err(GrantsError::InconsistentRestoredState);
+        }
+        Ok(self.total_disbursed)
+    }
+
+    fn validate_grant_invariants(grant: &Grant) -> Result<i128, GrantsError> {
+        if grant.total_amount <= 0 || grant.milestones.is_empty() {
+            return Err(GrantsError::InconsistentRestoredState);
+        }
+        let mut sum_total: i128 = 0;
+        let mut sum_claimable: i128 = 0;
+        let mut sum_claimed: i128 = 0;
+        for m in &grant.milestones {
+            if m.amount <= 0 {
+                return Err(GrantsError::InconsistentRestoredState);
+            }
+            sum_total = sum_total
+                .checked_add(m.amount)
+                .ok_or(GrantsError::InconsistentRestoredState)?;
+            if m.claimed && !m.confirmed {
+                return Err(GrantsError::InconsistentRestoredState);
+            }
+            if m.confirmed && !m.claimed {
+                sum_claimable = sum_claimable
+                    .checked_add(m.amount)
+                    .ok_or(GrantsError::InconsistentRestoredState)?;
+            }
+            if m.claimed {
+                sum_claimed = sum_claimed
+                    .checked_add(m.amount)
+                    .ok_or(GrantsError::InconsistentRestoredState)?;
+            }
+        }
+        if sum_total != grant.total_amount || sum_claimable != grant.claimable {
+            return Err(GrantsError::InconsistentRestoredState);
+        }
+        Ok(sum_claimed)
     }
 
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
@@ -280,7 +399,10 @@ mod tests {
 
         // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -411,5 +533,42 @@ mod tests {
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
         );
+    }
+
+    #[test]
+    fn archive_restore_and_consistency_check() {
+        let mut grants = contract();
+        let id = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 200])
+            .unwrap();
+        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
+
+        let archived = grants.archive_grant_entry(id).unwrap();
+        assert_eq!(
+            grants.confirm_milestone(GOVERNANCE, id, 1),
+            Err(GrantsError::EntryArchived)
+        );
+        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::EntryArchived));
+        assert_eq!(
+            grants.verify_post_restore(),
+            Err(GrantsError::EntryArchived)
+        );
+
+        // Corrupt restored claimable amount is rejected
+        let mut corrupted = archived.clone();
+        corrupted.claimable = 999;
+        assert_eq!(
+            grants.restore_grant_entry(id, corrupted),
+            Err(GrantsError::InconsistentRestoredState)
+        );
+
+        // Valid restore passes consistency check and allows completing remaining milestone
+        grants.restore_grant_entry(id, archived).unwrap();
+        assert_eq!(grants.verify_post_restore(), Ok(100));
+
+        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
+        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
+        assert_eq!(grants.verify_post_restore(), Ok(300));
     }
 }
