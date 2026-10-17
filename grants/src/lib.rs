@@ -1,27 +1,8 @@
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract with cross-contract
+//! treasury capital reservation integration.
 
 use std::collections::BTreeMap;
 
@@ -58,6 +39,12 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// Insufficient unencumbered treasury budget to reserve the grant total.
+    InsufficientAvailableTreasuryBudget,
+    /// The supplied reservation id is already bound or invalid.
+    DuplicateReservation,
+    /// The grant has already been cancelled.
+    GrantCancelled,
 }
 
 /// A single milestone within a grant.
@@ -82,6 +69,12 @@ pub struct Grant {
     pub milestones: Vec<Milestone>,
     /// Sum of confirmed-but-unclaimed milestone amounts.
     pub claimable: i128,
+    /// Optional treasury capital reservation id backing this grant.
+    pub reservation_id: Option<u64>,
+    /// Remaining reserved balance in treasury for this grant.
+    pub reserved_remaining: i128,
+    /// Whether the grant has been cancelled and its reservation released.
+    pub cancelled: bool,
 }
 
 /// Milestone-based community grants disbursement contract.
@@ -94,6 +87,12 @@ pub struct RefractGrants {
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Optional configured treasury capacity for capital reservation checks.
+    treasury_capacity: Option<i128>,
+    /// Total active reserved capital across all grants.
+    total_reserved: i128,
+    /// Set of active reservation IDs bound to grants.
+    bound_reservations: BTreeMap<u64, GrantId>,
 }
 
 impl RefractGrants {
@@ -103,7 +102,35 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            treasury_capacity: None,
+            total_reserved: 0,
+            bound_reservations: BTreeMap::new(),
         }
+    }
+
+    /// Configure the available treasury budget backing grant reservations.
+    pub fn set_treasury_capacity(
+        &mut self,
+        caller: Address,
+        capacity: i128,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if capacity < self.total_reserved {
+            return Err(GrantsError::InsufficientAvailableTreasuryBudget);
+        }
+        self.treasury_capacity = Some(capacity);
+        Ok(())
+    }
+
+    /// Returns the total capital currently reserved across active grants.
+    pub fn total_reserved(&self) -> i128 {
+        self.total_reserved
+    }
+
+    /// Returns the available treasury budget if a treasury capacity is configured.
+    pub fn available_treasury_budget(&self) -> Option<i128> {
+        self.treasury_capacity
+            .map(|cap| (cap - self.total_reserved).max(0))
     }
 
     /// Returns the configured governance/timelock authority.
@@ -122,15 +149,45 @@ impl RefractGrants {
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
     pub fn create_grant(
         &mut self,
         caller: Address,
         recipient: Address,
         total_amount: i128,
         milestones: Vec<i128>,
+    ) -> Result<GrantId, GrantsError> {
+        self.create_grant_internal(caller, recipient, total_amount, milestones, None)
+    }
+
+    /// Approves a new grant backed by an explicit treasury `reservation_id`,
+    /// enforcing that the treasury has enough unreserved capacity.
+    pub fn create_grant_with_reservation(
+        &mut self,
+        caller: Address,
+        recipient: Address,
+        total_amount: i128,
+        milestones: Vec<i128>,
+        reservation_id: u64,
+    ) -> Result<GrantId, GrantsError> {
+        if self.bound_reservations.contains_key(&reservation_id) {
+            return Err(GrantsError::DuplicateReservation);
+        }
+        self.create_grant_internal(
+            caller,
+            recipient,
+            total_amount,
+            milestones,
+            Some(reservation_id),
+        )
+    }
+
+    fn create_grant_internal(
+        &mut self,
+        caller: Address,
+        recipient: Address,
+        total_amount: i128,
+        milestones: Vec<i128>,
+        reservation_id: Option<u64>,
     ) -> Result<GrantId, GrantsError> {
         self.require_governance(caller)?;
 
@@ -146,10 +203,18 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
+        }
+
+        if let Some(cap) = self.treasury_capacity {
+            if self.total_reserved + total_amount > cap {
+                return Err(GrantsError::InsufficientAvailableTreasuryBudget);
+            }
         }
 
         let grant_id = self.next_grant_id;
@@ -164,6 +229,11 @@ impl RefractGrants {
             })
             .collect();
 
+        if let Some(res_id) = reservation_id {
+            self.bound_reservations.insert(res_id, grant_id);
+        }
+        self.total_reserved += total_amount;
+
         self.grants.insert(
             grant_id,
             Grant {
@@ -171,17 +241,39 @@ impl RefractGrants {
                 total_amount,
                 milestones: stored,
                 claimable: 0,
+                reservation_id,
+                reserved_remaining: total_amount,
+                cancelled: false,
             },
         );
 
         Ok(grant_id)
     }
 
+    /// Cancel an active grant and release its remaining un-drawn reservation
+    /// back into the treasury's available balance.
+    pub fn cancel_grant(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+    ) -> Result<i128, GrantsError> {
+        self.require_governance(caller)?;
+        let grant = self
+            .grants
+            .get_mut(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+        if grant.cancelled {
+            return Err(GrantsError::GrantCancelled);
+        }
+
+        let released = grant.reserved_remaining - grant.claimable;
+        grant.reserved_remaining = grant.claimable;
+        grant.cancelled = true;
+        self.total_reserved = (self.total_reserved - released).max(0);
+        Ok(released)
+    }
+
     /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
         &mut self,
         caller: Address,
@@ -194,13 +286,14 @@ impl RefractGrants {
             .grants
             .get_mut(&grant_id)
             .ok_or(GrantsError::GrantNotFound)?;
+        if grant.cancelled {
+            return Err(GrantsError::GrantCancelled);
+        }
 
         if milestone_index >= grant.milestones.len() {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
         for earlier in &grant.milestones[..milestone_index] {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
@@ -222,10 +315,7 @@ impl RefractGrants {
     }
 
     /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
+    /// recipient and draws down the corresponding treasury reservation.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
         let grant = self
             .grants
@@ -242,6 +332,12 @@ impl RefractGrants {
         }
 
         grant.claimable = 0;
+        grant.reserved_remaining = (grant.reserved_remaining - amount).max(0);
+        self.total_reserved = (self.total_reserved - amount).max(0);
+        if let Some(cap) = self.treasury_capacity.as_mut() {
+            *cap = (*cap - amount).max(0);
+        }
+
         for milestone in grant.milestones.iter_mut() {
             if milestone.confirmed {
                 milestone.claimed = true;
@@ -278,9 +374,11 @@ mod tests {
             .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
             .unwrap();
 
-        // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -295,6 +393,38 @@ mod tests {
     }
 
     #[test]
+    fn reservation_prevents_overcommitting_treasury_budget() {
+        let mut grants = contract();
+        grants.set_treasury_capacity(GOVERNANCE, 500).unwrap();
+
+        let g1 = grants
+            .create_grant_with_reservation(GOVERNANCE, RECIPIENT, 350, vec![150, 200], 101)
+            .unwrap();
+        assert_eq!(grants.total_reserved(), 350);
+        assert_eq!(grants.available_treasury_budget(), Some(150));
+
+        // Second grant requesting 200 fails because only 150 is unreserved.
+        assert_eq!(
+            grants.create_grant_with_reservation(GOVERNANCE, RECIPIENT, 200, vec![200], 102),
+            Err(GrantsError::InsufficientAvailableTreasuryBudget)
+        );
+
+        // Confirm first milestone (150) and cancel remaining unconfirmed (200).
+        grants.confirm_milestone(GOVERNANCE, g1, 0).unwrap();
+        let released = grants.cancel_grant(GOVERNANCE, g1).unwrap();
+        assert_eq!(released, 200);
+        assert_eq!(grants.total_reserved(), 150);
+        assert_eq!(grants.available_treasury_budget(), Some(350));
+
+        // Now the second grant of 200 succeeds!
+        let g2 = grants
+            .create_grant_with_reservation(GOVERNANCE, RECIPIENT, 200, vec![200], 102)
+            .unwrap();
+        assert_eq!(g2, 1);
+        assert_eq!(grants.total_reserved(), 350);
+    }
+
+    #[test]
     fn claim_releases_only_confirmed_amounts() {
         let mut grants = contract();
         let id = grants
@@ -302,7 +432,6 @@ mod tests {
             .unwrap();
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
         assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
         assert_eq!(grants.claimable(id), Some(0));
     }

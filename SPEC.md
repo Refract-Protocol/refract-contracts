@@ -213,3 +213,29 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Cross-Contract Capital Reservation Ledger (`RefractTreasury`)
+
+To prevent double-commitment of treasury funds across `RefractBountyEscrow`,
+`RefractGrants`, and `RefractBackstop`, `RefractTreasury` maintains an explicit
+reservation ledger:
+
+```
+available_balance(asset) = max(0, token_balance(asset) - total_reserved(asset))
+```
+
+### INV-6  No Double-Commitment of Reserved Capital
+
+```
+∀ asset: Address,
+    total_reserved(asset) == Σ { r.remaining_amount | r ∈ Reservations(asset), r.status == Active }
+    ∧ total_reserved(asset) <= token_balance(asset)
+```
+
+Every `reserve_capital` call checks `amount <= available_balance(asset)` and is
+idempotent on `(consumer, purpose, nonce)`. Direct `withdraw` calls also enforce
+`amount <= available_balance(asset)`. Expired reservations (`ledger > expiry_ledger`)
+can be reclaimed permissionlessly via `reclaim_expired_reservation`.
+

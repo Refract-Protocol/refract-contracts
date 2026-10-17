@@ -1,6 +1,10 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    IntoVal, Symbol,
+};
 
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
@@ -16,6 +20,7 @@ pub enum BackstopError {
     InsufficientShares = 5,
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
+    TreasuryNotConfigured = 8,
 }
 
 #[contracttype]
@@ -74,6 +79,85 @@ impl RefractBackstop {
         Ok(())
     }
 
+    /// Configure the `RefractTreasury` address used for replenishment capital
+    /// reservations.
+    pub fn set_treasury(env: Env, caller: Address, treasury: Address) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let config = Self::read_config(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        env.storage().instance().set(&"treasury", &treasury);
+        Ok(())
+    }
+
+    /// Reserve replenishment capital in `RefractTreasury` so the treasury
+    /// cannot double-commit those funds while a shortfall replenishment is
+    /// pending.
+    pub fn reserve_replenishment(
+        env: Env,
+        caller: Address,
+        nonce: u64,
+        amount: i128,
+        expiry_ledger: u32,
+    ) -> Result<u64, BackstopError> {
+        caller.require_auth();
+        let config = Self::read_config(&env)?;
+        if caller != config.admin && caller != config.pool {
+            return Err(BackstopError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(BackstopError::InvalidAmount);
+        }
+        let treasury = Self::treasury(&env)?;
+        let self_addr = env.current_contract_address();
+
+        let reservation_id: u64 = env.invoke_contract(
+            &treasury,
+            &Symbol::new(&env, "reserve_capital"),
+            (
+                self_addr,
+                symbol_short!("backstop"),
+                nonce,
+                config.token,
+                amount,
+                expiry_ledger,
+            )
+                .into_val(&env),
+        );
+        Ok(reservation_id)
+    }
+
+    /// Draw down reserved replenishment capital from `RefractTreasury` into the
+    /// backstop's `total_capital`.
+    pub fn draw_down_replenishment(
+        env: Env,
+        caller: Address,
+        reservation_id: u64,
+        amount: i128,
+    ) -> Result<i128, BackstopError> {
+        caller.require_auth();
+        let config = Self::read_config(&env)?;
+        if caller != config.admin && caller != config.pool {
+            return Err(BackstopError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(BackstopError::InvalidAmount);
+        }
+        let treasury = Self::treasury(&env)?;
+        let self_addr = env.current_contract_address();
+
+        let drawn: i128 = env.invoke_contract(
+            &treasury,
+            &Symbol::new(&env, "draw_down_reservation"),
+            (self_addr.clone(), reservation_id, self_addr, amount).into_val(&env),
+        );
+        let mut state = Self::read_state(&env)?;
+        state.total_capital += drawn;
+        env.storage().instance().set(&"state", &state);
+        Ok(drawn)
+    }
+
     /// Deposit `amount` of the configured token and mint backstop shares to
     /// `staker`, mirroring `RefractPool`'s share-accounting pattern.
     pub fn deposit(env: Env, staker: Address, amount: i128) -> Result<i128, BackstopError> {
@@ -81,8 +165,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
         if shares <= 0 {
@@ -112,8 +196,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -149,7 +233,7 @@ impl RefractBackstop {
     /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::read_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -157,7 +241,7 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
 
-        let mut state = Self::state(&env)?;
+        let mut state = Self::read_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
         } else {
@@ -186,8 +270,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let cut = amount * config.premium_share_bps / BPS_DENOM;
         state.premium_income += cut;
@@ -205,11 +289,11 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::read_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::read_config(&env)
     }
 
     /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
@@ -232,17 +316,61 @@ impl RefractBackstop {
         }
     }
 
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn read_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn read_state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
+    }
+
+    fn treasury(env: &Env) -> Result<Address, BackstopError> {
+        env.storage()
+            .instance()
+            .get(&"treasury")
+            .ok_or(BackstopError::TreasuryNotConfigured)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    #[test]
+    fn deposit_shortfall_and_withdraw() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RefractBackstop);
+        let client = RefractBackstopClient::new(&env, &contract_id);
+
+        let pool = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let staker = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        sac.mint(&staker, &1_000);
+        client.initialize(&pool, &admin, &token_id, &2_000);
+
+        let shares = client.deposit(&staker, &1_000);
+        assert_eq!(shares, 1_000);
+
+        let covered = client.cover_shortfall(&pool, &400);
+        assert_eq!(covered, 400);
+        assert_eq!(client.state().total_capital, 600);
+
+        let withdrawn = client.withdraw(&staker, &500);
+        assert_eq!(withdrawn, 300);
     }
 }
