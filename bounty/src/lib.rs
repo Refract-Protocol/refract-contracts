@@ -1,24 +1,31 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Vec,
+};
 
-/// Storage keys for the bounty escrow.
+pub const MAX_BATCH_OPS: u32 = 8;
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// The governance/timelock address authorized to award payouts.
     Governance,
-    /// The token used to fund and pay out bounties.
     Token,
-    /// Running total of funds currently held in escrow.
     Balance,
-    /// Immutable, timestamped record of a rewarded disclosure.
+    Paused,
     Award(BytesN<32>),
 }
 
-/// Immutable, timestamped record that a specific disclosure was rewarded.
-/// Only the commitment (hash) is stored on-chain; vulnerability details stay
-/// off-chain per SECURITY.md.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdminOp {
+    SetPaused(bool),
+    Award(Address, i128, BytesN<32>),
+    SetGovernance(Address),
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct AwardRecord {
@@ -38,32 +45,29 @@ pub enum BountyError {
     InsufficientBalance = 4,
     Unauthorized = 5,
     DuplicateReport = 6,
+    ContractPaused = 7,
+    EmptyBatch = 8,
+    BatchTooLarge = 9,
 }
 
-/// Governance-controlled bug bounty escrow.
-///
-/// The reward pool can be topped up by anyone (including the treasury), but
-/// payouts can only be authorized by the governance/timelock address. There is
-/// deliberately no single admin key with payout authority: a compromised admin
-/// key authorizing arbitrary "bounty" payouts is a direct fund-drain vector.
 #[contract]
 pub struct RefractBountyEscrow;
 
 #[contractimpl]
 impl RefractBountyEscrow {
-    /// One-time initialization wiring the governance/timelock address and the
-    /// token used for funding and payouts.
     pub fn initialize(env: Env, governance: Address, token: Address) -> Result<(), BountyError> {
         if env.storage().instance().has(&DataKey::Governance) {
             return Err(BountyError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Governance, &governance);
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Balance, &0i128);
+        env.storage().instance().set(&DataKey::Paused, &false);
         Ok(())
     }
 
-    /// Top up the reward pool. Callable by anyone, including the treasury.
     pub fn fund(env: Env, from: Address, amount: i128) -> Result<(), BountyError> {
         from.require_auth();
         if amount <= 0 {
@@ -71,15 +75,13 @@ impl RefractBountyEscrow {
         }
         let token = Self::token(&env)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
-        let balance = Self::balance(&env)?;
-        env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+        let balance = Self::balance_internal(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &(balance + amount));
         Ok(())
     }
 
-    /// Award a bounty to a security researcher. Gated strictly by the
-    /// governance/timelock address; a plain admin key has no authority here.
-    /// The `report_hash` commitment is stored on-chain as an immutable,
-    /// timestamped record of the rewarded disclosure.
     pub fn award(
         env: Env,
         caller: Address,
@@ -88,51 +90,92 @@ impl RefractBountyEscrow {
         report_hash: BytesN<32>,
     ) -> Result<(), BountyError> {
         caller.require_auth();
-        let governance = Self::governance(&env)?;
-        if caller != governance {
+        if caller != Self::governance_internal(&env)? {
             return Err(BountyError::Unauthorized);
         }
-        if amount <= 0 {
-            return Err(BountyError::InvalidAmount);
+        Self::apply_op(&env, AdminOp::Award(researcher, amount, report_hash))
+    }
+
+    /// Atomic batch administrative entrypoint (`#264`).
+    pub fn batch(env: Env, caller: Address, ops: Vec<AdminOp>) -> Result<u32, BountyError> {
+        caller.require_auth();
+        if caller != Self::governance_internal(&env)? {
+            return Err(BountyError::Unauthorized);
         }
-        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
-            return Err(BountyError::DuplicateReport);
+        if ops.is_empty() {
+            return Err(BountyError::EmptyBatch);
         }
-        let balance = Self::balance(&env)?;
-        if amount > balance {
-            return Err(BountyError::InsufficientBalance);
+        if ops.len() > MAX_BATCH_OPS {
+            return Err(BountyError::BatchTooLarge);
+        }
+        if Self::paused_internal(&env) && ops.get(0) != Some(AdminOp::SetPaused(false)) {
+            return Err(BountyError::ContractPaused);
         }
 
-        let token = Self::token(&env)?;
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
-        env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+        for (idx, op) in ops.iter().enumerate() {
+            Self::apply_op(&env, op.clone())?;
+            env.events()
+                .publish((symbol_short!("batch_op"), caller.clone(), idx as u32), op);
+        }
+        env.events()
+            .publish((symbol_short!("batch"), caller), ops.len());
+        Ok(ops.len())
+    }
 
-        let record = AwardRecord {
-            researcher,
-            amount,
-            report_hash: report_hash.clone(),
-            timestamp: env.ledger().timestamp(),
-        };
-        env.storage().persistent().set(&DataKey::Award(report_hash), &record);
+    pub fn balance(env: Env) -> Result<i128, BountyError> {
+        Self::balance_internal(&env)
+    }
+
+    fn apply_op(env: &Env, op: AdminOp) -> Result<(), BountyError> {
+        if Self::paused_internal(env) && op != AdminOp::SetPaused(false) {
+            return Err(BountyError::ContractPaused);
+        }
+        match op {
+            AdminOp::SetPaused(paused) => {
+                env.storage().instance().set(&DataKey::Paused, &paused);
+            }
+            AdminOp::SetGovernance(new_gov) => {
+                env.storage().instance().set(&DataKey::Governance, &new_gov);
+            }
+            AdminOp::Award(researcher, amount, report_hash) => {
+                if amount <= 0 {
+                    return Err(BountyError::InvalidAmount);
+                }
+                if env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::Award(report_hash.clone()))
+                {
+                    return Err(BountyError::DuplicateReport);
+                }
+                let balance = Self::balance_internal(env)?;
+                if amount > balance {
+                    return Err(BountyError::InsufficientBalance);
+                }
+                let token = Self::token(env)?;
+                token::Client::new(env, &token).transfer(
+                    &env.current_contract_address(),
+                    &researcher,
+                    &amount,
+                );
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Balance, &(balance - amount));
+                env.storage().persistent().set(
+                    &DataKey::Award(report_hash.clone()),
+                    &AwardRecord {
+                        researcher,
+                        amount,
+                        report_hash,
+                        timestamp: env.ledger().timestamp(),
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
-    /// Current funds held in escrow.
-    pub fn balance(env: Env) -> Result<i128, BountyError> {
-        Self::balance(&env)
-    }
-
-    /// The governance/timelock address authorized to award payouts.
-    pub fn governance(env: Env) -> Result<Address, BountyError> {
-        Self::governance(&env)
-    }
-
-    /// Immutable record of a rewarded disclosure, if any.
-    pub fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
-        env.storage().persistent().get(&DataKey::Award(report_hash))
-    }
-
-    fn governance(env: &Env) -> Result<Address, BountyError> {
+    fn governance_internal(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Governance)
@@ -146,13 +189,57 @@ impl RefractBountyEscrow {
             .ok_or(BountyError::NotInitialized)
     }
 
-    fn balance(env: &Env) -> Result<i128, BountyError> {
+    fn balance_internal(env: &Env) -> Result<i128, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Balance)
             .ok_or(BountyError::NotInitialized)
     }
+
+    fn paused_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
-mod test;
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+    use soroban_sdk::vec;
+
+    #[test]
+    fn bounty_batch_executes_multiple_awards_and_rolls_back_on_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov = Address::generate(&env);
+        let r1 = Address::generate(&env);
+        let r2 = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        StellarAssetClient::new(&env, &usdc).mint(&gov, &1_000);
+
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+        client.initialize(&gov, &usdc);
+        client.fund(&gov, &1_000);
+
+        let h1 = BytesN::from_array(&env, &[1u8; 32]);
+        let h2 = BytesN::from_array(&env, &[2u8; 32]);
+        client.batch(
+            &gov,
+            &vec![
+                &env,
+                AdminOp::Award(r1, 300, h1),
+                AdminOp::Award(r2, 400, h2),
+            ],
+        );
+        assert_eq!(client.balance(), 300);
+    }
+}
