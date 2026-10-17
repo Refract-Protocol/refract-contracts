@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::disallowed_methods)]
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
@@ -70,7 +71,9 @@ mod test {
         assert_eq!(client.admin(), admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
