@@ -88,6 +88,10 @@ pub enum GrantsError {
     StateArchived,
     /// Inconsistent state detected across counters, milestones or balances.
     InconsistentState,
+    /// Disbursement exceeds the allocated budget limit for the specified category.
+    BudgetCategoryExceeded,
+    /// Specified budget category was not found in the grant line items.
+    CategoryNotFound,
 }
 
 pub type GrantError = GrantsError;
@@ -98,6 +102,14 @@ pub struct LicensingAttestationRecord {
     pub spdx_license: String,
     pub deliverable_hash: [u8; 32],
     pub ip_attestation_signature: Option<Vec<u8>>,
+}
+
+/// A line-item budget entry for granular expenditure tracking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetItem {
+    pub category: String,
+    pub allocated: i128,
+    pub disbursed: i128,
 }
 
 /// A funding program record in the registry.
@@ -154,6 +166,8 @@ pub struct RefractGrants {
     programs: BTreeMap<u64, ProgramRecord>,
     /// Stored deliverable licensing attestations keyed by grant id.
     licensings: BTreeMap<GrantId, LicensingAttestationRecord>,
+    /// Stored line-item budgets keyed by grant id.
+    budgets: BTreeMap<GrantId, Vec<BudgetItem>>,
 }
 
 impl RefractGrants {
@@ -166,6 +180,7 @@ impl RefractGrants {
             next_program_id: 0,
             programs: BTreeMap::new(),
             licensings: BTreeMap::new(),
+            budgets: BTreeMap::new(),
         }
     }
 
@@ -239,6 +254,104 @@ impl RefractGrants {
         );
 
         Ok(grant_id)
+    }
+
+    /// Approves a new grant with line-item budget tracking across categories.
+    ///
+    /// Validates that:
+    /// - sum of `milestones` equals `total_amount`
+    /// - sum of `allocated` across all `budget` items equals `total_amount`
+    /// - each item's allocated is strictly positive and disbursed starts at 0
+    pub fn create_grant_with_budget(
+        &mut self,
+        caller: Address,
+        recipient: Address,
+        total_amount: i128,
+        milestones: Vec<i128>,
+        budget: Vec<BudgetItem>,
+    ) -> Result<GrantId, GrantsError> {
+        self.require_governance(caller)?;
+
+        if budget.is_empty() {
+            return Err(GrantsError::NoMilestones);
+        }
+
+        let mut budget_sum: i128 = 0;
+        for item in &budget {
+            if item.allocated <= 0 || item.disbursed != 0 {
+                return Err(GrantsError::InvalidMilestoneAmount);
+            }
+            budget_sum = budget_sum
+                .checked_add(item.allocated)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
+        }
+        if budget_sum != total_amount {
+            return Err(GrantsError::MilestoneSumMismatch);
+        }
+
+        let grant_id = self.create_grant(caller, recipient, total_amount, milestones)?;
+        self.budgets.insert(grant_id, budget);
+
+        Ok(grant_id)
+    }
+
+    /// Configures or replaces the line-item budget for an existing grant.
+    ///
+    /// Validates that the sum of all allocated amounts equals `grant.total_amount`.
+    pub fn configure_budget(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+        budget: Vec<BudgetItem>,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        let grant = self.grants.get(&grant_id).ok_or(GrantsError::GrantNotFound)?;
+
+        if budget.is_empty() {
+            return Err(GrantsError::NoMilestones);
+        }
+
+        let mut budget_sum: i128 = 0;
+        for item in &budget {
+            if item.allocated <= 0 || item.disbursed < 0 || item.disbursed > item.allocated {
+                return Err(GrantsError::InvalidMilestoneAmount);
+            }
+            budget_sum = budget_sum
+                .checked_add(item.allocated)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
+        }
+        if budget_sum != grant.total_amount {
+            return Err(GrantsError::MilestoneSumMismatch);
+        }
+
+        self.budgets.insert(grant_id, budget);
+        Ok(())
+    }
+
+    /// Returns the budget items for a grant, if configured.
+    pub fn get_budget_items(&self, grant_id: GrantId) -> Option<&Vec<BudgetItem>> {
+        self.budgets.get(&grant_id)
+    }
+
+    /// Returns (allocated, disbursed, remaining) for a grant's budget category.
+    pub fn get_budget_variance(
+        &self,
+        grant_id: GrantId,
+        category: &str,
+    ) -> Result<(i128, i128, i128), GrantsError> {
+        if !self.grants.contains_key(&grant_id) {
+            return Err(GrantsError::GrantNotFound);
+        }
+        let items = self.budgets.get(&grant_id).ok_or(GrantsError::CategoryNotFound)?;
+        let item = items
+            .iter()
+            .find(|b| b.category == category)
+            .ok_or(GrantsError::CategoryNotFound)?;
+        let remaining = item
+            .allocated
+            .checked_sub(item.disbursed)
+            .ok_or(GrantsError::BudgetCategoryExceeded)?;
+        Ok((item.allocated, item.disbursed, remaining))
     }
 
     /// Registers a new funding program with an allocated budget and round timeframe.
@@ -499,6 +612,50 @@ impl RefractGrants {
         Ok(release_amount)
     }
 
+    /// Releases a milestone debiting a specific budget category.
+    ///
+    /// Validates category exists and disbursement does not exceed allocated budget.
+    pub fn release_milestone_with_category(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+        milestone_index: usize,
+        category: &str,
+    ) -> Result<i128, GrantsError> {
+        self.require_governance(caller)?;
+
+        let grant = self
+            .grants
+            .get(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+
+        let milestone = grant
+            .milestones
+            .get(milestone_index)
+            .ok_or(GrantsError::InvalidMilestoneIndex)?;
+        let amount = milestone.amount;
+
+        // Check budget category
+        if let Some(items) = self.budgets.get_mut(&grant_id) {
+            let cat_item = items
+                .iter_mut()
+                .find(|b| b.category == category)
+                .ok_or(GrantsError::CategoryNotFound)?;
+            let new_disbursed = cat_item
+                .disbursed
+                .checked_add(amount)
+                .ok_or(GrantsError::BudgetCategoryExceeded)?;
+            if new_disbursed > cat_item.allocated {
+                return Err(GrantsError::BudgetCategoryExceeded);
+            }
+            cat_item.disbursed = new_disbursed;
+        } else {
+            return Err(GrantsError::CategoryNotFound);
+        }
+
+        self.release_milestone(caller, grant_id, milestone_index)
+    }
+
     /// Records a deliverable licensing attestation and IP assignment for a grant.
     pub fn attest_licensing(
         &mut self,
@@ -539,6 +696,50 @@ impl RefractGrants {
         grant_id: GrantId,
     ) -> Option<&LicensingAttestationRecord> {
         self.licensings.get(&grant_id)
+    }
+
+    /// Confirms delivery of a single milestone debiting a specific budget category.
+    ///
+    /// Validates category exists and disbursement does not exceed allocated budget.
+    pub fn confirm_milestone_with_category(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+        milestone_index: usize,
+        category: &str,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+
+        let grant = self
+            .grants
+            .get(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+
+        let milestone = grant
+            .milestones
+            .get(milestone_index)
+            .ok_or(GrantsError::InvalidMilestoneIndex)?;
+        let amount = milestone.amount;
+
+        // Check budget category
+        if let Some(items) = self.budgets.get_mut(&grant_id) {
+            let cat_item = items
+                .iter_mut()
+                .find(|b| b.category == category)
+                .ok_or(GrantsError::CategoryNotFound)?;
+            let new_disbursed = cat_item
+                .disbursed
+                .checked_add(amount)
+                .ok_or(GrantsError::BudgetCategoryExceeded)?;
+            if new_disbursed > cat_item.allocated {
+                return Err(GrantsError::BudgetCategoryExceeded);
+            }
+            cat_item.disbursed = new_disbursed;
+        } else {
+            return Err(GrantsError::CategoryNotFound);
+        }
+
+        self.confirm_milestone(caller, grant_id, milestone_index)
     }
 
     /// Confirms delivery of a single milestone, making its amount claimable.
@@ -677,7 +878,7 @@ impl RefractGrants {
         if (self.programs.len() as u64) > self.next_program_id {
             return Err(GrantsError::InconsistentState);
         }
-        for grant in self.grants.values() {
+        for (gid, grant) in &self.grants {
             let mut sum: i128 = 0;
             let mut confirmed_sum: i128 = 0;
             let mut claimed_sum: i128 = 0;
@@ -710,6 +911,25 @@ impl RefractGrants {
                 .ok_or(GrantsError::InconsistentState)?;
             if grant.claimable != expected_claimable {
                 return Err(GrantsError::InconsistentState);
+            }
+
+            if let Some(items) = self.budgets.get(gid) {
+                let mut budget_sum: i128 = 0;
+                let mut budget_disbursed: i128 = 0;
+                for item in items {
+                    if item.allocated <= 0 || item.disbursed < 0 || item.disbursed > item.allocated {
+                        return Err(GrantsError::InconsistentState);
+                    }
+                    budget_sum = budget_sum
+                        .checked_add(item.allocated)
+                        .ok_or(GrantsError::InconsistentState)?;
+                    budget_disbursed = budget_disbursed
+                        .checked_add(item.disbursed)
+                        .ok_or(GrantsError::InconsistentState)?;
+                }
+                if budget_sum != grant.total_amount || budget_disbursed > confirmed_sum {
+                    return Err(GrantsError::InconsistentState);
+                }
             }
         }
         for prog in self.programs.values() {
@@ -748,6 +968,7 @@ pub mod contract {
         Program(u64),
         GrantProgram(u64),
         Licensing(u64),
+        Budget(u64),
     }
 
     #[contracttype]
@@ -765,6 +986,14 @@ pub mod contract {
         pub total_amount: i128,
         pub milestones: Vec<MilestoneRecord>,
         pub claimable: i128,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct BudgetItem {
+        pub category: Symbol,
+        pub allocated: i128,
+        pub disbursed: i128,
     }
 
     #[contracttype]
@@ -815,6 +1044,8 @@ pub mod contract {
         InvalidLicense = 20,
         StateArchived = 21,
         InconsistentState = 22,
+        BudgetCategoryExceeded = 23,
+        CategoryNotFound = 24,
     }
 
     pub use self::GrantsContractError as GrantContractError;
@@ -1126,6 +1357,166 @@ pub mod contract {
             Ok(grant_id)
         }
 
+        pub fn create_grant_with_budget(
+            env: Env,
+            caller: Address,
+            recipient: Address,
+            total_amount: i128,
+            milestones: Vec<i128>,
+            budget: Vec<BudgetItem>,
+        ) -> Result<u64, GrantsContractError> {
+            caller.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if caller != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            if total_amount <= 0 {
+                return Err(GrantsContractError::InvalidTotalAmount);
+            }
+            if milestones.is_empty() {
+                return Err(GrantsContractError::NoMilestones);
+            }
+            let mut sum: i128 = 0;
+            let mut stored_milestones = Vec::new(&env);
+            for i in 0..milestones.len() {
+                let amt = milestones.get(i).unwrap_or(0);
+                if amt <= 0 {
+                    return Err(GrantsContractError::InvalidMilestoneAmount);
+                }
+                sum = sum.checked_add(amt).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+                stored_milestones.push_back(MilestoneRecord {
+                    amount: amt,
+                    confirmed: false,
+                    claimed: false,
+                });
+            }
+            if sum != total_amount {
+                return Err(GrantsContractError::MilestoneSumMismatch);
+            }
+
+            if budget.is_empty() {
+                return Err(GrantsContractError::NoMilestones);
+            }
+            let mut budget_sum: i128 = 0;
+            for i in 0..budget.len() {
+                let item = budget.get(i).ok_or(GrantsContractError::InvalidMilestoneAmount)?;
+                if item.allocated <= 0 || item.disbursed != 0 {
+                    return Err(GrantsContractError::InvalidMilestoneAmount);
+                }
+                budget_sum = budget_sum
+                    .checked_add(item.allocated)
+                    .ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            }
+            if budget_sum != total_amount {
+                return Err(GrantsContractError::MilestoneSumMismatch);
+            }
+
+            let next_id: u64 = env.storage().instance().get(&GrantsDataKey::NextGrantId).unwrap_or(0);
+            let grant_id = next_id;
+            env.storage().instance().set(&GrantsDataKey::NextGrantId, &(next_id + 1));
+
+            let record = GrantRecord {
+                recipient: recipient.clone(),
+                total_amount,
+                milestones: stored_milestones,
+                claimable: 0,
+            };
+            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &record);
+            env.storage().persistent().set(&GrantsDataKey::Budget(grant_id), &budget);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("create")),
+                (grant_id, recipient, total_amount),
+            );
+            Ok(grant_id)
+        }
+
+        pub fn configure_budget(
+            env: Env,
+            caller: Address,
+            grant_id: u64,
+            budget: Vec<BudgetItem>,
+        ) -> Result<(), GrantsContractError> {
+            caller.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if caller != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            let grant: GrantRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Grant(grant_id))
+                .ok_or(GrantsContractError::GrantNotFound)?;
+
+            if budget.is_empty() {
+                return Err(GrantsContractError::NoMilestones);
+            }
+            let mut budget_sum: i128 = 0;
+            for i in 0..budget.len() {
+                let item = budget.get(i).ok_or(GrantsContractError::InvalidMilestoneAmount)?;
+                if item.allocated <= 0 || item.disbursed < 0 || item.disbursed > item.allocated {
+                    return Err(GrantsContractError::InvalidMilestoneAmount);
+                }
+                budget_sum = budget_sum
+                    .checked_add(item.allocated)
+                    .ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            }
+            if budget_sum != grant.total_amount {
+                return Err(GrantsContractError::MilestoneSumMismatch);
+            }
+
+            env.storage().persistent().set(&GrantsDataKey::Budget(grant_id), &budget);
+            Ok(())
+        }
+
+        pub fn get_budget_items(
+            env: Env,
+            grant_id: u64,
+        ) -> Result<Vec<BudgetItem>, GrantsContractError> {
+            if !env.storage().persistent().has(&GrantsDataKey::Grant(grant_id)) {
+                return Err(GrantsContractError::GrantNotFound);
+            }
+            env.storage()
+                .persistent()
+                .get(&GrantsDataKey::Budget(grant_id))
+                .ok_or(GrantsContractError::CategoryNotFound)
+        }
+
+        pub fn get_budget_variance(
+            env: Env,
+            grant_id: u64,
+            category: Symbol,
+        ) -> Result<(i128, i128, i128), GrantsContractError> {
+            if !env.storage().persistent().has(&GrantsDataKey::Grant(grant_id)) {
+                return Err(GrantsContractError::GrantNotFound);
+            }
+            let budget: Vec<BudgetItem> = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Budget(grant_id))
+                .ok_or(GrantsContractError::CategoryNotFound)?;
+
+            for i in 0..budget.len() {
+                let item = budget.get(i).ok_or(GrantsContractError::CategoryNotFound)?;
+                if item.category == category {
+                    let remaining = item
+                        .allocated
+                        .checked_sub(item.disbursed)
+                        .ok_or(GrantsContractError::BudgetCategoryExceeded)?;
+                    return Ok((item.allocated, item.disbursed, remaining));
+                }
+            }
+            Err(GrantsContractError::CategoryNotFound)
+        }
+
         pub fn release_milestone(
             env: Env,
             caller: Address,
@@ -1197,6 +1588,214 @@ pub mod contract {
                 (grant_id, milestone_index, target_m.amount),
             );
             Ok(target_m.amount)
+        }
+
+        pub fn release_milestone_with_category(
+            env: Env,
+            caller: Address,
+            grant_id: u64,
+            milestone_index: u32,
+            category: Symbol,
+        ) -> Result<i128, GrantsContractError> {
+            caller.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if caller != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            let mut grant: GrantRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Grant(grant_id))
+                .ok_or(GrantsContractError::GrantNotFound)?;
+
+            let idx = milestone_index;
+            if idx >= grant.milestones.len() {
+                return Err(GrantsContractError::InvalidMilestoneIndex);
+            }
+            for i in 0..idx {
+                let m = grant.milestones.get(i).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+                if !m.confirmed {
+                    return Err(GrantsContractError::MilestoneOutOfOrder);
+                }
+            }
+            let mut target_m = grant.milestones.get(idx).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+            if target_m.confirmed {
+                return Err(GrantsContractError::MilestoneAlreadyConfirmed);
+            }
+
+            let is_final = idx == grant.milestones.len() - 1;
+            if is_final {
+                let attestation: LicensingAttestation = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::Licensing(grant_id))
+                    .ok_or(GrantsContractError::MissingLicensingAttestation)?;
+                if attestation.spdx_license == Symbol::new(&env, "") {
+                    return Err(GrantsContractError::InvalidLicense);
+                }
+            }
+
+            let amount = target_m.amount;
+            let mut budget: Vec<BudgetItem> = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Budget(grant_id))
+                .ok_or(GrantsContractError::CategoryNotFound)?;
+
+            let mut found = false;
+            for i in 0..budget.len() {
+                let mut item = budget.get(i).ok_or(GrantsContractError::CategoryNotFound)?;
+                if item.category == category {
+                    let new_disbursed = item
+                        .disbursed
+                        .checked_add(amount)
+                        .ok_or(GrantsContractError::BudgetCategoryExceeded)?;
+                    if new_disbursed > item.allocated {
+                        return Err(GrantsContractError::BudgetCategoryExceeded);
+                    }
+                    item.disbursed = new_disbursed;
+                    budget.set(i, item);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(GrantsContractError::CategoryNotFound);
+            }
+
+            if let Some(program_id) = env.storage().persistent().get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id)) {
+                let mut program: ProgramInfo = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::Program(program_id))
+                    .ok_or(GrantsContractError::ProgramNotFound)?;
+                let remaining = program.budget.checked_sub(program.disbursed).ok_or(GrantsContractError::BudgetExceeded)?;
+                if target_m.amount > remaining {
+                    return Err(GrantsContractError::BudgetExceeded);
+                }
+                program.disbursed = program.disbursed.checked_add(target_m.amount).ok_or(GrantsContractError::BudgetExceeded)?;
+                env.storage().persistent().set(&GrantsDataKey::Program(program_id), &program);
+            }
+
+            target_m.confirmed = true;
+            grant.claimable = grant.claimable.checked_add(target_m.amount).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            grant.milestones.set(idx, target_m.clone());
+            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
+            env.storage().persistent().set(&GrantsDataKey::Budget(grant_id), &budget);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("release")),
+                (grant_id, milestone_index, target_m.amount),
+            );
+            Ok(target_m.amount)
+        }
+
+        pub fn confirm_milestone_with_category(
+            env: Env,
+            caller: Address,
+            grant_id: u64,
+            milestone_index: u32,
+            category: Symbol,
+        ) -> Result<(), GrantsContractError> {
+            caller.require_auth();
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+            if caller != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+            let mut grant: GrantRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Grant(grant_id))
+                .ok_or(GrantsContractError::GrantNotFound)?;
+
+            let idx = milestone_index;
+            if idx >= grant.milestones.len() {
+                return Err(GrantsContractError::InvalidMilestoneIndex);
+            }
+            for i in 0..idx {
+                let m = grant.milestones.get(i).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+                if !m.confirmed {
+                    return Err(GrantsContractError::MilestoneOutOfOrder);
+                }
+            }
+            let mut target_m = grant.milestones.get(idx).ok_or(GrantsContractError::InvalidMilestoneIndex)?;
+            if target_m.confirmed {
+                return Err(GrantsContractError::MilestoneAlreadyConfirmed);
+            }
+
+            let is_final = idx == grant.milestones.len() - 1;
+            if is_final {
+                let attestation: LicensingAttestation = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::Licensing(grant_id))
+                    .ok_or(GrantsContractError::MissingLicensingAttestation)?;
+                if attestation.spdx_license == Symbol::new(&env, "") {
+                    return Err(GrantsContractError::InvalidLicense);
+                }
+            }
+
+            let amount = target_m.amount;
+            let mut budget: Vec<BudgetItem> = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Budget(grant_id))
+                .ok_or(GrantsContractError::CategoryNotFound)?;
+
+            let mut found = false;
+            for i in 0..budget.len() {
+                let mut item = budget.get(i).ok_or(GrantsContractError::CategoryNotFound)?;
+                if item.category == category {
+                    let new_disbursed = item
+                        .disbursed
+                        .checked_add(amount)
+                        .ok_or(GrantsContractError::BudgetCategoryExceeded)?;
+                    if new_disbursed > item.allocated {
+                        return Err(GrantsContractError::BudgetCategoryExceeded);
+                    }
+                    item.disbursed = new_disbursed;
+                    budget.set(i, item);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(GrantsContractError::CategoryNotFound);
+            }
+
+            if let Some(program_id) = env.storage().persistent().get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id)) {
+                let mut program: ProgramInfo = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::Program(program_id))
+                    .ok_or(GrantsContractError::ProgramNotFound)?;
+                let remaining = program.budget.checked_sub(program.disbursed).ok_or(GrantsContractError::BudgetExceeded)?;
+                if target_m.amount > remaining {
+                    return Err(GrantsContractError::BudgetExceeded);
+                }
+                program.disbursed = program.disbursed.checked_add(target_m.amount).ok_or(GrantsContractError::BudgetExceeded)?;
+                env.storage().persistent().set(&GrantsDataKey::Program(program_id), &program);
+            }
+
+            target_m.confirmed = true;
+            grant.claimable = grant.claimable.checked_add(target_m.amount).ok_or(GrantsContractError::MilestoneSumMismatch)?;
+            grant.milestones.set(idx, target_m);
+            env.storage().persistent().set(&GrantsDataKey::Grant(grant_id), &grant);
+            env.storage().persistent().set(&GrantsDataKey::Budget(grant_id), &budget);
+
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("confirm")),
+                (grant_id, milestone_index),
+            );
+            Ok(())
         }
 
         pub fn confirm_milestone(
@@ -1441,6 +2040,22 @@ pub mod contract {
                     if grant.claimable != expected_claimable {
                         return Err(GrantsContractError::InconsistentState);
                     }
+
+                    if let Some(budget) = env.storage().persistent().get::<_, Vec<BudgetItem>>(&GrantsDataKey::Budget(gid)) {
+                        let mut b_sum: i128 = 0;
+                        let mut b_disbursed: i128 = 0;
+                        for i in 0..budget.len() {
+                            let item = budget.get(i).ok_or(GrantsContractError::InconsistentState)?;
+                            if item.allocated <= 0 || item.disbursed < 0 || item.disbursed > item.allocated {
+                                return Err(GrantsContractError::InconsistentState);
+                            }
+                            b_sum = b_sum.checked_add(item.allocated).ok_or(GrantsContractError::InconsistentState)?;
+                            b_disbursed = b_disbursed.checked_add(item.disbursed).ok_or(GrantsContractError::InconsistentState)?;
+                        }
+                        if b_sum != grant.total_amount || b_disbursed > confirmed_sum {
+                            return Err(GrantsContractError::InconsistentState);
+                        }
+                    }
                 }
             }
 
@@ -1462,9 +2077,9 @@ pub mod contract {
 }
 
 pub use contract::{
-    GrantContractError, GrantRecord, GrantsContractError, GrantsDataKey, LicensingAttestation,
-    MilestoneRecord, ProgramInfo, ProgramRegistry, RefractGrantsContract,
-    RefractGrantsContractClient,
+    BudgetItem as ContractBudgetItem, GrantContractError, GrantRecord, GrantsContractError,
+    GrantsDataKey, LicensingAttestation, MilestoneRecord, ProgramInfo, ProgramRegistry,
+    RefractGrantsContract, RefractGrantsContractClient,
 };
 
 #[cfg(test)]
@@ -1735,6 +2350,96 @@ mod tests {
         assert_eq!(prog.committed, 600);
         assert_eq!(prog.disbursed, 600);
     }
+
+    #[test]
+    fn test_pure_rust_budget_line_items_lifecycle() {
+        let mut grants = contract();
+        let budget = vec![
+            BudgetItem { category: "development".to_string(), allocated: 600, disbursed: 0 },
+            BudgetItem { category: "audit".to_string(), allocated: 300, disbursed: 0 },
+            BudgetItem { category: "marketing".to_string(), allocated: 100, disbursed: 0 },
+        ];
+
+        // 1. Budget sum mismatch rejection
+        let invalid_budget = vec![
+            BudgetItem { category: "development".to_string(), allocated: 500, disbursed: 0 },
+        ];
+        let mismatch_err = grants.create_grant_with_budget(
+            GOVERNANCE,
+            RECIPIENT,
+            1_000,
+            vec![400, 300, 300],
+            invalid_budget,
+        );
+        assert_eq!(mismatch_err, Err(GrantsError::MilestoneSumMismatch));
+
+        // 2. Successful creation with budget
+        let gid = grants
+            .create_grant_with_budget(
+                GOVERNANCE,
+                RECIPIENT,
+                1_000,
+                vec![400, 300, 300],
+                budget,
+            )
+            .unwrap();
+
+        // Check variance initially
+        assert_eq!(grants.get_budget_variance(gid, "development"), Ok((600, 0, 600)));
+        assert_eq!(grants.get_budget_variance(gid, "audit"), Ok((300, 0, 300)));
+        assert_eq!(grants.get_budget_variance(gid, "marketing"), Ok((100, 0, 100)));
+
+        // Category not found
+        assert_eq!(
+            grants.get_budget_variance(gid, "nonexistent"),
+            Err(GrantsError::CategoryNotFound)
+        );
+
+        // 3. Disbursement of milestone 0 (400) under "development" category
+        grants.confirm_milestone_with_category(GOVERNANCE, gid, 0, "development").unwrap();
+        assert_eq!(grants.get_budget_variance(gid, "development"), Ok((600, 400, 200)));
+
+        // 4. Milestone 1 (300) under non-existent category fails
+        assert_eq!(
+            grants.confirm_milestone_with_category(GOVERNANCE, gid, 1, "nonexistent"),
+            Err(GrantsError::CategoryNotFound)
+        );
+
+        // 5. Milestone 1 (300) exceeds remaining "development" budget (remaining 200) -> BudgetCategoryExceeded
+        assert_eq!(
+            grants.confirm_milestone_with_category(GOVERNANCE, gid, 1, "development"),
+            Err(GrantsError::BudgetCategoryExceeded)
+        );
+
+        // 6. Milestone 1 (300) under "audit" category succeeds
+        grants.confirm_milestone_with_category(GOVERNANCE, gid, 1, "audit").unwrap();
+        assert_eq!(grants.get_budget_variance(gid, "audit"), Ok((300, 300, 0)));
+
+        // 7. Milestone 2 (300) exceeds "marketing" (allocated 100) -> BudgetCategoryExceeded
+        assert_eq!(
+            grants.confirm_milestone_with_category(GOVERNANCE, gid, 2, "marketing"),
+            Err(GrantsError::BudgetCategoryExceeded)
+        );
+
+        // 8. Reconfigure budget with governance approval
+        let updated_budget = vec![
+            BudgetItem { category: "development".to_string(), allocated: 400, disbursed: 400 },
+            BudgetItem { category: "audit".to_string(), allocated: 300, disbursed: 300 },
+            BudgetItem { category: "marketing".to_string(), allocated: 300, disbursed: 0 },
+        ];
+        grants.configure_budget(GOVERNANCE, gid, updated_budget).unwrap();
+
+        // Now milestone 2 under "marketing" succeeds
+        grants.confirm_milestone_with_category(GOVERNANCE, gid, 2, "marketing").unwrap();
+        assert_eq!(grants.get_budget_variance(gid, "marketing"), Ok((300, 300, 0)));
+
+        // Integrity verification passes
+        assert!(grants.verify_integrity().is_ok());
+
+        // Full claimable claimed
+        assert_eq!(grants.claim(RECIPIENT, gid), Ok(1_000));
+        assert!(grants.verify_integrity().is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -1938,6 +2643,131 @@ mod soroban_grants_tests {
         contract.confirm_milestone(10, gid, 0).unwrap();
         assert_eq!(contract.claim(20, gid), Ok(40));
         assert!(contract.verify_integrity().is_ok());
+    }
+
+    #[test]
+    fn test_soroban_budget_line_items_and_variance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RefractGrantsContract);
+        let client = RefractGrantsContractClient::new(&env, &contract_id);
+
+        let gov = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.initialize(&gov);
+
+        let dev_sym = Symbol::new(&env, "dev");
+        let audit_sym = Symbol::new(&env, "audit");
+        let infra_sym = Symbol::new(&env, "infra");
+        let bogus_sym = Symbol::new(&env, "bogus");
+
+        let mut budget = Vec::new(&env);
+        budget.push_back(ContractBudgetItem {
+            category: dev_sym.clone(),
+            allocated: 500,
+            disbursed: 0,
+        });
+        budget.push_back(ContractBudgetItem {
+            category: audit_sym.clone(),
+            allocated: 300,
+            disbursed: 0,
+        });
+        budget.push_back(ContractBudgetItem {
+            category: infra_sym.clone(),
+            allocated: 200,
+            disbursed: 0,
+        });
+
+        let milestones = Vec::from_array(&env, [300i128, 400i128, 300i128]);
+
+        // 1. Budget sum mismatch error
+        let mut bad_budget = Vec::new(&env);
+        bad_budget.push_back(ContractBudgetItem {
+            category: dev_sym.clone(),
+            allocated: 400,
+            disbursed: 0,
+        });
+        let mismatch_err = client.try_create_grant_with_budget(
+            &gov,
+            &recipient,
+            &1000,
+            &milestones,
+            &bad_budget,
+        );
+        assert_eq!(mismatch_err, Err(Ok(GrantsContractError::MilestoneSumMismatch)));
+
+        // 2. Successful creation
+        let gid = client.create_grant_with_budget(
+            &gov,
+            &recipient,
+            &1000,
+            &milestones,
+            &budget,
+        );
+        assert_eq!(gid, 0);
+
+        // Check variance initially
+        let (alloc_d, disb_d, rem_d) = client.get_budget_variance(&gid, &dev_sym);
+        assert_eq!((alloc_d, disb_d, rem_d), (500, 0, 500));
+
+        let (alloc_a, disb_a, rem_a) = client.get_budget_variance(&gid, &audit_sym);
+        assert_eq!((alloc_a, disb_a, rem_a), (300, 0, 300));
+
+        // CategoryNotFound on querying unknown category
+        let not_found_err = client.try_get_budget_variance(&gid, &bogus_sym);
+        assert_eq!(not_found_err, Err(Ok(GrantsContractError::CategoryNotFound)));
+
+        // 3. Confirm milestone 0 (300) under category "dev"
+        client.confirm_milestone_with_category(&gov, &gid, &0, &dev_sym);
+        let (alloc_d2, disb_d2, rem_d2) = client.get_budget_variance(&gid, &dev_sym);
+        assert_eq!((alloc_d2, disb_d2, rem_d2), (500, 300, 200));
+
+        // 4. Confirm milestone 1 (400) under category "bogus" -> CategoryNotFound
+        let cat_not_found = client.try_confirm_milestone_with_category(&gov, &gid, &1, &bogus_sym);
+        assert_eq!(cat_not_found, Err(Ok(GrantsContractError::CategoryNotFound)));
+
+        // 5. Confirm milestone 1 (400) under category "dev" (remaining only 200) -> BudgetCategoryExceeded
+        let overspend_err = client.try_confirm_milestone_with_category(&gov, &gid, &1, &dev_sym);
+        assert_eq!(overspend_err, Err(Ok(GrantsContractError::BudgetCategoryExceeded)));
+
+        // 6. Confirm milestone 1 (400) under category "audit" (allocated only 300) -> BudgetCategoryExceeded
+        let audit_overspend = client.try_confirm_milestone_with_category(&gov, &gid, &1, &audit_sym);
+        assert_eq!(audit_overspend, Err(Ok(GrantsContractError::BudgetCategoryExceeded)));
+
+        // 7. Reconfigure budget with governance
+        let mut reconfigured = Vec::new(&env);
+        reconfigured.push_back(ContractBudgetItem {
+            category: dev_sym.clone(),
+            allocated: 300,
+            disbursed: 300,
+        });
+        reconfigured.push_back(ContractBudgetItem {
+            category: audit_sym.clone(),
+            allocated: 500,
+            disbursed: 0,
+        });
+        reconfigured.push_back(ContractBudgetItem {
+            category: infra_sym.clone(),
+            allocated: 200,
+            disbursed: 0,
+        });
+        client.configure_budget(&gov, &gid, &reconfigured);
+
+        // Milestone 1 (400) under "audit" now succeeds
+        client.confirm_milestone_with_category(&gov, &gid, &1, &audit_sym);
+        let (alloc_a2, disb_a2, rem_a2) = client.get_budget_variance(&gid, &audit_sym);
+        assert_eq!((alloc_a2, disb_a2, rem_a2), (500, 400, 100));
+
+        // Check get_budget_items
+        let stored_items = client.get_budget_items(&gid);
+        assert_eq!(stored_items.len(), 3);
+
+        // Verify integrity and on_restore
+        assert!(client.verify_integrity());
+        let (next_g, next_p) = client.on_restore();
+        assert_eq!((next_g, next_p), (1, 0));
     }
 }
 
