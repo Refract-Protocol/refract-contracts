@@ -211,6 +211,30 @@ fn generate_treasury_snapshot() -> String {
                     .get::<_, u64>(&k)
                     .unwrap()
                     .into_val(&env),
+                TreasuryDataKey::ChallengeThresholdAmount => env
+                    .storage()
+                    .instance()
+                    .get::<_, i128>(&k)
+                    .unwrap_or(0)
+                    .into_val(&env),
+                TreasuryDataKey::ChallengeWindowSeconds => env
+                    .storage()
+                    .instance()
+                    .get::<_, u64>(&k)
+                    .unwrap_or(0)
+                    .into_val(&env),
+                TreasuryDataKey::NextWithdrawalId => env
+                    .storage()
+                    .instance()
+                    .get::<_, u64>(&k)
+                    .unwrap_or(1)
+                    .into_val(&env),
+                TreasuryDataKey::Withdrawal(_id) => env
+                    .storage()
+                    .persistent()
+                    .get::<_, refract_treasury::WithdrawalRecord>(&k)
+                    .expect("withdrawal")
+                    .into_val(&env),
             };
             out.push_str(&format!("storage[{}].val = {:?}\n", i, v_val));
             out.push_str(&format!(

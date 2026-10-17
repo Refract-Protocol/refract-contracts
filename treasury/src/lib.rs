@@ -7,8 +7,43 @@ pub use normalization::{
 };
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    String as SorobanString, Symbol,
 };
+
+/// Status of a queued or executed withdrawal.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum WithdrawalStatus {
+    Pending = 0,
+    Challenged = 1,
+    Approved = 2,
+    Executed = 3,
+    Cancelled = 4,
+}
+
+/// A withdrawal proposal/record tracked in treasury storage.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WithdrawalRecord {
+    pub id: u64,
+    pub token: Address,
+    pub amount: i128,
+    pub to: Address,
+    pub proposed_at: u64,
+    pub status: WithdrawalStatus,
+    pub challenger: Option<Address>,
+    pub challenge_reason: Option<SorobanString>,
+}
+
+/// Configuration for high-value withdrawal challenge period.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChallengeConfig {
+    pub challenge_threshold_amount: i128,
+    pub challenge_window_seconds: u64,
+}
 
 /// Storage keys for the treasury contract.
 #[contracttype]
@@ -20,6 +55,10 @@ pub enum DataKey {
     ReserveTarget(Address),    // token -> target ratio / amount
     LastRelease(Address),      // token -> timestamp
     TimelockContract,          // timelock address authorized to release reserve
+    ChallengeThresholdAmount,  // i128
+    ChallengeWindowSeconds,    // u64
+    NextWithdrawalId,          // u64
+    Withdrawal(u64),           // u64 -> WithdrawalRecord
 }
 
 #[contracterror]
@@ -37,6 +76,12 @@ pub enum TreasuryError {
     NormalizationError = 9,
     StateArchived = 10,
     InconsistentState = 11,
+    InvalidChallengeWindow = 12,
+    WithdrawalNotFound = 13,
+    InvalidWithdrawalStatus = 14,
+    WithdrawalChallenged = 15,
+    ChallengePeriodActive = 16,
+    ChallengePeriodExpired = 17,
 }
 
 /// `RefractTreasury` is a token-custody vault with a segregated emergency reserve pool
@@ -57,10 +102,8 @@ impl RefractTreasury {
             return Err(TreasuryError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.events().publish(
-            (symbol_short!("treasury"), symbol_short!("init")),
-            (admin,),
-        );
+        env.events()
+            .publish((symbol_short!("treasury"), symbol_short!("init")), (admin,));
         Ok(())
     }
 
@@ -83,7 +126,10 @@ impl RefractTreasury {
         Self::assert_live_and_consistent(&env, &token).map(|_| true)
     }
 
-    fn assert_live_and_consistent(env: &Env, token: &Address) -> Result<(i128, i128), TreasuryError> {
+    fn assert_live_and_consistent(
+        env: &Env,
+        token: &Address,
+    ) -> Result<(i128, i128), TreasuryError> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(TreasuryError::StateArchived);
         }
@@ -245,9 +291,10 @@ impl RefractTreasury {
         env.storage()
             .instance()
             .set(&DataKey::ReserveBalance(token.clone()), &new_reserve);
-        env.storage()
-            .instance()
-            .set(&DataKey::LastRelease(token.clone()), &env.ledger().timestamp());
+        env.storage().instance().set(
+            &DataKey::LastRelease(token.clone()),
+            &env.ledger().timestamp(),
+        );
 
         env.events().publish(
             (symbol_short!("rel_res"), purpose_tag),
@@ -301,7 +348,8 @@ impl RefractTreasury {
             return Err(TreasuryError::InvalidAmount);
         }
 
-        let total_balance = token::Client::new(&env, &token).balance(&env.current_contract_address());
+        let total_balance =
+            token::Client::new(&env, &token).balance(&env.current_contract_address());
         let reserve: i128 = env
             .storage()
             .instance()
@@ -329,12 +377,20 @@ impl RefractTreasury {
     }
 
     /// Convert token units to protocol units (1e7, rounding Ceil for inflow).
-    pub fn to_protocol_units(_env: Env, amount: i128, token_decimals: u32) -> Result<i128, NormalizationError> {
+    pub fn to_protocol_units(
+        _env: Env,
+        amount: i128,
+        token_decimals: u32,
+    ) -> Result<i128, NormalizationError> {
         normalization::to_protocol_units(amount, token_decimals)
     }
 
     /// Convert protocol units (1e7) to token units (rounding Floor for outflow/payout).
-    pub fn to_token_units(_env: Env, protocol_amount: i128, token_decimals: u32) -> Result<i128, NormalizationError> {
+    pub fn to_token_units(
+        _env: Env,
+        protocol_amount: i128,
+        token_decimals: u32,
+    ) -> Result<i128, NormalizationError> {
         normalization::to_token_units(protocol_amount, token_decimals)
     }
 
@@ -372,6 +428,303 @@ impl RefractTreasury {
         Self::release_reserve(env, caller, token, token_amount, to, purpose_tag)?;
         Ok(token_amount)
     }
+    /// Configure high-value withdrawal challenge threshold and window duration.
+    /// Only callable by admin/governance.
+    pub fn configure_challenge_period(
+        env: Env,
+        caller: Address,
+        challenge_threshold_amount: i128,
+        challenge_window_seconds: u64,
+    ) -> Result<(), TreasuryError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TreasuryError::NotInitialized)?;
+        if caller != admin {
+            return Err(TreasuryError::Unauthorized);
+        }
+        if challenge_threshold_amount <= 0 || challenge_window_seconds == 0 {
+            return Err(TreasuryError::InvalidChallengeWindow);
+        }
+
+        env.storage().instance().set(
+            &DataKey::ChallengeThresholdAmount,
+            &challenge_threshold_amount,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::ChallengeWindowSeconds, &challenge_window_seconds);
+
+        env.events().publish(
+            (Symbol::new(&env, "ChallengeConfigured"), admin),
+            (challenge_threshold_amount, challenge_window_seconds),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the current challenge period configuration:
+    /// (challenge_threshold_amount, challenge_window_seconds).
+    pub fn get_challenge_config(env: Env) -> (i128, u64) {
+        let threshold = env
+            .storage()
+            .instance()
+            .get(&DataKey::ChallengeThresholdAmount)
+            .unwrap_or(0);
+        let window = env
+            .storage()
+            .instance()
+            .get(&DataKey::ChallengeWindowSeconds)
+            .unwrap_or(0);
+        (threshold, window)
+    }
+
+    /// Propose a withdrawal from operating balance. Only callable by admin.
+    /// If amount < challenge_threshold_amount (or threshold not configured), fast-path can still
+    /// be proposed and immediately executed via execute_withdrawal, or executed directly via withdraw.
+    /// Returns the unique withdrawal_id.
+    pub fn propose_withdrawal(
+        env: Env,
+        caller: Address,
+        token: Address,
+        amount: i128,
+        to: Address,
+    ) -> Result<u64, TreasuryError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TreasuryError::NotInitialized)?;
+        if caller != admin {
+            return Err(TreasuryError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(TreasuryError::InvalidAmount);
+        }
+
+        let total_balance =
+            token::Client::new(&env, &token).balance(&env.current_contract_address());
+        let reserve: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReserveBalance(token.clone()))
+            .unwrap_or(0);
+        let operating = total_balance - reserve;
+        if amount > operating {
+            return Err(TreasuryError::InsufficientBalance);
+        }
+
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextWithdrawalId)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextWithdrawalId, &(next_id + 1));
+
+        let now = env.ledger().timestamp();
+        let record = WithdrawalRecord {
+            id: next_id,
+            token: token.clone(),
+            amount,
+            to: to.clone(),
+            proposed_at: now,
+            status: WithdrawalStatus::Pending,
+            challenger: None,
+            challenge_reason: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Withdrawal(next_id), &record);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("prop_wdr")),
+            (next_id, token, amount, to),
+        );
+
+        Ok(next_id)
+    }
+
+    /// Retrieve a withdrawal record by ID.
+    pub fn get_withdrawal(env: Env, withdrawal_id: u64) -> Result<WithdrawalRecord, TreasuryError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Withdrawal(withdrawal_id))
+            .ok_or(TreasuryError::WithdrawalNotFound)
+    }
+
+    /// Raise a challenge against a proposed withdrawal.
+    /// Can be called by any stakeholder within the challenge window.
+    /// Pauses execution and transitions the withdrawal to `Challenged`.
+    pub fn raise_challenge(
+        env: Env,
+        challenger: Address,
+        withdrawal_id: u64,
+        reason: SorobanString,
+    ) -> Result<(), TreasuryError> {
+        challenger.require_auth();
+
+        let mut withdrawal = Self::get_withdrawal(env.clone(), withdrawal_id)?;
+
+        if withdrawal.status != WithdrawalStatus::Pending {
+            return Err(TreasuryError::InvalidWithdrawalStatus);
+        }
+
+        let (threshold, window) = Self::get_challenge_config(env.clone());
+        if threshold > 0 && withdrawal.amount >= threshold {
+            let now = env.ledger().timestamp();
+            let deadline = withdrawal
+                .proposed_at
+                .checked_add(window)
+                .ok_or(TreasuryError::InconsistentState)?;
+            if now >= deadline {
+                return Err(TreasuryError::ChallengePeriodExpired);
+            }
+        }
+
+        withdrawal.status = WithdrawalStatus::Challenged;
+        withdrawal.challenger = Some(challenger.clone());
+        withdrawal.challenge_reason = Some(reason.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Withdrawal(withdrawal_id), &withdrawal);
+
+        env.events().publish(
+            (Symbol::new(&env, "ChallengeRaised"), withdrawal_id),
+            (challenger, withdrawal.amount, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Resolve an active challenge on a withdrawal.
+    /// Strictly governance/admin only.
+    /// If `approved` is true, status becomes `Approved` (clearing the challenge block).
+    /// If `approved` is false, status becomes `Cancelled`.
+    pub fn resolve_challenge(
+        env: Env,
+        governance: Address,
+        withdrawal_id: u64,
+        approved: bool,
+    ) -> Result<(), TreasuryError> {
+        governance.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TreasuryError::NotInitialized)?;
+        if governance != admin {
+            return Err(TreasuryError::Unauthorized);
+        }
+
+        let mut withdrawal = Self::get_withdrawal(env.clone(), withdrawal_id)?;
+
+        if withdrawal.status != WithdrawalStatus::Challenged {
+            return Err(TreasuryError::InvalidWithdrawalStatus);
+        }
+
+        if approved {
+            withdrawal.status = WithdrawalStatus::Approved;
+        } else {
+            withdrawal.status = WithdrawalStatus::Cancelled;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Withdrawal(withdrawal_id), &withdrawal);
+
+        env.events().publish(
+            (Symbol::new(&env, "ChallengeResolved"), withdrawal_id),
+            (governance, approved),
+        );
+
+        Ok(())
+    }
+
+    /// Execute a withdrawal after validations.
+    /// Checks:
+    /// - If `amount >= challenge_threshold_amount`, withdrawal is permitted ONLY after
+    ///   `challenge_window_seconds` has elapsed from `proposed_at`, unless already explicitly
+    ///   `Approved` by governance resolution.
+    /// - Fails with `WithdrawalChallenged` if currently in `Challenged` status.
+    /// - Fails with `ChallengePeriodActive` if within challenge window and not approved.
+    pub fn execute_withdrawal(
+        env: Env,
+        caller: Address,
+        withdrawal_id: u64,
+    ) -> Result<(), TreasuryError> {
+        caller.require_auth();
+
+        let mut withdrawal = Self::get_withdrawal(env.clone(), withdrawal_id)?;
+
+        match withdrawal.status {
+            WithdrawalStatus::Pending => {
+                let (threshold, window) = Self::get_challenge_config(env.clone());
+                if threshold > 0 && withdrawal.amount >= threshold {
+                    let now = env.ledger().timestamp();
+                    let deadline = withdrawal
+                        .proposed_at
+                        .checked_add(window)
+                        .ok_or(TreasuryError::InconsistentState)?;
+                    if now < deadline {
+                        return Err(TreasuryError::ChallengePeriodActive);
+                    }
+                }
+            }
+            WithdrawalStatus::Approved => {
+                // Approved by governance resolution after a challenge; ready to execute
+            }
+            WithdrawalStatus::Challenged => {
+                return Err(TreasuryError::WithdrawalChallenged);
+            }
+            WithdrawalStatus::Executed | WithdrawalStatus::Cancelled => {
+                return Err(TreasuryError::InvalidWithdrawalStatus);
+            }
+        }
+
+        // Perform the token transfer and update operating balance
+        let token = withdrawal.token.clone();
+        let amount = withdrawal.amount;
+        let to = withdrawal.to.clone();
+
+        let total_balance =
+            token::Client::new(&env, &token).balance(&env.current_contract_address());
+        let reserve: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReserveBalance(token.clone()))
+            .unwrap_or(0);
+        let operating = total_balance - reserve;
+        if amount > operating {
+            return Err(TreasuryError::InsufficientBalance);
+        }
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &to, &amount);
+
+        let new_operating = operating - amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::OperatingBalance(token.clone()), &new_operating);
+
+        withdrawal.status = WithdrawalStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Withdrawal(withdrawal_id), &withdrawal);
+
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("withdraw")),
+            (caller, token, amount, to),
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -394,7 +747,9 @@ mod test {
         assert_eq!(client.admin(), admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
@@ -496,7 +851,9 @@ mod test {
         client.initialize(&admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
@@ -534,7 +891,9 @@ mod test {
         client.initialize(&admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
@@ -577,7 +936,9 @@ mod test {
         assert_eq!(client.timelock(), timelock);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         let depositor = Address::generate(&env);
@@ -589,25 +950,13 @@ mod test {
 
         // Stranger fails
         assert_eq!(
-            client.try_release_reserve(
-                &stranger,
-                &token_id,
-                &100,
-                &to,
-                &symbol_short!("payout")
-            ),
+            client.try_release_reserve(&stranger, &token_id, &100, &to, &symbol_short!("payout")),
             Err(Ok(TreasuryError::UnauthorizedTimelock))
         );
 
         // Admin also fails because only timelock can release reserve
         assert_eq!(
-            client.try_release_reserve(
-                &admin,
-                &token_id,
-                &100,
-                &to,
-                &symbol_short!("payout")
-            ),
+            client.try_release_reserve(&admin, &token_id, &100, &to, &symbol_short!("payout")),
             Err(Ok(TreasuryError::UnauthorizedTimelock))
         );
     }
@@ -626,7 +975,9 @@ mod test {
         client.set_timelock(&admin, &timelock);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
@@ -639,13 +990,7 @@ mod test {
         env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
 
         let to = Address::generate(&env);
-        client.release_reserve(
-            &timelock,
-            &token_id,
-            &400,
-            &to,
-            &symbol_short!("disaster"),
-        );
+        client.release_reserve(&timelock, &token_id, &400, &to, &symbol_short!("disaster"));
 
         assert_eq!(token_client.balance(&to), 400);
         assert_eq!(token_client.balance(&contract_id), 600);
@@ -657,13 +1002,7 @@ mod test {
 
         // Cannot release more than remaining reserve
         assert_eq!(
-            client.try_release_reserve(
-                &timelock,
-                &token_id,
-                &700,
-                &to,
-                &symbol_short!("excess")
-            ),
+            client.try_release_reserve(&timelock, &token_id, &700, &to, &symbol_short!("excess")),
             Err(Ok(TreasuryError::InsufficientReserve))
         );
     }
@@ -720,7 +1059,9 @@ mod test {
         client.set_timelock(&admin, &timelock);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
         let token_client = token::Client::new(&env, &token_id);
 
@@ -768,7 +1109,9 @@ mod test {
         client.initialize(&admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
         // Deposit reserve and operating funds
@@ -785,11 +1128,20 @@ mod test {
 
         // Simulate state inconsistency where tracked operating balance exceeds physical tokens
         env.as_contract(&contract_id, || {
-            env.storage().instance().set(&DataKey::OperatingBalance(token_id.clone()), &200_000_000i128);
+            env.storage().instance().set(
+                &DataKey::OperatingBalance(token_id.clone()),
+                &200_000_000i128,
+            );
         });
 
-        assert_eq!(client.try_on_restore(&token_id), Err(Ok(TreasuryError::InconsistentState)));
-        assert_eq!(client.try_verify_integrity(&token_id), Err(Ok(TreasuryError::InconsistentState)));
+        assert_eq!(
+            client.try_on_restore(&token_id),
+            Err(Ok(TreasuryError::InconsistentState))
+        );
+        assert_eq!(
+            client.try_verify_integrity(&token_id),
+            Err(Ok(TreasuryError::InconsistentState))
+        );
     }
 
     #[test]
@@ -800,9 +1152,178 @@ mod test {
         let client = RefractTreasuryClient::new(&env, &contract_id);
 
         let token = Address::generate(&env);
-        assert_eq!(client.try_on_restore(&token), Err(Ok(TreasuryError::StateArchived)));
-        assert_eq!(client.try_verify_integrity(&token), Err(Ok(TreasuryError::StateArchived)));
+        assert_eq!(
+            client.try_on_restore(&token),
+            Err(Ok(TreasuryError::StateArchived))
+        );
+        assert_eq!(
+            client.try_verify_integrity(&token),
+            Err(Ok(TreasuryError::StateArchived))
+        );
         assert_eq!(client.try_admin(), Err(Ok(TreasuryError::NotInitialized)));
     }
-}
 
+    #[test]
+    fn test_challenge_period_configuration_and_permissions() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Unauthorized configure
+        let unauth = client.try_configure_challenge_period(&stranger, &1_000_000, &86400);
+        assert_eq!(unauth, Err(Ok(TreasuryError::Unauthorized)));
+
+        // Invalid parameters
+        let invalid_thresh = client.try_configure_challenge_period(&admin, &0, &86400);
+        assert_eq!(
+            invalid_thresh,
+            Err(Ok(TreasuryError::InvalidChallengeWindow))
+        );
+
+        let invalid_window = client.try_configure_challenge_period(&admin, &1_000_000, &0);
+        assert_eq!(
+            invalid_window,
+            Err(Ok(TreasuryError::InvalidChallengeWindow))
+        );
+
+        // Valid configuration
+        client.configure_challenge_period(&admin, &50_000, &3600);
+        let (thresh, win) = client.get_challenge_config();
+        assert_eq!(thresh, 50_000);
+        assert_eq!(win, 3600);
+    }
+
+    #[test]
+    fn test_high_value_withdrawal_challenge_and_resolution_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Configure challenge period: threshold = 10_000, window = 100 seconds
+        client.configure_challenge_period(&admin, &10_000, &100);
+
+        // Mint operating funds to treasury contract
+        sac.mint(&contract_id, &100_000);
+
+        // 1. Below threshold (fast path proposal): 5_000 < 10_000
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let low_val_id = client.propose_withdrawal(&admin, &token_id, &5_000, &recipient);
+        assert_eq!(low_val_id, 1);
+
+        // Immediately executable even at timestamp 1000 without waiting for window
+        client.execute_withdrawal(&admin, &low_val_id);
+        assert_eq!(token_client.balance(&recipient), 5_000);
+
+        let low_rec = client.get_withdrawal(&low_val_id);
+        assert_eq!(low_rec.status, WithdrawalStatus::Executed);
+
+        // Re-executing already executed fails
+        assert_eq!(
+            client.try_execute_withdrawal(&admin, &low_val_id),
+            Err(Ok(TreasuryError::InvalidWithdrawalStatus))
+        );
+
+        // 2. High value withdrawal: 20_000 >= 10_000
+        env.ledger().with_mut(|l| l.timestamp = 2000);
+        let high_val_id = client.propose_withdrawal(&admin, &token_id, &20_000, &recipient);
+        assert_eq!(high_val_id, 2);
+
+        // Attempting to execute before challenge window (timestamp 2050 < 2000 + 100) fails
+        env.ledger().with_mut(|l| l.timestamp = 2050);
+        assert_eq!(
+            client.try_execute_withdrawal(&admin, &high_val_id),
+            Err(Ok(TreasuryError::ChallengePeriodActive))
+        );
+
+        // Stakeholder raises challenge during the window
+        let reason = SorobanString::from_str(&env, "Suspicious destination address");
+        client.raise_challenge(&challenger, &high_val_id, &reason);
+
+        let challenged_rec = client.get_withdrawal(&high_val_id);
+        assert_eq!(challenged_rec.status, WithdrawalStatus::Challenged);
+        assert_eq!(challenged_rec.challenger, Some(challenger.clone()));
+        assert_eq!(challenged_rec.challenge_reason, Some(reason));
+
+        // Attempt to execute even after window has passed (e.g. timestamp 2500) fails because it is Challenged
+        env.ledger().with_mut(|l| l.timestamp = 2500);
+        assert_eq!(
+            client.try_execute_withdrawal(&admin, &high_val_id),
+            Err(Ok(TreasuryError::WithdrawalChallenged))
+        );
+
+        // Unauthorized caller cannot resolve challenge
+        assert_eq!(
+            client.try_resolve_challenge(&stranger, &high_val_id, &true),
+            Err(Ok(TreasuryError::Unauthorized))
+        );
+
+        // Governance resolves challenge: approved = true
+        client.resolve_challenge(&admin, &high_val_id, &true);
+        let resolved_rec = client.get_withdrawal(&high_val_id);
+        assert_eq!(resolved_rec.status, WithdrawalStatus::Approved);
+
+        // Now execution succeeds
+        client.execute_withdrawal(&admin, &high_val_id);
+        assert_eq!(token_client.balance(&recipient), 25_000);
+
+        let executed_rec = client.get_withdrawal(&high_val_id);
+        assert_eq!(executed_rec.status, WithdrawalStatus::Executed);
+
+        // 3. High value withdrawal cancelled by governance
+        let high_val_id3 = client.propose_withdrawal(&admin, &token_id, &30_000, &recipient);
+        assert_eq!(high_val_id3, 3);
+
+        let cancel_reason = SorobanString::from_str(&env, "Fraudulent transaction reported");
+        client.raise_challenge(&challenger, &high_val_id3, &cancel_reason);
+
+        // Governance cancels withdrawal: approved = false
+        client.resolve_challenge(&admin, &high_val_id3, &false);
+        let cancelled_rec = client.get_withdrawal(&high_val_id3);
+        assert_eq!(cancelled_rec.status, WithdrawalStatus::Cancelled);
+
+        // Execution of cancelled withdrawal fails
+        assert_eq!(
+            client.try_execute_withdrawal(&admin, &high_val_id3),
+            Err(Ok(TreasuryError::InvalidWithdrawalStatus))
+        );
+
+        // 4. Challenge after window has expired is rejected
+        env.ledger().with_mut(|l| l.timestamp = 3000);
+        let high_val_id4 = client.propose_withdrawal(&admin, &token_id, &15_000, &recipient);
+        assert_eq!(high_val_id4, 4);
+
+        // Advance past window (timestamp 3150 >= 3000 + 100)
+        env.ledger().with_mut(|l| l.timestamp = 3150);
+
+        // Raising challenge now fails with ChallengePeriodExpired
+        let late_reason = SorobanString::from_str(&env, "Too late challenge");
+        assert_eq!(
+            client.try_raise_challenge(&challenger, &high_val_id4, &late_reason),
+            Err(Ok(TreasuryError::ChallengePeriodExpired))
+        );
+
+        // Execution succeeds because window passed with 0 challenges
+        client.execute_withdrawal(&admin, &high_val_id4);
+        assert_eq!(token_client.balance(&recipient), 40_000);
+    }
+}
