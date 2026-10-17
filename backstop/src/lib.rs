@@ -1,5 +1,7 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
+pub use refract_interfaces::RefractError;
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
 /// Basis-point denominator used for premium-share configuration.
@@ -16,6 +18,20 @@ pub enum BackstopError {
     InsufficientShares = 5,
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
+}
+
+impl From<BackstopError> for RefractError {
+    fn from(err: BackstopError) -> Self {
+        match err {
+            BackstopError::AlreadyInitialized => RefractError::AlreadyInitialized,
+            BackstopError::NotInitialized => RefractError::NotInitialized,
+            BackstopError::Unauthorized => RefractError::Unauthorized,
+            BackstopError::InvalidAmount => RefractError::InvalidAmount,
+            BackstopError::InsufficientShares => RefractError::InsufficientShares,
+            BackstopError::InsufficientCapital => RefractError::InsufficientFunds,
+            BackstopError::InvalidPremiumShare => RefractError::InvalidParameter,
+        }
+    }
 }
 
 #[contracttype]
@@ -81,8 +97,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
         if shares <= 0 {
@@ -112,8 +128,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -149,7 +165,7 @@ impl RefractBackstop {
     /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::read_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -157,7 +173,7 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
 
-        let mut state = Self::state(&env)?;
+        let mut state = Self::read_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
         } else {
@@ -186,8 +202,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::read_config(&env)?;
+        let mut state = Self::read_state(&env)?;
 
         let cut = amount * config.premium_share_bps / BPS_DENOM;
         state.premium_income += cut;
@@ -205,11 +221,11 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::read_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::read_config(&env)
     }
 
     /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
@@ -232,17 +248,34 @@ impl RefractBackstop {
         }
     }
 
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn read_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn read_state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn backstop_error_maps_to_unified_refract_error() {
+        assert_eq!(
+            RefractError::from(BackstopError::Unauthorized),
+            RefractError::Unauthorized
+        );
+        assert_eq!(
+            RefractError::from(BackstopError::InsufficientCapital),
+            RefractError::InsufficientFunds
+        );
     }
 }

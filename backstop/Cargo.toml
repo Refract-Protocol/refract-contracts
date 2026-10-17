@@ -9,6 +9,7 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+refract-interfaces = { path = "../interfaces" }
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]

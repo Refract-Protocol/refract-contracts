@@ -22,3 +22,7 @@ branches = 93.75
 lines = 87.43
 branches = 83.33
 
+[interfaces]
+lines = 95.00
+branches = 90.00
+

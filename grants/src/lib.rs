@@ -23,6 +23,9 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
+
+pub use refract_interfaces::RefractError;
 use std::collections::BTreeMap;
 
 /// Identifier for a grant.
@@ -58,6 +61,23 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+}
+
+impl From<GrantsError> for RefractError {
+    fn from(err: GrantsError) -> Self {
+        match err {
+            GrantsError::Unauthorized | GrantsError::NotRecipient => RefractError::Unauthorized,
+            GrantsError::GrantNotFound => RefractError::NotFound,
+            GrantsError::NoMilestones
+            | GrantsError::MilestoneSumMismatch
+            | GrantsError::InvalidMilestoneIndex => RefractError::InvalidParameter,
+            GrantsError::InvalidMilestoneAmount
+            | GrantsError::InvalidTotalAmount
+            | GrantsError::NothingToClaim => RefractError::InvalidAmount,
+            GrantsError::MilestoneAlreadyConfirmed => RefractError::DuplicateEntry,
+            GrantsError::MilestoneOutOfOrder => RefractError::OutOfOrder,
+        }
+    }
 }
 
 /// A single milestone within a grant.
@@ -146,7 +166,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -280,7 +302,10 @@ mod tests {
 
         // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));

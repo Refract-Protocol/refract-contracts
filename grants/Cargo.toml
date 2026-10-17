@@ -8,6 +8,7 @@ name = "refract_grants"
 path = "src/lib.rs"
 
 [dependencies]
+refract-interfaces = { path = "../interfaces" }
 soroban-sdk = "21.0.0"
 
 [dev-dependencies]

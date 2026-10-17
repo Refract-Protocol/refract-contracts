@@ -1,6 +1,10 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
+pub use refract_interfaces::RefractError;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env,
+};
 
 /// Storage keys for the bounty escrow.
 #[contracttype]
@@ -40,6 +44,19 @@ pub enum BountyError {
     DuplicateReport = 6,
 }
 
+impl From<BountyError> for RefractError {
+    fn from(err: BountyError) -> Self {
+        match err {
+            BountyError::AlreadyInitialized => RefractError::AlreadyInitialized,
+            BountyError::NotInitialized => RefractError::NotInitialized,
+            BountyError::InvalidAmount => RefractError::InvalidAmount,
+            BountyError::InsufficientBalance => RefractError::InsufficientFunds,
+            BountyError::Unauthorized => RefractError::Unauthorized,
+            BountyError::DuplicateReport => RefractError::DuplicateEntry,
+        }
+    }
+}
+
 /// Governance-controlled bug bounty escrow.
 ///
 /// The reward pool can be topped up by anyone (including the treasury), but
@@ -57,7 +74,9 @@ impl RefractBountyEscrow {
         if env.storage().instance().has(&DataKey::Governance) {
             return Err(BountyError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Governance, &governance);
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Balance, &0i128);
         Ok(())
@@ -69,10 +88,12 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        let token = Self::token(&env)?;
+        let token = Self::read_token(&env)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
-        let balance = Self::balance(&env)?;
-        env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+        let balance = Self::read_balance(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &(balance + amount));
         Ok(())
     }
 
@@ -88,24 +109,34 @@ impl RefractBountyEscrow {
         report_hash: BytesN<32>,
     ) -> Result<(), BountyError> {
         caller.require_auth();
-        let governance = Self::governance(&env)?;
+        let governance = Self::read_governance(&env)?;
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Award(report_hash.clone()))
+        {
             return Err(BountyError::DuplicateReport);
         }
-        let balance = Self::balance(&env)?;
+        let balance = Self::read_balance(&env)?;
         if amount > balance {
             return Err(BountyError::InsufficientBalance);
         }
 
-        let token = Self::token(&env)?;
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
-        env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+        let token = Self::read_token(&env)?;
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &researcher,
+            &amount,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &(balance - amount));
 
         let record = AwardRecord {
             researcher,
@@ -113,18 +144,20 @@ impl RefractBountyEscrow {
             report_hash: report_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&DataKey::Award(report_hash), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Award(report_hash), &record);
         Ok(())
     }
 
     /// Current funds held in escrow.
     pub fn balance(env: Env) -> Result<i128, BountyError> {
-        Self::balance(&env)
+        Self::read_balance(&env)
     }
 
     /// The governance/timelock address authorized to award payouts.
     pub fn governance(env: Env) -> Result<Address, BountyError> {
-        Self::governance(&env)
+        Self::read_governance(&env)
     }
 
     /// Immutable record of a rewarded disclosure, if any.
@@ -132,21 +165,21 @@ impl RefractBountyEscrow {
         env.storage().persistent().get(&DataKey::Award(report_hash))
     }
 
-    fn governance(env: &Env) -> Result<Address, BountyError> {
+    fn read_governance(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Governance)
             .ok_or(BountyError::NotInitialized)
     }
 
-    fn token(env: &Env) -> Result<Address, BountyError> {
+    fn read_token(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Token)
             .ok_or(BountyError::NotInitialized)
     }
 
-    fn balance(env: &Env) -> Result<i128, BountyError> {
+    fn read_balance(env: &Env) -> Result<i128, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Balance)
@@ -155,4 +188,22 @@ impl RefractBountyEscrow {
 }
 
 #[cfg(test)]
-mod test;
+mod test {
+    use super::*;
+
+    #[test]
+    fn bounty_error_maps_to_unified_refract_error_discriminants() {
+        assert_eq!(
+            RefractError::from(BountyError::Unauthorized).code(),
+            RefractError::Unauthorized.code()
+        );
+        assert_eq!(
+            RefractError::from(BountyError::InsufficientBalance).code(),
+            RefractError::InsufficientFunds.code()
+        );
+        assert_eq!(
+            RefractError::from(BountyError::DuplicateReport).code(),
+            RefractError::DuplicateEntry.code()
+        );
+    }
+}

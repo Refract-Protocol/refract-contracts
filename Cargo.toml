@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["pool", "policy", "oracle", "incident_response", "vetoken", "timelock", "multisig", "governance"]
+members = ["interfaces", "pool", "policy", "oracle", "incident_response", "vetoken", "timelock", "multisig", "governance", "backstop", "bounty", "grants", "treasury"]
 
 [workspace.dependencies]
 soroban-sdk = { version = "21.0.0", features = ["alloc"] }
+refract-interfaces = { path = "interfaces" }
 proptest = "1.5.0"
 
 [profile.release]

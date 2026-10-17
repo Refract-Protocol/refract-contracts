@@ -10,6 +10,7 @@ name = "refract_bounty"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+refract-interfaces = { path = "../interfaces" }
 soroban-sdk = { version = "21.0.0" }
 
 [dev-dependencies]

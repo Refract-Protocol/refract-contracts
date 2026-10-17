@@ -1,0 +1,16 @@
+[package]
+name = "refract-interfaces"
+version = "0.1.0"
+edition = "2021"
+description = "Shared typed cross-contract client interfaces, value types, and unified error enum for Refract Protocol"
+license = "MIT"
+
+[lib]
+name = "refract_interfaces"
+path = "src/lib.rs"
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
