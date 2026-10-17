@@ -2,9 +2,7 @@
 
 use refract_backstop::{RefractBackstop, RefractBackstopClient};
 use refract_bounty::{DataKey as BountyDataKey, RefractBountyEscrow, RefractBountyEscrowClient};
-use refract_grants::{
-    GrantsDataKey, RefractGrantsContract, RefractGrantsContractClient,
-};
+use refract_grants::{GrantsDataKey, RefractGrantsContract, RefractGrantsContractClient};
 use refract_treasury::{DataKey as TreasuryDataKey, RefractTreasury, RefractTreasuryClient};
 use soroban_sdk::{
     symbol_short,
@@ -102,7 +100,9 @@ fn generate_treasury_snapshot() -> String {
     let admin = Address::generate(&env);
     let timelock = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let sac = token::StellarAssetClient::new(&env, &token_id);
     let recipient = Address::generate(&env);
 
@@ -160,9 +160,15 @@ fn generate_treasury_snapshot() -> String {
         let keys: Vec<(&'static str, TreasuryDataKey)> = vec![
             ("instance", TreasuryDataKey::Admin),
             ("instance", TreasuryDataKey::TimelockContract),
-            ("instance", TreasuryDataKey::ReserveBalance(token_id.clone())),
+            (
+                "instance",
+                TreasuryDataKey::ReserveBalance(token_id.clone()),
+            ),
             ("instance", TreasuryDataKey::ReserveTarget(token_id.clone())),
-            ("instance", TreasuryDataKey::OperatingBalance(token_id.clone())),
+            (
+                "instance",
+                TreasuryDataKey::OperatingBalance(token_id.clone()),
+            ),
             ("instance", TreasuryDataKey::LastRelease(token_id.clone())),
         ];
         for (i, (scope, k)) in keys.into_iter().enumerate() {
@@ -235,6 +241,12 @@ fn generate_treasury_snapshot() -> String {
                     .get::<_, refract_treasury::WithdrawalRecord>(&k)
                     .expect("withdrawal")
                     .into_val(&env),
+                TreasuryDataKey::KeeperDelegation(_keeper, _action) => env
+                    .storage()
+                    .persistent()
+                    .get::<_, refract_treasury::KeeperDelegation>(&k)
+                    .expect("keeper delegation")
+                    .into_val(&env),
             };
             out.push_str(&format!("storage[{}].val = {:?}\n", i, v_val));
             out.push_str(&format!(
@@ -259,7 +271,9 @@ fn generate_bounty_snapshot() -> String {
 
     let governance = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let sac = token::StellarAssetClient::new(&env, &token_id);
     let funder = Address::generate(&env);
     let researcher = Address::generate(&env);
@@ -388,7 +402,9 @@ fn generate_backstop_snapshot() -> String {
     let pool = Address::generate(&env);
     let admin = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let sac = token::StellarAssetClient::new(&env, &token_id);
     let staker = Address::generate(&env);
 
@@ -661,7 +677,10 @@ fn test_meta_intentional_xdr_byte_mutation_fails() {
     let result = verify_snapshot(&golden, &mutated);
     assert!(result.is_err(), "Mutated XDR byte must fail verification");
     let diff = result.unwrap_err();
-    assert!(diff.contains(".xdr = ff"), "Diff must pinpoint mutated XDR hex line");
+    assert!(
+        diff.contains(".xdr = ff"),
+        "Diff must pinpoint mutated XDR hex line"
+    );
 }
 
 #[test]
@@ -670,6 +689,10 @@ fn test_meta_golden_files_exist_and_match() {
         let path = golden_file_path(name);
         assert!(path.exists(), "Golden file {:?} must exist on disk", path);
         let content = fs::read_to_string(&path).expect("read golden file");
-        assert!(!content.trim().is_empty(), "Golden file {:?} must not be empty", path);
+        assert!(
+            !content.trim().is_empty(),
+            "Golden file {:?} must not be empty",
+            path
+        );
     }
 }

@@ -45,20 +45,32 @@ pub struct ChallengeConfig {
     pub challenge_window_seconds: u64,
 }
 
+/// Scoped, expiring keeper delegation record.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeeperDelegation {
+    pub delegator: Address,
+    pub keeper: Address,
+    pub allowed_action: Symbol,
+    pub expires_at: u64,
+    pub revoked: bool,
+}
+
 /// Storage keys for the treasury contract.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
-    OperatingBalance(Address), // token -> amount
-    ReserveBalance(Address),   // token -> amount
-    ReserveTarget(Address),    // token -> target ratio / amount
-    LastRelease(Address),      // token -> timestamp
-    TimelockContract,          // timelock address authorized to release reserve
-    ChallengeThresholdAmount,  // i128
-    ChallengeWindowSeconds,    // u64
-    NextWithdrawalId,          // u64
-    Withdrawal(u64),           // u64 -> WithdrawalRecord
+    OperatingBalance(Address),         // token -> amount
+    ReserveBalance(Address),           // token -> amount
+    ReserveTarget(Address),            // token -> target ratio / amount
+    LastRelease(Address),              // token -> timestamp
+    TimelockContract,                  // timelock address authorized to release reserve
+    ChallengeThresholdAmount,          // i128
+    ChallengeWindowSeconds,            // u64
+    NextWithdrawalId,                  // u64
+    Withdrawal(u64),                   // u64 -> WithdrawalRecord
+    KeeperDelegation(Address, Symbol), // (keeper, allowed_action) -> KeeperDelegation
 }
 
 #[contracterror]
@@ -82,6 +94,10 @@ pub enum TreasuryError {
     WithdrawalChallenged = 15,
     ChallengePeriodActive = 16,
     ChallengePeriodExpired = 17,
+    DelegationNotFound = 18,
+    DelegationExpired = 19,
+    DelegationRevoked = 20,
+    InvalidTtl = 21,
 }
 
 /// `RefractTreasury` is a token-custody vault with a segregated emergency reserve pool
@@ -725,6 +741,123 @@ impl RefractTreasury {
 
         Ok(())
     }
+
+    /// Grant a scoped, expiring keeper delegation for an automated operation.
+    /// Only callable by the delegator (or delegator must authenticate).
+    /// If ttl_seconds is 0, returns InvalidTtl.
+    /// Emits `KeeperDelegationGranted`.
+    pub fn grant_keeper_delegation(
+        env: Env,
+        delegator: Address,
+        keeper: Address,
+        action: Symbol,
+        ttl_seconds: u64,
+    ) -> Result<(), TreasuryError> {
+        delegator.require_auth();
+
+        if ttl_seconds == 0 {
+            return Err(TreasuryError::InvalidTtl);
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now
+            .checked_add(ttl_seconds)
+            .ok_or(TreasuryError::InconsistentState)?;
+
+        let delegation = KeeperDelegation {
+            delegator: delegator.clone(),
+            keeper: keeper.clone(),
+            allowed_action: action.clone(),
+            expires_at,
+            revoked: false,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::KeeperDelegation(keeper.clone(), action.clone()),
+            &delegation,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "KeeperDelegationGranted"), keeper),
+            (delegator, action, expires_at),
+        );
+
+        Ok(())
+    }
+
+    /// Revoke an existing keeper delegation.
+    /// Only callable by the delegator who originally granted the delegation.
+    /// Emits `KeeperDelegationRevoked`.
+    pub fn revoke_keeper_delegation(
+        env: Env,
+        delegator: Address,
+        keeper: Address,
+        action: Symbol,
+    ) -> Result<(), TreasuryError> {
+        delegator.require_auth();
+
+        let mut delegation: KeeperDelegation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KeeperDelegation(keeper.clone(), action.clone()))
+            .ok_or(TreasuryError::DelegationNotFound)?;
+
+        if delegation.delegator != delegator {
+            return Err(TreasuryError::Unauthorized);
+        }
+
+        delegation.revoked = true;
+        env.storage().persistent().set(
+            &DataKey::KeeperDelegation(keeper.clone(), action.clone()),
+            &delegation,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "KeeperDelegationRevoked"), keeper),
+            (delegator, action),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve a keeper delegation record by keeper and action.
+    pub fn get_keeper_delegation(
+        env: Env,
+        keeper: Address,
+        action: Symbol,
+    ) -> Result<KeeperDelegation, TreasuryError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::KeeperDelegation(keeper, action))
+            .ok_or(TreasuryError::DelegationNotFound)
+    }
+
+    /// Verify that an active, non-expired, non-revoked delegation exists for a keeper and action.
+    /// Invariants:
+    /// - current_time <= expires_at (fails with DelegationExpired if current_time > expires_at)
+    /// - !revoked (fails with DelegationRevoked if revoked)
+    pub fn verify_keeper_delegation(
+        env: Env,
+        keeper: Address,
+        action: Symbol,
+    ) -> Result<(), TreasuryError> {
+        let delegation: KeeperDelegation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KeeperDelegation(keeper, action))
+            .ok_or(TreasuryError::DelegationNotFound)?;
+
+        if delegation.revoked {
+            return Err(TreasuryError::DelegationRevoked);
+        }
+
+        let now = env.ledger().timestamp();
+        if now > delegation.expires_at {
+            return Err(TreasuryError::DelegationExpired);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1325,5 +1458,80 @@ mod test {
         // Execution succeeds because window passed with 0 challenges
         client.execute_withdrawal(&admin, &high_val_id4);
         assert_eq!(token_client.balance(&recipient), 40_000);
+    }
+
+    #[test]
+    fn test_keeper_delegation_lifecycle_and_invariants() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let keeper = Address::generate(&env);
+        let action_settle = Symbol::new(&env, "settle");
+        let action_execute = Symbol::new(&env, "execute");
+
+        // 1. Invalid TTL (0) fails
+        assert_eq!(
+            client.try_grant_keeper_delegation(&admin, &keeper, &action_settle, &0),
+            Err(Ok(TreasuryError::InvalidTtl))
+        );
+
+        // 2. Grant delegation with 300s TTL at t=1000
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        client.grant_keeper_delegation(&admin, &keeper, &action_settle, &300);
+
+        let delegation = client.get_keeper_delegation(&keeper, &action_settle);
+        assert_eq!(delegation.delegator, admin);
+        assert_eq!(delegation.keeper, keeper);
+        assert_eq!(delegation.allowed_action, action_settle);
+        assert_eq!(delegation.expires_at, 1300);
+        assert!(!delegation.revoked);
+
+        // Verification succeeds at t=1200
+        env.ledger().with_mut(|l| l.timestamp = 1200);
+        client.verify_keeper_delegation(&keeper, &action_settle);
+
+        // Verification for ungranted action fails with DelegationNotFound
+        assert_eq!(
+            client.try_verify_keeper_delegation(&keeper, &action_execute),
+            Err(Ok(TreasuryError::DelegationNotFound))
+        );
+
+        // Verification after expiration (t=1301 > 1300) fails with DelegationExpired
+        env.ledger().with_mut(|l| l.timestamp = 1301);
+        assert_eq!(
+            client.try_verify_keeper_delegation(&keeper, &action_settle),
+            Err(Ok(TreasuryError::DelegationExpired))
+        );
+
+        // 3. Re-grant or grant for another action and test revocation
+        let action_extend = Symbol::new(&env, "extend_ttl");
+        client.grant_keeper_delegation(&admin, &keeper, &action_extend, &500);
+
+        // Valid before revocation
+        client.verify_keeper_delegation(&keeper, &action_extend);
+
+        // Non-delegator cannot revoke
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_revoke_keeper_delegation(&stranger, &keeper, &action_extend),
+            Err(Ok(TreasuryError::Unauthorized))
+        );
+
+        // Delegator revokes delegation
+        client.revoke_keeper_delegation(&admin, &keeper, &action_extend);
+
+        let revoked_del = client.get_keeper_delegation(&keeper, &action_extend);
+        assert!(revoked_del.revoked);
+
+        // Verification now fails with DelegationRevoked
+        assert_eq!(
+            client.try_verify_keeper_delegation(&keeper, &action_extend),
+            Err(Ok(TreasuryError::DelegationRevoked))
+        );
     }
 }
