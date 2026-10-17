@@ -213,3 +213,19 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Automated Risk-Guardian Circuit Breakers
+
+To protect protocol capital against silent oracle staleness and asset depegs,
+`RefractBackstop` and `RefractTreasury` evaluate `GuardianFeedConfig` rules on
+hot paths (`deposit`, `withdraw`) and via `check_guardians()`:
+
+- **Staleness trip:** `current_ledger - observed_ledger > max_staleness_ledgers`
+- **Depeg trip:** `|price - reference_price| * 10_000 / reference_price > max_deviation_bps`
+- **Hysteresis auto-resume:** requires `healthy_ledgers_to_resume` consecutive
+  distinct ledgers with deviation `<= resume_hysteresis_bps` and fresh readings.
+- **Governance bypass:** loss-event drawdowns (`cover_shortfall`,
+  `emergency_drawdown`) remain unblocked when a guardian is tripped.
+

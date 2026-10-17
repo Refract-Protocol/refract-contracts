@@ -122,3 +122,12 @@ The permissionless design of \process_claim\ and \expire_policy\ adheres to high
 2. Policies can **never** be prematurely expired.
 3. Liquidity capital and utilization metrics are maintained deterministically.
 No breaking code refactors are required; the design is secure, resilient, and ready for production deployment.
+
+---
+
+## 6. Automated Risk-Guardian Circuit Breakers & Hysteresis Anti-Flapping
+
+- **Hot-Path Enforcement:** `deposit` in `RefractBackstop` and routine `withdraw` in `RefractTreasury` invoke `check_guardians()` directly so attackers cannot bypass protective halts by omitting a separate crank call.
+- **Anti-Flapping Hysteresis:** Once tripped at `max_deviation_bps`, a guard only clears after `healthy_ledgers_to_resume` consecutive distinct ledgers inside `resume_hysteresis_bps` (`<= max_deviation_bps`), preventing oscillation at the threshold boundary.
+- **Loss-Event Liveness:** Governance/pool loss-event drawdowns (`cover_shortfall`, `emergency_drawdown`) are never blocked by a tripped guardian.
+
