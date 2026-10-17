@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
@@ -10,9 +11,6 @@ pub enum DataKey {
 }
 
 /// `RefractTreasury` is a deliberately minimal token-custody vault.
-///
-/// Funds are deposited via plain token transfers to the contract address
-/// (no `deposit` entrypoint is required). Withdrawals are admin-gated.
 #[contract]
 pub struct RefractTreasury;
 
@@ -70,11 +68,12 @@ mod test {
         assert_eq!(client.admin(), admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
-        // Deposit via plain transfer.
         sac.mint(&contract_id, &1_000);
         assert_eq!(token_client.balance(&contract_id), 1_000);
 
