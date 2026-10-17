@@ -146,7 +146,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -260,6 +262,7 @@ impl RefractGrants {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -280,7 +283,10 @@ mod tests {
 
         // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -411,5 +417,28 @@ mod tests {
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
         );
+    }
+
+    #[test]
+    fn timelock_delay_gates_milestone_confirmation_with_shared_fixture() {
+        let fx = refract_testutils::ProtocolTestFixture::setup();
+        let pid = fx.timelock().queue(
+            &fx.governance_id,
+            &soroban_sdk::symbol_short!("confirm"),
+            &0,
+        );
+        assert!(!fx.timelock().is_ready(&pid));
+        fx.advance_time(refract_testutils::DEFAULT_TIMELOCK_DELAY_SECS);
+        let queued = fx.timelock().execute(&pid);
+        assert_eq!(queued.amount, 0);
+
+        let mut grants = contract();
+        let id = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 250, vec![100, 150])
+            .unwrap();
+        grants
+            .confirm_milestone(GOVERNANCE, id, queued.amount as usize)
+            .unwrap();
+        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
     }
 }

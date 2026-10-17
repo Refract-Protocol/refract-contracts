@@ -1,0 +1,14 @@
+[package]
+name = "refract-testutils"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Soroban test harness with mock token, governance, timelock, and multisig contracts"
+license = "MIT"
+
+[lib]
+name = "refract_testutils"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

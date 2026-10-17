@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
@@ -56,31 +57,25 @@ impl RefractTreasury {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use refract_testutils::ProtocolTestFixture;
+    use soroban_sdk::testutils::Address as _;
 
     #[test]
     fn withdraw_is_admin_gated() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, RefractTreasury);
-        let client = RefractTreasuryClient::new(&env, &contract_id);
+        let fx = ProtocolTestFixture::setup();
+        let contract_id = fx.env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&fx.env, &contract_id);
 
-        let admin = Address::generate(&env);
-        client.initialize(&admin);
-        assert_eq!(client.admin(), admin);
-
-        let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
-        let token_client = token::Client::new(&env, &token_id);
-        let sac = token::StellarAssetClient::new(&env, &token_id);
+        client.initialize(&fx.timelock_id);
+        assert_eq!(client.admin(), fx.timelock_id);
 
         // Deposit via plain transfer.
-        sac.mint(&contract_id, &1_000);
-        assert_eq!(token_client.balance(&contract_id), 1_000);
+        fx.token.fund(&fx.env, &contract_id, 1_000);
+        assert_eq!(fx.token.balance(&fx.env, &contract_id), 1_000);
 
-        let to = Address::generate(&env);
-        client.withdraw(&admin, &token_id, &400, &to);
-        assert_eq!(token_client.balance(&to), 400);
-        assert_eq!(token_client.balance(&contract_id), 600);
+        let to = Address::generate(&fx.env);
+        client.withdraw(&fx.timelock_id, &fx.token.address, &400, &to);
+        assert_eq!(fx.token.balance(&fx.env, &to), 400);
+        assert_eq!(fx.token.balance(&fx.env, &contract_id), 600);
     }
 }
