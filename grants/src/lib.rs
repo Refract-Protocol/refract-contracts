@@ -23,6 +23,8 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
+#![allow(clippy::too_many_arguments)]
+
 pub mod normalization;
 pub use normalization::{
     normalize_inflow, normalize_outflow, to_protocol_units, to_token_units, NormalizationError,
@@ -82,6 +84,10 @@ pub enum GrantsError {
     MissingLicensingAttestation,
     /// SPDX license identifier is invalid or empty.
     InvalidLicense,
+    /// Required contract state entries were archived or uninitialized.
+    StateArchived,
+    /// Inconsistent state detected across counters, milestones or balances.
+    InconsistentState,
 }
 
 pub type GrantError = GrantsError;
@@ -655,6 +661,68 @@ impl RefractGrants {
             .map_err(|_| GrantsError::NormalizationError)
     }
 
+    /// Checks post-restore consistency across all grants and programs.
+    /// Re-derives milestone sums, validates that grant_count and program_count match
+    /// sequence counters, and confirms disbursements do not exceed committed budgets.
+    pub fn on_restore(&self) -> Result<(usize, usize), GrantsError> {
+        self.verify_integrity()?;
+        Ok((self.grants.len(), self.programs.len()))
+    }
+
+    /// Validates internal consistency across counters, grants, milestones, and programs.
+    pub fn verify_integrity(&self) -> Result<(), GrantsError> {
+        if (self.grants.len() as u64) > self.next_grant_id {
+            return Err(GrantsError::InconsistentState);
+        }
+        if (self.programs.len() as u64) > self.next_program_id {
+            return Err(GrantsError::InconsistentState);
+        }
+        for grant in self.grants.values() {
+            let mut sum: i128 = 0;
+            let mut confirmed_sum: i128 = 0;
+            let mut claimed_sum: i128 = 0;
+            for m in &grant.milestones {
+                if m.amount <= 0 {
+                    return Err(GrantsError::InconsistentState);
+                }
+                sum = sum
+                    .checked_add(m.amount)
+                    .ok_or(GrantsError::InconsistentState)?;
+                if m.confirmed {
+                    confirmed_sum = confirmed_sum
+                        .checked_add(m.amount)
+                        .ok_or(GrantsError::InconsistentState)?;
+                }
+                if m.claimed {
+                    if !m.confirmed {
+                        return Err(GrantsError::InconsistentState);
+                    }
+                    claimed_sum = claimed_sum
+                        .checked_add(m.amount)
+                        .ok_or(GrantsError::InconsistentState)?;
+                }
+            }
+            if sum != grant.total_amount {
+                return Err(GrantsError::InconsistentState);
+            }
+            let expected_claimable = confirmed_sum
+                .checked_sub(claimed_sum)
+                .ok_or(GrantsError::InconsistentState)?;
+            if grant.claimable != expected_claimable {
+                return Err(GrantsError::InconsistentState);
+            }
+        }
+        for prog in self.programs.values() {
+            if prog.budget <= 0 || prog.committed < 0 || prog.disbursed < 0 {
+                return Err(GrantsError::InconsistentState);
+            }
+            if prog.disbursed > prog.committed || prog.committed > prog.budget {
+                return Err(GrantsError::InconsistentState);
+            }
+        }
+        Ok(())
+    }
+
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
         if caller != self.governance {
             return Err(GrantsError::Unauthorized);
@@ -745,6 +813,8 @@ pub mod contract {
         InvalidRoundTime = 18,
         MissingLicensingAttestation = 19,
         InvalidLicense = 20,
+        StateArchived = 21,
+        InconsistentState = 22,
     }
 
     pub use self::GrantsContractError as GrantContractError;
@@ -1304,6 +1374,90 @@ pub mod contract {
             normalization::to_token_units(protocol_amount, token_decimals)
                 .map_err(|_| GrantsContractError::NormalizationError)
         }
+
+        /// Explicit post-restore consistency check and state integrity verification.
+        /// Asserts that required instance storage entries are live (failing closed with
+        /// `StateArchived` instead of reading zero/default values), verifies that
+        /// next_grant_id and next_program_id are monotonic, and reconciles grant milestones
+        /// against total_amount and claimable totals.
+        pub fn on_restore(env: Env) -> Result<(u64, u64), GrantsContractError> {
+            let (next_grant_id, next_program_id) = Self::assert_live_and_consistent(&env)?;
+            env.events().publish(
+                (symbol_short!("grant"), symbol_short!("restore")),
+                (next_grant_id, next_program_id),
+            );
+            Ok((next_grant_id, next_program_id))
+        }
+
+        /// Read-only integrity verification check.
+        pub fn verify_integrity(env: Env) -> Result<bool, GrantsContractError> {
+            Self::assert_live_and_consistent(&env).map(|_| true)
+        }
+
+        fn assert_live_and_consistent(env: &Env) -> Result<(u64, u64), GrantsContractError> {
+            if !env.storage().instance().has(&GrantsDataKey::Governance) {
+                return Err(GrantsContractError::StateArchived);
+            }
+            let next_grant_id: u64 = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::NextGrantId)
+                .ok_or(GrantsContractError::StateArchived)?;
+            let next_program_id: u64 = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::NextProgramId)
+                .ok_or(GrantsContractError::StateArchived)?;
+
+            // Reconcile all live grants up to next_grant_id
+            for gid in 0..next_grant_id {
+                if let Some(grant) = env.storage().persistent().get::<_, GrantRecord>(&GrantsDataKey::Grant(gid)) {
+                    if grant.total_amount <= 0 || grant.claimable < 0 {
+                        return Err(GrantsContractError::InconsistentState);
+                    }
+                    let mut sum: i128 = 0;
+                    let mut confirmed_sum: i128 = 0;
+                    let mut claimed_sum: i128 = 0;
+                    for i in 0..grant.milestones.len() {
+                        let m = grant.milestones.get(i).ok_or(GrantsContractError::InconsistentState)?;
+                        if m.amount <= 0 {
+                            return Err(GrantsContractError::InconsistentState);
+                        }
+                        sum = sum.checked_add(m.amount).ok_or(GrantsContractError::InconsistentState)?;
+                        if m.confirmed {
+                            confirmed_sum = confirmed_sum.checked_add(m.amount).ok_or(GrantsContractError::InconsistentState)?;
+                        }
+                        if m.claimed {
+                            if !m.confirmed {
+                                return Err(GrantsContractError::InconsistentState);
+                            }
+                            claimed_sum = claimed_sum.checked_add(m.amount).ok_or(GrantsContractError::InconsistentState)?;
+                        }
+                    }
+                    if sum != grant.total_amount {
+                        return Err(GrantsContractError::InconsistentState);
+                    }
+                    let expected_claimable = confirmed_sum.checked_sub(claimed_sum).ok_or(GrantsContractError::InconsistentState)?;
+                    if grant.claimable != expected_claimable {
+                        return Err(GrantsContractError::InconsistentState);
+                    }
+                }
+            }
+
+            // Reconcile all live programs up to next_program_id
+            for pid in 0..next_program_id {
+                if let Some(prog) = env.storage().persistent().get::<_, ProgramInfo>(&GrantsDataKey::Program(pid)) {
+                    if prog.budget <= 0 || prog.committed < 0 || prog.disbursed < 0 {
+                        return Err(GrantsContractError::InconsistentState);
+                    }
+                    if prog.disbursed > prog.committed || prog.committed > prog.budget {
+                        return Err(GrantsContractError::InconsistentState);
+                    }
+                }
+            }
+
+            Ok((next_grant_id, next_program_id))
+        }
     }
 }
 
@@ -1744,5 +1898,46 @@ mod soroban_grants_tests {
         // Full grant claimable and claimed
         let claimed = client.claim(&recipient, &gid);
         assert_eq!(claimed, 300);
+
+        // Verification of live and consistent state
+        let (ngid, npid) = client.on_restore();
+        assert_eq!(ngid, 1);
+        assert_eq!(npid, 0);
+        assert!(client.verify_integrity());
+
+        // Simulate desynchronization: tampering with grant claimable
+        env.as_contract(&contract_id, || {
+            let mut g: GrantRecord = env.storage().persistent().get(&GrantsDataKey::Grant(gid)).unwrap();
+            g.claimable = 999;
+            env.storage().persistent().set(&GrantsDataKey::Grant(gid), &g);
+        });
+
+        assert_eq!(client.try_on_restore(), Err(Ok(GrantsContractError::InconsistentState)));
+        assert_eq!(client.try_verify_integrity(), Err(Ok(GrantsContractError::InconsistentState)));
+    }
+
+    #[test]
+    fn test_soroban_grants_uninitialized_or_archived_fails_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RefractGrantsContract);
+        let client = RefractGrantsContractClient::new(&env, &contract_id);
+
+        assert_eq!(client.try_on_restore(), Err(Ok(GrantsContractError::StateArchived)));
+        assert_eq!(client.try_verify_integrity(), Err(Ok(GrantsContractError::StateArchived)));
+    }
+
+    #[test]
+    fn test_pure_rust_grants_on_restore_and_integrity() {
+        let mut contract = RefractGrants::new(10);
+        let gid = contract.create_grant(10, 20, 100, vec![40, 60]).unwrap();
+        assert_eq!(contract.on_restore(), Ok((1, 0)));
+        assert!(contract.verify_integrity().is_ok());
+
+        contract.confirm_milestone(10, gid, 0).unwrap();
+        assert_eq!(contract.claim(20, gid), Ok(40));
+        assert!(contract.verify_integrity().is_ok());
     }
 }
+

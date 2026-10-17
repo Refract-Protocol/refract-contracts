@@ -23,6 +23,8 @@ pub enum BackstopError {
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
     NormalizationError = 8,
+    StateArchived = 9,
+    InconsistentState = 10,
 }
 
 #[contracttype]
@@ -85,6 +87,25 @@ impl RefractBackstop {
         );
 
         Ok(())
+    }
+
+    /// Explicit post-restore consistency check and state integrity verification.
+    /// Asserts that required instance storage entries are live (failing closed with
+    /// `StateArchived` instead of zero/default reads), verifies that total_shares and
+    /// total_capital are non-negative, and reconciles that the actual contract token
+    /// balance is at least equal to total_capital.
+    pub fn on_restore(env: Env) -> Result<BackstopState, BackstopError> {
+        let (config, state) = Self::assert_live_and_consistent(&env)?;
+        env.events().publish(
+            (symbol_short!("backstop"), symbol_short!("restore")),
+            (config.token, state.total_capital, state.total_shares),
+        );
+        Ok(state)
+    }
+
+    /// Read-only integrity verification check.
+    pub fn verify_integrity(env: Env) -> Result<bool, BackstopError> {
+        Self::assert_live_and_consistent(&env).map(|_| true)
     }
 
     /// Deposit `amount` of the configured token and mint backstop shares to
@@ -275,18 +296,51 @@ impl RefractBackstop {
         }
     }
 
+    fn assert_live_and_consistent(env: &Env) -> Result<(BackstopConfig, BackstopState), BackstopError> {
+        if !env.storage().instance().has(&"config") || !env.storage().instance().has(&"state") {
+            return Err(BackstopError::StateArchived);
+        }
+        let config: BackstopConfig = env
+            .storage()
+            .instance()
+            .get(&"config")
+            .ok_or(BackstopError::StateArchived)?;
+        let state: BackstopState = env
+            .storage()
+            .instance()
+            .get(&"state")
+            .ok_or(BackstopError::StateArchived)?;
+
+        if state.total_shares < 0 || state.total_capital < 0 || state.premium_income < 0 {
+            return Err(BackstopError::InconsistentState);
+        }
+
+        let real_balance = token::Client::new(env, &config.token).balance(&env.current_contract_address());
+        if real_balance < state.total_capital {
+            return Err(BackstopError::InconsistentState);
+        }
+
+        Ok((config, state))
+    }
+
     fn get_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+        if !env.storage().instance().has(&"config") {
+            return Err(BackstopError::StateArchived);
+        }
         env.storage()
             .instance()
             .get(&"config")
-            .ok_or(BackstopError::NotInitialized)
+            .ok_or(BackstopError::StateArchived)
     }
 
     fn get_state(env: &Env) -> Result<BackstopState, BackstopError> {
+        if !env.storage().instance().has(&"state") {
+            return Err(BackstopError::StateArchived);
+        }
         env.storage()
             .instance()
             .get(&"state")
-            .ok_or(BackstopError::NotInitialized)
+            .ok_or(BackstopError::StateArchived)
     }
 }
 
@@ -321,4 +375,52 @@ mod test {
         let token_client = token::Client::new(&env, &token_id);
         assert_eq!(token_client.balance(&pool), 40_000_000);
     }
+
+    #[test]
+    fn test_backstop_on_restore_and_integrity_checks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBackstop);
+        let client = RefractBackstopClient::new(&env, &contract_id);
+
+        let pool = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        client.initialize(&pool, &admin, &token_id, &1000);
+
+        let staker = Address::generate(&env);
+        sac.mint(&staker, &100_000_000);
+        client.deposit(&staker, &100_000_000);
+
+        let st = client.on_restore();
+        assert_eq!(st.total_shares, 100_000_000);
+        assert_eq!(st.total_capital, 100_000_000);
+        assert!(client.verify_integrity());
+
+        // Simulate state desynchronization (e.g. total_capital exceeds actual token holdings)
+        env.as_contract(&contract_id, || {
+            let mut state: BackstopState = env.storage().instance().get(&"state").unwrap();
+            state.total_capital = 500_000_000;
+            env.storage().instance().set(&"state", &state);
+        });
+
+        assert_eq!(client.try_on_restore(), Err(Ok(BackstopError::InconsistentState)));
+        assert_eq!(client.try_verify_integrity(), Err(Ok(BackstopError::InconsistentState)));
+    }
+
+    #[test]
+    fn test_backstop_uninitialized_or_archived_fails_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBackstop);
+        let client = RefractBackstopClient::new(&env, &contract_id);
+
+        assert_eq!(client.try_on_restore(), Err(Ok(BackstopError::StateArchived)));
+        assert_eq!(client.try_state(), Err(Ok(BackstopError::StateArchived)));
+        assert_eq!(client.try_config(), Err(Ok(BackstopError::StateArchived)));
+    }
 }
+

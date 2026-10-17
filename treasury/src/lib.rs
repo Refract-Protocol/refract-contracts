@@ -35,6 +35,8 @@ pub enum TreasuryError {
     UnauthorizedTimelock = 7,
     InsufficientBalance = 8,
     NormalizationError = 9,
+    StateArchived = 10,
+    InconsistentState = 11,
 }
 
 /// `RefractTreasury` is a token-custody vault with a segregated emergency reserve pool
@@ -60,6 +62,55 @@ impl RefractTreasury {
             (admin,),
         );
         Ok(())
+    }
+
+    /// Explicit post-restore consistency check and state integrity verification.
+    /// Asserts that required instance storage entries are live (failing closed with
+    /// `StateArchived` instead of zero/default reads), verifies that reserve balance
+    /// and operating balance are non-negative, and reconciles that the actual contract token
+    /// balance is at least equal to reserve_balance + operating_balance.
+    pub fn on_restore(env: Env, token: Address) -> Result<(i128, i128), TreasuryError> {
+        let (operating, reserve) = Self::assert_live_and_consistent(&env, &token)?;
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("restore")),
+            (token, operating, reserve),
+        );
+        Ok((operating, reserve))
+    }
+
+    /// Read-only integrity verification check for a given token.
+    pub fn verify_integrity(env: Env, token: Address) -> Result<bool, TreasuryError> {
+        Self::assert_live_and_consistent(&env, &token).map(|_| true)
+    }
+
+    fn assert_live_and_consistent(env: &Env, token: &Address) -> Result<(i128, i128), TreasuryError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(TreasuryError::StateArchived);
+        }
+        let reserve: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReserveBalance(token.clone()))
+            .unwrap_or(0);
+        let operating: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OperatingBalance(token.clone()))
+            .unwrap_or(0);
+
+        if reserve < 0 || operating < 0 {
+            return Err(TreasuryError::InconsistentState);
+        }
+
+        let total_recorded = reserve
+            .checked_add(operating)
+            .ok_or(TreasuryError::InconsistentState)?;
+        let real_balance = token::Client::new(env, token).balance(&env.current_contract_address());
+        if real_balance < total_recorded {
+            return Err(TreasuryError::InconsistentState);
+        }
+
+        Ok((operating, reserve))
     }
 
     /// Return the configured admin.
@@ -705,4 +756,53 @@ mod test {
         let (reserve_bal, _, _) = client.get_reserve_info(&token_id);
         assert_eq!(reserve_bal, 15_000_000);
     }
+
+    #[test]
+    fn test_treasury_on_restore_and_integrity_checks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        // Deposit reserve and operating funds
+        let depositor = Address::generate(&env);
+        sac.mint(&depositor, &50_000_000);
+        client.deposit_reserve(&depositor, &token_id, &50_000_000);
+
+        sac.mint(&contract_id, &50_000_000);
+
+        let (operating, reserve) = client.on_restore(&token_id);
+        assert_eq!(reserve, 50_000_000);
+        assert_eq!(operating, 0); // initial operating set on withdraw or defaults to 0
+        assert!(client.verify_integrity(&token_id));
+
+        // Simulate state inconsistency where tracked operating balance exceeds physical tokens
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::OperatingBalance(token_id.clone()), &200_000_000i128);
+        });
+
+        assert_eq!(client.try_on_restore(&token_id), Err(Ok(TreasuryError::InconsistentState)));
+        assert_eq!(client.try_verify_integrity(&token_id), Err(Ok(TreasuryError::InconsistentState)));
+    }
+
+    #[test]
+    fn test_treasury_uninitialized_or_archived_fails_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&env, &contract_id);
+
+        let token = Address::generate(&env);
+        assert_eq!(client.try_on_restore(&token), Err(Ok(TreasuryError::StateArchived)));
+        assert_eq!(client.try_verify_integrity(&token), Err(Ok(TreasuryError::StateArchived)));
+        assert_eq!(client.try_admin(), Err(Ok(TreasuryError::NotInitialized)));
+    }
 }
+

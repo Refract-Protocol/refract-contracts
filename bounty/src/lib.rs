@@ -45,6 +45,8 @@ pub enum BountyError {
     Unauthorized = 5,
     DuplicateReport = 6,
     NormalizationError = 7,
+    StateArchived = 8,
+    InconsistentState = 9,
 }
 
 /// Governance-controlled bug bounty escrow.
@@ -74,6 +76,25 @@ impl RefractBountyEscrow {
         );
 
         Ok(())
+    }
+
+    /// Explicit post-restore consistency check and state integrity verification.
+    /// Asserts that required instance storage entries are live (failing closed with
+    /// `StateArchived` instead of reading zero/default values), verifies that the
+    /// recorded balance is non-negative, and reconciles that the actual contract token
+    /// balance is at least equal to the escrowed balance.
+    pub fn on_restore(env: Env) -> Result<i128, BountyError> {
+        let (balance, _token) = Self::assert_live_and_consistent(&env)?;
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("restore")),
+            balance,
+        );
+        Ok(balance)
+    }
+
+    /// Read-only integrity verification check.
+    pub fn verify_integrity(env: Env) -> Result<bool, BountyError> {
+        Self::assert_live_and_consistent(&env).map(|_| true)
     }
 
     /// Top up the reward pool. Callable by anyone, including the treasury.
@@ -180,25 +201,58 @@ impl RefractBountyEscrow {
         env.storage().persistent().get(&DataKey::Award(report_hash))
     }
 
+    fn assert_live_and_consistent(env: &Env) -> Result<(i128, Address), BountyError> {
+        if !env.storage().instance().has(&DataKey::Governance) {
+            return Err(BountyError::StateArchived);
+        }
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(BountyError::StateArchived)?;
+        let balance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Balance)
+            .ok_or(BountyError::StateArchived)?;
+        if balance < 0 {
+            return Err(BountyError::InconsistentState);
+        }
+        let real_balance = token::Client::new(env, &token).balance(&env.current_contract_address());
+        if real_balance < balance {
+            return Err(BountyError::InconsistentState);
+        }
+        Ok((balance, token))
+    }
+
     fn get_governance(env: &Env) -> Result<Address, BountyError> {
+        if !env.storage().instance().has(&DataKey::Governance) {
+            return Err(BountyError::StateArchived);
+        }
         env.storage()
             .instance()
             .get(&DataKey::Governance)
-            .ok_or(BountyError::NotInitialized)
+            .ok_or(BountyError::StateArchived)
     }
 
     fn get_token(env: &Env) -> Result<Address, BountyError> {
+        if !env.storage().instance().has(&DataKey::Governance) {
+            return Err(BountyError::StateArchived);
+        }
         env.storage()
             .instance()
             .get(&DataKey::Token)
-            .ok_or(BountyError::NotInitialized)
+            .ok_or(BountyError::StateArchived)
     }
 
     fn get_balance(env: &Env) -> Result<i128, BountyError> {
+        if !env.storage().instance().has(&DataKey::Governance) {
+            return Err(BountyError::StateArchived);
+        }
         env.storage()
             .instance()
             .get(&DataKey::Balance)
-            .ok_or(BountyError::NotInitialized)
+            .ok_or(BountyError::StateArchived)
     }
 }
 
@@ -236,4 +290,50 @@ mod test {
         let token_client = token::Client::new(&env, &token_id);
         assert_eq!(token_client.balance(&researcher), 50_000_000);
     }
+
+    #[test]
+    fn test_bounty_on_restore_and_integrity_checks() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        client.initialize(&governance, &token_id);
+
+        let funder = Address::generate(&env);
+        sac.mint(&funder, &100_000_000);
+        client.fund(&funder, &100_000_000);
+
+        // Verification of live and consistent state
+        let restored_bal = client.on_restore();
+        assert_eq!(restored_bal, 100_000_000);
+        assert!(client.verify_integrity());
+
+        // Simulate inconsistency where contract recorded balance exceeds token reserves
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Balance, &200_000_000i128);
+        });
+        assert_eq!(client.try_on_restore(), Err(Ok(BountyError::InconsistentState)));
+        assert_eq!(client.try_verify_integrity(), Err(Ok(BountyError::InconsistentState)));
+    }
+
+    #[test]
+    fn test_bounty_uninitialized_or_archived_fails_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let res = client.try_on_restore();
+        assert_eq!(res, Err(Ok(BountyError::StateArchived)));
+
+        let res_bal = client.try_balance();
+        assert_eq!(res_bal, Err(Ok(BountyError::StateArchived)));
+    }
 }
+
