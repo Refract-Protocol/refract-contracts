@@ -6,11 +6,14 @@ pub use normalization::{
     Rounding, PROTOCOL_DECIMALS, PROTOCOL_SCALE,
 };
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN,
+    Env, Symbol,
+};
 
 /// Storage keys for the bounty escrow.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataKey {
     /// The governance/timelock address authorized to award payouts.
     Governance,
@@ -20,6 +23,10 @@ pub enum DataKey {
     Balance,
     /// Immutable, timestamped record of a rewarded disclosure.
     Award(BytesN<32>),
+    /// Configured refill rules for a bounty program.
+    RefillRules(u64),
+    /// Current balance allocated to a bounty program.
+    ProgramBalance(u64),
 }
 
 /// Immutable, timestamped record that a specific disclosure was rewarded.
@@ -32,6 +39,15 @@ pub struct AwardRecord {
     pub amount: i128,
     pub report_hash: BytesN<32>,
     pub timestamp: u64,
+}
+
+/// Refill rules configured for a bounty program.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefillRules {
+    pub min_threshold: i128,
+    pub refill_amount: i128,
+    pub allowance_source: Address,
 }
 
 #[contracterror]
@@ -47,6 +63,9 @@ pub enum BountyError {
     NormalizationError = 7,
     StateArchived = 8,
     InconsistentState = 9,
+    ProgramBelowThreshold = 10,
+    RefillNotNeeded = 11,
+    RulesNotFound = 12,
 }
 
 /// Governance-controlled bug bounty escrow.
@@ -97,7 +116,7 @@ impl RefractBountyEscrow {
         Self::assert_live_and_consistent(&env).map(|_| true)
     }
 
-    /// Top up the reward pool. Callable by anyone, including the treasury.
+    /// Top up the general reward pool. Callable by anyone, including the treasury.
     pub fn fund(env: Env, from: Address, amount: i128) -> Result<(), BountyError> {
         from.require_auth();
         if amount <= 0 {
@@ -106,7 +125,10 @@ impl RefractBountyEscrow {
         let token = Self::get_token(&env)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
         let balance = Self::get_balance(&env)?;
-        env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+        let new_balance = balance
+            .checked_add(amount)
+            .ok_or(BountyError::InvalidAmount)?;
+        env.storage().instance().set(&DataKey::Balance, &new_balance);
 
         env.events().publish(
             (symbol_short!("bounty"), symbol_short!("fund")),
@@ -114,6 +136,166 @@ impl RefractBountyEscrow {
         );
 
         Ok(())
+    }
+
+    /// Top up a specific bounty program escrow balance on demand.
+    /// Transfers tokens from the sponsor into the contract escrow and increments
+    /// both the overall contract balance and the program-specific balance.
+    /// Emits structured `ProgramToppedUp` event.
+    pub fn top_up_program(
+        env: Env,
+        sponsor: Address,
+        program_id: u64,
+        amount: i128,
+    ) -> Result<i128, BountyError> {
+        sponsor.require_auth();
+        if amount <= 0 {
+            return Err(BountyError::InvalidAmount);
+        }
+        let token = Self::get_token(&env)?;
+        token::Client::new(&env, &token).transfer(&sponsor, &env.current_contract_address(), &amount);
+
+        let total_balance = Self::get_balance(&env)?;
+        let new_total = total_balance
+            .checked_add(amount)
+            .ok_or(BountyError::InvalidAmount)?;
+        env.storage().instance().set(&DataKey::Balance, &new_total);
+
+        let prog_balance = Self::get_program_balance(&env, program_id);
+        let new_prog_balance = prog_balance
+            .checked_add(amount)
+            .ok_or(BountyError::InvalidAmount)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProgramBalance(program_id), &new_prog_balance);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "ProgramToppedUp"),
+                program_id,
+            ),
+            (sponsor, amount, new_prog_balance),
+        );
+
+        Ok(new_prog_balance)
+    }
+
+    /// Configure low-balance refill rules for a bounty program.
+    /// Gated strictly by the governance authority.
+    pub fn configure_refill_rules(
+        env: Env,
+        admin: Address,
+        program_id: u64,
+        min_threshold: i128,
+        refill_amount: i128,
+        allowance_source: Address,
+    ) -> Result<(), BountyError> {
+        admin.require_auth();
+        let governance = Self::get_governance(&env)?;
+        if admin != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        if min_threshold < 0 || refill_amount <= 0 {
+            return Err(BountyError::InvalidAmount);
+        }
+
+        let rules = RefillRules {
+            min_threshold,
+            refill_amount,
+            allowance_source: allowance_source.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::RefillRules(program_id), &rules);
+
+        let current_balance = Self::get_program_balance(&env, program_id);
+        if current_balance < min_threshold {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "LowBalanceWarning"),
+                    program_id,
+                ),
+                (current_balance, min_threshold),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Auto-refill a bounty program if its balance falls below `min_threshold`.
+    /// Callable by keepers; draws `refill_amount` from `allowance_source` into escrow.
+    /// Emits structured `ProgramAutoRefilled` event.
+    pub fn auto_refill(
+        env: Env,
+        keeper: Address,
+        program_id: u64,
+    ) -> Result<i128, BountyError> {
+        keeper.require_auth();
+
+        let rules = env
+            .storage()
+            .persistent()
+            .get::<_, RefillRules>(&DataKey::RefillRules(program_id))
+            .ok_or(BountyError::RulesNotFound)?;
+
+        let current_balance = Self::get_program_balance(&env, program_id);
+        if current_balance >= rules.min_threshold {
+            return Err(BountyError::RefillNotNeeded);
+        }
+
+        let token = Self::get_token(&env)?;
+        token::Client::new(&env, &token).transfer_from(
+            &env.current_contract_address(),
+            &rules.allowance_source,
+            &env.current_contract_address(),
+            &rules.refill_amount,
+        );
+
+        let total_balance = Self::get_balance(&env)?;
+        let new_total = total_balance
+            .checked_add(rules.refill_amount)
+            .ok_or(BountyError::InvalidAmount)?;
+        env.storage().instance().set(&DataKey::Balance, &new_total);
+
+        let new_prog_balance = current_balance
+            .checked_add(rules.refill_amount)
+            .ok_or(BountyError::InvalidAmount)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProgramBalance(program_id), &new_prog_balance);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "ProgramAutoRefilled"),
+                program_id,
+            ),
+            (keeper, rules.allowance_source, rules.refill_amount, new_prog_balance),
+        );
+
+        Ok(new_prog_balance)
+    }
+
+    /// Check if a program's balance is below its configured `min_threshold`.
+    /// Emits `LowBalanceWarning` if below threshold.
+    pub fn check_balance_threshold(env: Env, program_id: u64) -> Result<bool, BountyError> {
+        let rules_opt = env
+            .storage()
+            .persistent()
+            .get::<_, RefillRules>(&DataKey::RefillRules(program_id));
+        if let Some(rules) = rules_opt {
+            let current_balance = Self::get_program_balance(&env, program_id);
+            if current_balance < rules.min_threshold {
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "LowBalanceWarning"),
+                        program_id,
+                    ),
+                    (current_balance, rules.min_threshold),
+                );
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Award a bounty to a security researcher. Gated strictly by the
@@ -163,6 +345,90 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
+    /// Award a bounty funded by a specific bounty program.
+    /// Checks that the program has sufficient balance and is not below its configured
+    /// `min_threshold`. Deducts from both the program balance and the contract total balance.
+    /// Emits `LowBalanceWarning` if post-award balance drops below `min_threshold`.
+    pub fn award_from_program(
+        env: Env,
+        caller: Address,
+        program_id: u64,
+        researcher: Address,
+        amount: i128,
+        report_hash: BytesN<32>,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::get_governance(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(BountyError::InvalidAmount);
+        }
+        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+            return Err(BountyError::DuplicateReport);
+        }
+
+        let prog_balance = Self::get_program_balance(&env, program_id);
+        let rules_opt = env
+            .storage()
+            .persistent()
+            .get::<_, RefillRules>(&DataKey::RefillRules(program_id));
+
+        if let Some(ref rules) = rules_opt {
+            if prog_balance < rules.min_threshold {
+                return Err(BountyError::ProgramBelowThreshold);
+            }
+        }
+
+        if amount > prog_balance {
+            return Err(BountyError::InsufficientBalance);
+        }
+
+        let total_balance = Self::get_balance(&env)?;
+        if amount > total_balance {
+            return Err(BountyError::InsufficientBalance);
+        }
+
+        let token = Self::get_token(&env)?;
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
+
+        let new_total = total_balance - amount;
+        env.storage().instance().set(&DataKey::Balance, &new_total);
+
+        let new_prog_bal = prog_balance - amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProgramBalance(program_id), &new_prog_bal);
+
+        let record = AwardRecord {
+            researcher: researcher.clone(),
+            amount,
+            report_hash: report_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::Award(report_hash.clone()), &record);
+
+        env.events().publish(
+            (symbol_short!("bounty"), symbol_short!("award")),
+            (researcher, amount, report_hash),
+        );
+
+        if let Some(rules) = rules_opt {
+            if new_prog_bal < rules.min_threshold {
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "LowBalanceWarning"),
+                        program_id,
+                    ),
+                    (new_prog_bal, rules.min_threshold),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Award a bounty using canonical protocol units (1e7), normalizing to native token units
     /// with floor rounding (protecting against dust overpayment).
     /// Returns the actual native token amount awarded.
@@ -186,6 +452,18 @@ impl RefractBountyEscrow {
         Self::get_balance(&env)
     }
 
+    /// Current funds held for a specific bounty program.
+    pub fn program_balance(env: Env, program_id: u64) -> i128 {
+        Self::get_program_balance(&env, program_id)
+    }
+
+    /// Configured refill rules for a specific bounty program.
+    pub fn get_refill_rules(env: Env, program_id: u64) -> Option<RefillRules> {
+        env.storage()
+            .persistent()
+            .get::<_, RefillRules>(&DataKey::RefillRules(program_id))
+    }
+
     /// The governance/timelock address authorized to award payouts.
     pub fn governance(env: Env) -> Result<Address, BountyError> {
         Self::get_governance(&env)
@@ -199,6 +477,13 @@ impl RefractBountyEscrow {
     /// Immutable record of a rewarded disclosure, if any.
     pub fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
         env.storage().persistent().get(&DataKey::Award(report_hash))
+    }
+
+    fn get_program_balance(env: &Env, program_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::ProgramBalance(program_id))
+            .unwrap_or(0i128)
     }
 
     fn assert_live_and_consistent(env: &Env) -> Result<(i128, Address), BountyError> {
@@ -259,7 +544,7 @@ impl RefractBountyEscrow {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{testutils::Address as _, testutils::Events as _, Env, TryFromVal};
 
     #[test]
     fn test_bounty_canonical_award() {
@@ -335,5 +620,210 @@ mod test {
         let res_bal = client.try_balance();
         assert_eq!(res_bal, Err(Ok(BountyError::StateArchived)));
     }
-}
 
+    #[test]
+    fn test_top_up_program_success_and_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        client.initialize(&governance, &token_id);
+
+        let sponsor = Address::generate(&env);
+        sac.mint(&sponsor, &500_000_000);
+
+        // Top up program 1 with 200_000_000
+        let prog_bal = client.top_up_program(&sponsor, &1, &200_000_000);
+        assert_eq!(prog_bal, 200_000_000);
+        assert_eq!(client.program_balance(&1), 200_000_000);
+        assert_eq!(client.balance(), 200_000_000);
+
+        // Top up again with 100_000_000
+        let prog_bal_2 = client.top_up_program(&sponsor, &1, &100_000_000);
+        assert_eq!(prog_bal_2, 300_000_000);
+        assert_eq!(client.program_balance(&1), 300_000_000);
+        assert_eq!(client.balance(), 300_000_000);
+
+        // Check ProgramToppedUp event emitted
+        let events = env.events().all();
+        let topped_up_found = events.iter().any(|(_, topics, _)| {
+            topics.iter().any(|t| {
+                Symbol::try_from_val(&env, &t)
+                    .map(|s| s == Symbol::new(&env, "ProgramToppedUp"))
+                    .unwrap_or(false)
+            })
+        });
+        assert!(topped_up_found, "ProgramToppedUp event must be emitted");
+
+        // Reject invalid top-up amount
+        assert_eq!(
+            client.try_top_up_program(&sponsor, &1, &0),
+            Err(Ok(BountyError::InvalidAmount))
+        );
+        assert_eq!(
+            client.try_top_up_program(&sponsor, &1, &-10),
+            Err(Ok(BountyError::InvalidAmount))
+        );
+    }
+
+    #[test]
+    fn test_configure_refill_rules_and_low_balance_warning() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+
+        client.initialize(&governance, &token_id);
+
+        let treasury_source = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        // Stranger cannot configure refill rules
+        assert_eq!(
+            client.try_configure_refill_rules(&stranger, &1, &100_000_000, &500_000_000, &treasury_source),
+            Err(Ok(BountyError::Unauthorized))
+        );
+
+        // Governance configures rules when program balance is 0 (< 100_000_000) -> emits LowBalanceWarning
+        client.configure_refill_rules(&governance, &1, &100_000_000, &500_000_000, &treasury_source);
+
+        let rules = client.get_refill_rules(&1).expect("Rules should be saved");
+        assert_eq!(rules.min_threshold, 100_000_000);
+        assert_eq!(rules.refill_amount, 500_000_000);
+        assert_eq!(rules.allowance_source, treasury_source);
+
+        // Check LowBalanceWarning was emitted
+        let events = env.events().all();
+        let warning_found = events.iter().any(|(_, topics, _)| {
+            topics.iter().any(|t| {
+                Symbol::try_from_val(&env, &t)
+                    .map(|s| s == Symbol::new(&env, "LowBalanceWarning"))
+                    .unwrap_or(false)
+            })
+        });
+        assert!(warning_found, "LowBalanceWarning event must be emitted");
+
+        // check_balance_threshold returns true
+        assert_eq!(client.check_balance_threshold(&1), true);
+    }
+
+    #[test]
+    fn test_auto_refill_lifecycle_and_rejections() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        client.initialize(&governance, &token_id);
+
+        let treasury = Address::generate(&env);
+        let keeper = Address::generate(&env);
+
+        sac.mint(&treasury, &1_000_000_000);
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.approve(&treasury, &contract_id, &1_000_000_000, &100_000);
+
+        // Attempt refill before rules configured -> RulesNotFound
+        assert_eq!(
+            client.try_auto_refill(&keeper, &1),
+            Err(Ok(BountyError::RulesNotFound))
+        );
+
+        // Configure rules: min_threshold = 100_000_000, refill = 400_000_000
+        client.configure_refill_rules(&governance, &1, &100_000_000, &400_000_000, &treasury);
+
+        // Execute auto_refill via keeper
+        let new_bal = client.auto_refill(&keeper, &1);
+        assert_eq!(new_bal, 400_000_000);
+        assert_eq!(client.program_balance(&1), 400_000_000);
+        assert_eq!(client.balance(), 400_000_000);
+
+        let token_client = token::Client::new(&env, &token_id);
+        assert_eq!(token_client.balance(&contract_id), 400_000_000);
+        assert_eq!(token_client.balance(&treasury), 600_000_000);
+
+        // Attempting refill when balance is above threshold -> RefillNotNeeded
+        assert_eq!(
+            client.try_auto_refill(&keeper, &1),
+            Err(Ok(BountyError::RefillNotNeeded))
+        );
+
+        // Verify ProgramAutoRefilled event
+        let events = env.events().all();
+        let refilled_found = events.iter().any(|(_, topics, _)| {
+            topics.iter().any(|t| {
+                Symbol::try_from_val(&env, &t)
+                    .map(|s| s == Symbol::new(&env, "ProgramAutoRefilled"))
+                    .unwrap_or(false)
+            })
+        });
+        assert!(refilled_found, "ProgramAutoRefilled event must be emitted");
+    }
+
+    #[test]
+    fn test_award_from_program_blocks_when_below_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RefractBountyEscrow);
+        let client = RefractBountyEscrowClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let sac = token::StellarAssetClient::new(&env, &token_id);
+
+        client.initialize(&governance, &token_id);
+
+        let sponsor = Address::generate(&env);
+        sac.mint(&sponsor, &500_000_000);
+
+        // Top up 250_000_000
+        client.top_up_program(&sponsor, &1, &250_000_000);
+
+        let treasury = Address::generate(&env);
+        // Configure rules with threshold 100_000_000
+        client.configure_refill_rules(&governance, &1, &100_000_000, &300_000_000, &treasury);
+
+        let researcher = Address::generate(&env);
+        let report_hash1 = BytesN::from_array(&env, &[1u8; 32]);
+
+        // Award 160_000_000 -> balance becomes 90_000_000 (< 100_000_000 threshold)
+        client.award_from_program(&governance, &1, &researcher, &160_000_000, &report_hash1);
+        assert_eq!(client.program_balance(&1), 90_000_000);
+        assert_eq!(client.balance(), 90_000_000);
+
+        // Next award must be BLOCKED because program balance is below threshold
+        let report_hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        let blocked = client.try_award_from_program(&governance, &1, &researcher, &10_000_000, &report_hash2);
+        assert_eq!(blocked, Err(Ok(BountyError::ProgramBelowThreshold)));
+
+        // Keeper triggers auto_refill
+        sac.mint(&treasury, &500_000_000);
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.approve(&treasury, &contract_id, &500_000_000, &100_000);
+        let keeper = Address::generate(&env);
+        client.auto_refill(&keeper, &1);
+
+        assert_eq!(client.program_balance(&1), 390_000_000);
+        assert_eq!(client.balance(), 390_000_000);
+
+        // Now award succeeds!
+        client.award_from_program(&governance, &1, &researcher, &10_000_000, &report_hash2);
+        assert_eq!(client.program_balance(&1), 380_000_000);
+    }
+}
