@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "contracts": {
+    "governance": "G_TIMELOCK_AUTHORITY",
+    "treasury": "C_REFRACT_TREASURY",
+    "bounty": "C_REFRACT_BOUNTY",
+    "grants": "C_REFRACT_GRANTS"
+  },
+  "assets": {
+    "USDC": "C_USDC_TOKEN"
+  },
+  "treasury_balances": {
+    "USDC": 25000
+  },
+  "escrow_balances": {
+    "bounty": {
+      "USDC": 500
+    },
+    "grants": {
+      "USDC": 1000
+    }
+  },
+  "already_imported_ids": [],
+  "bounties": [
+    {
+      "legacy_id": "bounty-2025-001",
+      "asset": "USDC",
+      "researcher": "G_RESEARCHER_ALPHA",
+      "amount": 1000,
+      "report_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "timestamp": 1700000000,
+      "already_settled": true
+    },
+    {
+      "legacy_id": "bounty-2025-002",
+      "asset": "USDC",
+      "researcher": "G_RESEARCHER_BETA",
+      "amount": 1200,
+      "report_hash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+      "timestamp": 1705000000,
+      "already_settled": false
+    }
+  ],
+  "grants": [
+    {
+      "legacy_id": "grant-2025-001",
+      "asset": "USDC",
+      "recipient": "G_GRANTEE_ONE",
+      "total_amount": 5000,
+      "milestones": [
+        { "amount": 1000, "confirmed": true, "claimed": true },
+        { "amount": 1500, "confirmed": true, "claimed": false },
+        { "amount": 2500, "confirmed": false, "claimed": false }
+      ]
+    }
+  ]
+}
