@@ -1,0 +1,13 @@
+[package]
+name = "refract-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared 1e7 fixed-point checked and saturating arithmetic for Refract contracts"
+license = "MIT"
+
+[lib]
+name = "refract_common"
+path = "src/lib.rs"
+
+[dev-dependencies]
+proptest = { workspace = true }

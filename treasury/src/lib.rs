@@ -1,5 +1,7 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
+use refract_common::checked_sub_non_negative;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
 /// Storage keys for the treasury contract.
@@ -35,6 +37,8 @@ impl RefractTreasury {
     }
 
     /// Withdraw `amount` of `token` to `to`. Only the admin may call this.
+    /// Uses `refract_common::checked_sub_non_negative` to validate positive
+    /// outflow against the vault's current balance before transferring.
     pub fn withdraw(env: Env, caller: Address, token: Address, amount: i128, to: Address) {
         caller.require_auth();
         let admin: Address = env
@@ -49,6 +53,10 @@ impl RefractTreasury {
             panic!("amount must be positive");
         }
         let client = token::Client::new(&env, &token);
+        let vault_balance = client.balance(&env.current_contract_address());
+        if checked_sub_non_negative(vault_balance, amount).is_err() {
+            panic!("insufficient treasury balance");
+        }
         client.transfer(&env.current_contract_address(), &to, &amount);
     }
 }
@@ -70,7 +78,9 @@ mod test {
         assert_eq!(client.admin(), admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
