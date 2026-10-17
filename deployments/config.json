@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "protocol": "refract-protocol",
+  "networks": {
+    "local": {
+      "network_passphrase": "Standalone Network ; February 2017",
+      "rpc_url": "http://localhost:8000/soroban/rpc",
+      "usdc_token_symbol": "USDC"
+    },
+    "testnet": {
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "rpc_url": "https://soroban-testnet.stellar.org",
+      "usdc_token_symbol": "USDC"
+    }
+  },
+  "contracts": [
+    {
+      "name": "refract_multisig",
+      "package": "refract-multisig",
+      "wasm_file": "refract_multisig.wasm",
+      "phase": 1,
+      "admin_role": "self_governed_signers",
+      "init_args": {
+        "threshold": 3,
+        "signer_count": 5
+      },
+      "wires_to": []
+    },
+    {
+      "name": "refract_incident_response",
+      "package": "refract-incident-response",
+      "wasm_file": "refract_incident_response.wasm",
+      "phase": 1,
+      "admin_role": "refract_timelock",
+      "guardian_role": "refract_multisig",
+      "init_args": {
+        "sunset_window_secs": 604800
+      },
+      "wires_to": ["refract_multisig", "refract_timelock"]
+    },
+    {
+      "name": "refract_vetoken",
+      "package": "refract-vetoken",
+      "wasm_file": "refract_vetoken.wasm",
+      "phase": 2,
+      "admin_role": "refract_timelock",
+      "init_args": {
+        "max_lock_secs": 126144000
+      },
+      "wires_to": ["refract_timelock"]
+    },
+    {
+      "name": "refract_timelock",
+      "package": "refract-timelock",
+      "wasm_file": "refract_timelock.wasm",
+      "phase": 2,
+      "admin_role": "refract_governance",
+      "guardian_role": "refract_multisig",
+      "init_args": {
+        "min_delay_secs": 172800,
+        "grace_period_secs": 604800
+      },
+      "wires_to": ["refract_governance", "refract_multisig"]
+    },
+    {
+      "name": "refract_governance",
+      "package": "refract-governance",
+      "wasm_file": "refract_governance.wasm",
+      "phase": 2,
+      "admin_role": "refract_timelock",
+      "init_args": {
+        "voting_period_secs": 259200,
+        "quorum_bps": 1000
+      },
+      "wires_to": ["refract_vetoken", "refract_timelock"]
+    },
+    {
+      "name": "refract_oracle",
+      "package": "refract-oracle",
+      "wasm_file": "refract_oracle.wasm",
+      "phase": 3,
+      "admin_role": "refract_timelock",
+      "init_args": {
+        "max_staleness_secs": 1800,
+        "min_submission_interval_secs": 60
+      },
+      "wires_to": ["refract_timelock"]
+    },
+    {
+      "name": "refract_policy",
+      "package": "refract-policy",
+      "wasm_file": "refract_policy.wasm",
+      "phase": 3,
+      "admin_role": "refract_timelock",
+      "init_args": {
+        "pool_contract": "@refract_pool"
+      },
+      "wires_to": ["refract_pool", "refract_timelock"]
+    },
+    {
+      "name": "refract_pool",
+      "package": "refract-pool",
+      "wasm_file": "refract_pool.wasm",
+      "phase": 3,
+      "admin_role": "refract_timelock",
+      "init_args": {
+        "policy_registry": "@refract_policy",
+        "oracle_contract": "@refract_oracle",
+        "backstop_contract": "@refract_backstop"
+      },
+      "wires_to": ["refract_policy", "refract_oracle", "refract_backstop", "refract_timelock"]
+    },
+    {
+      "name": "refract_backstop",
+      "package": "refract-backstop",
+      "wasm_file": "refract_backstop.wasm",
+      "phase": 4,
+      "admin_role": "refract_timelock",
+      "init_args": {
+        "pool_contract": "@refract_pool",
+        "admin": "@refract_timelock",
+        "premium_share_bps": 2000
+      },
+      "wires_to": ["refract_pool", "refract_timelock"]
+    },
+    {
+      "name": "refract_treasury",
+      "package": "refract-treasury",
+      "wasm_file": "refract_treasury.wasm",
+      "phase": 4,
+      "admin_role": "refract_timelock",
+      "guardian_role": "refract_incident_response",
+      "init_args": {
+        "admin": "@refract_timelock",
+        "epoch_duration_secs": 604800
+      },
+      "wires_to": ["refract_timelock", "refract_incident_response"]
+    },
+    {
+      "name": "refract_bounty",
+      "package": "refract-bounty",
+      "wasm_file": "refract_bounty.wasm",
+      "phase": 4,
+      "admin_role": "refract_timelock",
+      "init_args": {
+        "governance": "@refract_timelock"
+      },
+      "wires_to": ["refract_timelock"]
+    },
+    {
+      "name": "refract_grants",
+      "package": "refract-grants",
+      "wasm_file": "refract_grants.wasm",
+      "phase": 4,
+      "admin_role": "refract_timelock",
+      "init_args": {
+        "governance": "@refract_timelock"
+      },
+      "wires_to": ["refract_timelock"]
+    }
+  ]
+}

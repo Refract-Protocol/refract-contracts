@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "protocol": "refract-protocol",
+  "network": "testnet",
+  "network_passphrase": "Test SDF Network ; September 2015",
+  "rpc_url": "https://soroban-testnet.stellar.org",
+  "deployer_identity_alias": "bootstrap-deployer",
+  "assets": {
+    "USDC": "CCQXCX5B2ETTK4ZKHMVHVCPCXOLH2D26PSHBSMLV42SLWOCEKC2BJBE6"
+  },
+  "contracts": [
+    {
+      "name": "refract_multisig",
+      "package": "refract-multisig",
+      "wasm_file": "refract_multisig.wasm",
+      "phase": 1,
+      "contract_id": "CDRJDCL37BKYWOB6KYR6U45NABMEBWDZ5NXDGHBTGNXA4JAV4Z3OVSOV",
+      "wasm_sha256": "594b232f60bd584efcba234e3edf46930799affcf2a8367453de66d358a3f33c",
+      "admin_role": "self_governed_signers",
+      "admin_address": "CDRJDCL37BKYWOB6KYR6U45NABMEBWDZ5NXDGHBTGNXA4JAV4Z3OVSOV",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "threshold": 3,
+        "signer_count": 5
+      },
+      "wired_peers": {}
+    },
+    {
+      "name": "refract_incident_response",
+      "package": "refract-incident-response",
+      "wasm_file": "refract_incident_response.wasm",
+      "phase": 1,
+      "contract_id": "CAN6SJUHUFATCJ2GR5E4YX775YJ3I5V4BNJAGLGIQZ2LHOVEAI7KQJX3",
+      "wasm_sha256": "d3cda02af82dc1527408565bc65cffe616dd063802db29d57ec1387fbd1f5547",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": "CDRJDCL37BKYWOB6KYR6U45NABMEBWDZ5NXDGHBTGNXA4JAV4Z3OVSOV",
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "sunset_window_secs": 604800
+      },
+      "wired_peers": {
+        "refract_multisig": "CDRJDCL37BKYWOB6KYR6U45NABMEBWDZ5NXDGHBTGNXA4JAV4Z3OVSOV",
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    },
+    {
+      "name": "refract_vetoken",
+      "package": "refract-vetoken",
+      "wasm_file": "refract_vetoken.wasm",
+      "phase": 2,
+      "contract_id": "CC5HTO72ZRXCGCCLRMP5BAUQ4MQZRCKMNGV6O4AVIN5SYAG53MUZYCVG",
+      "wasm_sha256": "278a5d0c58ec290fecb2287dbb212f416708e11f46c8241315ce8377bfa49ac4",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "max_lock_secs": 126144000
+      },
+      "wired_peers": {
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    },
+    {
+      "name": "refract_timelock",
+      "package": "refract-timelock",
+      "wasm_file": "refract_timelock.wasm",
+      "phase": 2,
+      "contract_id": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "wasm_sha256": "46b2c58ee669f3d69544b97f98b780275ed125ee67d779137f0f6071a9202cba",
+      "admin_role": "refract_governance",
+      "admin_address": "CAMFKWY54F5Y3AKAAXA2NYGPTZW4F33HRLORA5RARGEAJVD4UYF2VIVT",
+      "guardian_address": "CDRJDCL37BKYWOB6KYR6U45NABMEBWDZ5NXDGHBTGNXA4JAV4Z3OVSOV",
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "min_delay_secs": 172800,
+        "grace_period_secs": 604800
+      },
+      "wired_peers": {
+        "refract_governance": "CAMFKWY54F5Y3AKAAXA2NYGPTZW4F33HRLORA5RARGEAJVD4UYF2VIVT",
+        "refract_multisig": "CDRJDCL37BKYWOB6KYR6U45NABMEBWDZ5NXDGHBTGNXA4JAV4Z3OVSOV"
+      }
+    },
+    {
+      "name": "refract_governance",
+      "package": "refract-governance",
+      "wasm_file": "refract_governance.wasm",
+      "phase": 2,
+      "contract_id": "CAMFKWY54F5Y3AKAAXA2NYGPTZW4F33HRLORA5RARGEAJVD4UYF2VIVT",
+      "wasm_sha256": "b40d8d8258a7e0b8f4624408af8ef14b1e03591be5275ae75b4018495b577798",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "voting_period_secs": 259200,
+        "quorum_bps": 1000
+      },
+      "wired_peers": {
+        "refract_vetoken": "CC5HTO72ZRXCGCCLRMP5BAUQ4MQZRCKMNGV6O4AVIN5SYAG53MUZYCVG",
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    },
+    {
+      "name": "refract_oracle",
+      "package": "refract-oracle",
+      "wasm_file": "refract_oracle.wasm",
+      "phase": 3,
+      "contract_id": "CDCUYZAXYSGCNVXQRQCV4DGBUOEZZFEE4GDDBN6MAMEA5FIQ2NRRIEGD",
+      "wasm_sha256": "5c3bed545edd541e66a04c146d3f7ac7f0e3388f00160b454959dc4cb6f21a9e",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "max_staleness_secs": 1800,
+        "min_submission_interval_secs": 60
+      },
+      "wired_peers": {
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    },
+    {
+      "name": "refract_policy",
+      "package": "refract-policy",
+      "wasm_file": "refract_policy.wasm",
+      "phase": 3,
+      "contract_id": "CAB3OQALTLJ4IGXXPAG3TKQOZWH5PAS3VUXOOKZLD6Q27WD5OAJ3DYUW",
+      "wasm_sha256": "762478be00505d816c5ead070ef546bb3a2eeb3506151f40ebcd3f2de41a246c",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "pool_contract": "CADJ32SVF7UCACV3FMPWLXEBLLJTDMJAIOAPFSWRF2H7TNUNUGXETFVS"
+      },
+      "wired_peers": {
+        "refract_pool": "CADJ32SVF7UCACV3FMPWLXEBLLJTDMJAIOAPFSWRF2H7TNUNUGXETFVS",
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    },
+    {
+      "name": "refract_pool",
+      "package": "refract-pool",
+      "wasm_file": "refract_pool.wasm",
+      "phase": 3,
+      "contract_id": "CADJ32SVF7UCACV3FMPWLXEBLLJTDMJAIOAPFSWRF2H7TNUNUGXETFVS",
+      "wasm_sha256": "b4fecab8f43478fb82156cf60a0c14bd158a936d8659e0592e282353c7cbd025",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "policy_registry": "CAB3OQALTLJ4IGXXPAG3TKQOZWH5PAS3VUXOOKZLD6Q27WD5OAJ3DYUW",
+        "oracle_contract": "CDCUYZAXYSGCNVXQRQCV4DGBUOEZZFEE4GDDBN6MAMEA5FIQ2NRRIEGD",
+        "backstop_contract": "CCEPG3YZ3WSLPB22IEDQCETJ7FTAH2OBRBCAOETL7HWPFM564XHRJJIL"
+      },
+      "wired_peers": {
+        "refract_policy": "CAB3OQALTLJ4IGXXPAG3TKQOZWH5PAS3VUXOOKZLD6Q27WD5OAJ3DYUW",
+        "refract_oracle": "CDCUYZAXYSGCNVXQRQCV4DGBUOEZZFEE4GDDBN6MAMEA5FIQ2NRRIEGD",
+        "refract_backstop": "CCEPG3YZ3WSLPB22IEDQCETJ7FTAH2OBRBCAOETL7HWPFM564XHRJJIL",
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    },
+    {
+      "name": "refract_backstop",
+      "package": "refract-backstop",
+      "wasm_file": "refract_backstop.wasm",
+      "phase": 4,
+      "contract_id": "CCEPG3YZ3WSLPB22IEDQCETJ7FTAH2OBRBCAOETL7HWPFM564XHRJJIL",
+      "wasm_sha256": "c6bc25ce64fa28dff50bfc6cc451459a850de035cc2c032b11aa2a875ce45615",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "pool_contract": "CADJ32SVF7UCACV3FMPWLXEBLLJTDMJAIOAPFSWRF2H7TNUNUGXETFVS",
+        "admin": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+        "premium_share_bps": 2000
+      },
+      "wired_peers": {
+        "refract_pool": "CADJ32SVF7UCACV3FMPWLXEBLLJTDMJAIOAPFSWRF2H7TNUNUGXETFVS",
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    },
+    {
+      "name": "refract_treasury",
+      "package": "refract-treasury",
+      "wasm_file": "refract_treasury.wasm",
+      "phase": 4,
+      "contract_id": "CCMH5ZJNAL274ZYF7IMTI3OBE2IORYMAL27UATCACIY4OQGVNO3DSH6P",
+      "wasm_sha256": "c5a1d2979533135fe5f47a5a5531366c023a0f499a8c9b5d902a93b16da2e90d",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": "CAN6SJUHUFATCJ2GR5E4YX775YJ3I5V4BNJAGLGIQZ2LHOVEAI7KQJX3",
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "admin": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+        "epoch_duration_secs": 604800
+      },
+      "wired_peers": {
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+        "refract_incident_response": "CAN6SJUHUFATCJ2GR5E4YX775YJ3I5V4BNJAGLGIQZ2LHOVEAI7KQJX3"
+      }
+    },
+    {
+      "name": "refract_bounty",
+      "package": "refract-bounty",
+      "wasm_file": "refract_bounty.wasm",
+      "phase": 4,
+      "contract_id": "CCSCTZGUJHK32TAY7DOJB634VAXCL5QOPCUHCAVIFMJOC6S5JYXNFZNT",
+      "wasm_sha256": "d24c5cfdca142bcf28f98acce0351f8800d5b82ee0bc80b254b0c34e2c1bc578",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "governance": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      },
+      "wired_peers": {
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    },
+    {
+      "name": "refract_grants",
+      "package": "refract-grants",
+      "wasm_file": "refract_grants.wasm",
+      "phase": 4,
+      "contract_id": "CDDHEQ5LGINJKSHLF7WZESJ2K7PILPWQRDVTQWF7ML63Z7Z25KC7L2IU",
+      "wasm_sha256": "e23e39b6ea5a244bddcd311c18e354a706ba2be05b97a73218951de789e8fac2",
+      "admin_role": "refract_timelock",
+      "admin_address": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3",
+      "guardian_address": null,
+      "initialized": true,
+      "idempotent_skip_init": false,
+      "bootstrap_deployer_revoked": true,
+      "init_params": {
+        "governance": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      },
+      "wired_peers": {
+        "refract_timelock": "CASITOSJJROHNYW26WM4Y23PXFEYQNEWYOLJISFRRG6LB6CO4DNB64R3"
+      }
+    }
+  ]
+}
