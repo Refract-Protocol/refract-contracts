@@ -78,9 +78,21 @@ pub enum GrantsError {
     InvalidProgramBudget,
     /// Round start timestamp must be less than or equal to round end timestamp.
     InvalidRoundTime,
+    /// Final milestone requires licensing attestation before release.
+    MissingLicensingAttestation,
+    /// SPDX license identifier is invalid or empty.
+    InvalidLicense,
 }
 
 pub type GrantError = GrantsError;
+
+/// Deliverable licensing and IP assignment attestation record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LicensingAttestationRecord {
+    pub spdx_license: String,
+    pub deliverable_hash: [u8; 32],
+    pub ip_attestation_signature: Option<Vec<u8>>,
+}
 
 /// A funding program record in the registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +146,8 @@ pub struct RefractGrants {
     next_program_id: u64,
     /// Stored programs keyed by id.
     programs: BTreeMap<u64, ProgramRecord>,
+    /// Stored deliverable licensing attestations keyed by grant id.
+    licensings: BTreeMap<GrantId, LicensingAttestationRecord>,
 }
 
 impl RefractGrants {
@@ -145,6 +159,7 @@ impl RefractGrants {
             grants: BTreeMap::new(),
             next_program_id: 0,
             programs: BTreeMap::new(),
+            licensings: BTreeMap::new(),
         }
     }
 
@@ -419,8 +434,20 @@ impl RefractGrants {
             .get_mut(&grant_id)
             .ok_or(GrantsError::GrantNotFound)?;
 
-        if milestone_index >= grant.milestones.len() {
+        let total_milestones = grant.milestones.len();
+        if milestone_index >= total_milestones {
             return Err(GrantsError::InvalidMilestoneIndex);
+        }
+
+        let is_final = milestone_index == total_milestones - 1;
+        if is_final {
+            if let Some(attestation) = self.licensings.get(&grant_id) {
+                if attestation.spdx_license.is_empty() {
+                    return Err(GrantsError::InvalidLicense);
+                }
+            } else if grant.program_id.is_some() {
+                return Err(GrantsError::MissingLicensingAttestation);
+            }
         }
 
         for earlier in grant.milestones.iter().take(milestone_index) {
@@ -466,6 +493,48 @@ impl RefractGrants {
         Ok(release_amount)
     }
 
+    /// Records a deliverable licensing attestation and IP assignment for a grant.
+    pub fn attest_licensing(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+        spdx_license: String,
+        deliverable_hash: [u8; 32],
+        ip_attestation_signature: Option<Vec<u8>>,
+    ) -> Result<(), GrantsError> {
+        let grant = self
+            .grants
+            .get(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+
+        if caller != grant.recipient && caller != self.governance {
+            return Err(GrantsError::Unauthorized);
+        }
+
+        if spdx_license.is_empty() {
+            return Err(GrantsError::InvalidLicense);
+        }
+
+        self.licensings.insert(
+            grant_id,
+            LicensingAttestationRecord {
+                spdx_license,
+                deliverable_hash,
+                ip_attestation_signature,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Returns the licensing attestation for `grant_id`, if recorded.
+    pub fn get_licensing_attestation(
+        &self,
+        grant_id: GrantId,
+    ) -> Option<&LicensingAttestationRecord> {
+        self.licensings.get(&grant_id)
+    }
+
     /// Confirms delivery of a single milestone, making its amount claimable.
     ///
     /// Governance/timelock-gated and separate from creation so different
@@ -484,8 +553,20 @@ impl RefractGrants {
             .get_mut(&grant_id)
             .ok_or(GrantsError::GrantNotFound)?;
 
-        if milestone_index >= grant.milestones.len() {
+        let total_milestones = grant.milestones.len();
+        if milestone_index >= total_milestones {
             return Err(GrantsError::InvalidMilestoneIndex);
+        }
+
+        let is_final = milestone_index == total_milestones - 1;
+        if is_final {
+            if let Some(attestation) = self.licensings.get(&grant_id) {
+                if attestation.spdx_license.is_empty() {
+                    return Err(GrantsError::InvalidLicense);
+                }
+            } else if grant.program_id.is_some() {
+                return Err(GrantsError::MissingLicensingAttestation);
+            }
         }
 
         // Enforce in-order confirmation: every earlier milestone must already be
@@ -585,8 +666,8 @@ impl RefractGrants {
 pub mod contract {
     use super::*;
     use soroban_sdk::{
-        contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-        Vec,
+        contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
+        Env, Symbol, Vec,
     };
 
     #[contracttype]
@@ -598,6 +679,7 @@ pub mod contract {
         NextProgramId,
         Program(u64),
         GrantProgram(u64),
+        Licensing(u64),
     }
 
     #[contracttype]
@@ -631,6 +713,14 @@ pub mod contract {
 
     pub type ProgramRegistry = ProgramInfo;
 
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LicensingAttestation {
+        pub spdx_license: Symbol,
+        pub deliverable_hash: BytesN<32>,
+        pub ip_attestation_signature: Option<Bytes>,
+    }
+
     #[contracterror]
     #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
     #[repr(u32)]
@@ -653,6 +743,8 @@ pub mod contract {
         BudgetExceeded = 16,
         InvalidProgramBudget = 17,
         InvalidRoundTime = 18,
+        MissingLicensingAttestation = 19,
+        InvalidLicense = 20,
     }
 
     pub use self::GrantsContractError as GrantContractError;
@@ -999,6 +1091,18 @@ pub mod contract {
                 return Err(GrantsContractError::MilestoneAlreadyConfirmed);
             }
 
+            let is_final = idx == grant.milestones.len() - 1;
+            if is_final {
+                let attestation: LicensingAttestation = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::Licensing(grant_id))
+                    .ok_or(GrantsContractError::MissingLicensingAttestation)?;
+                if attestation.spdx_license == Symbol::new(&env, "") {
+                    return Err(GrantsContractError::InvalidLicense);
+                }
+            }
+
             if let Some(program_id) = env.storage().persistent().get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id)) {
                 let mut program: ProgramInfo = env
                     .storage()
@@ -1060,6 +1164,18 @@ pub mod contract {
                 return Err(GrantsContractError::MilestoneAlreadyConfirmed);
             }
 
+            let is_final = idx == grant.milestones.len() - 1;
+            if is_final {
+                let attestation: LicensingAttestation = env
+                    .storage()
+                    .persistent()
+                    .get(&GrantsDataKey::Licensing(grant_id))
+                    .ok_or(GrantsContractError::MissingLicensingAttestation)?;
+                if attestation.spdx_license == Symbol::new(&env, "") {
+                    return Err(GrantsContractError::InvalidLicense);
+                }
+            }
+
             if let Some(program_id) = env.storage().persistent().get::<_, u64>(&GrantsDataKey::GrantProgram(grant_id)) {
                 let mut program: ProgramInfo = env
                     .storage()
@@ -1084,6 +1200,63 @@ pub mod contract {
                 (grant_id, milestone_index),
             );
             Ok(())
+        }
+
+        pub fn attest_licensing(
+            env: Env,
+            caller: Address,
+            grant_id: u64,
+            spdx_license: Symbol,
+            deliverable_hash: BytesN<32>,
+            ip_attestation_signature: Option<Bytes>,
+        ) -> Result<(), GrantsContractError> {
+            caller.require_auth();
+            let grant: GrantRecord = env
+                .storage()
+                .persistent()
+                .get(&GrantsDataKey::Grant(grant_id))
+                .ok_or(GrantsContractError::GrantNotFound)?;
+
+            let gov: Address = env
+                .storage()
+                .instance()
+                .get(&GrantsDataKey::Governance)
+                .ok_or(GrantsContractError::Unauthorized)?;
+
+            if caller != grant.recipient && caller != gov {
+                return Err(GrantsContractError::Unauthorized);
+            }
+
+            if spdx_license == Symbol::new(&env, "") {
+                return Err(GrantsContractError::InvalidLicense);
+            }
+
+            let attestation = LicensingAttestation {
+                spdx_license: spdx_license.clone(),
+                deliverable_hash: deliverable_hash.clone(),
+                ip_attestation_signature: ip_attestation_signature.clone(),
+            };
+
+            env.storage()
+                .persistent()
+                .set(&GrantsDataKey::Licensing(grant_id), &attestation);
+
+            env.events().publish(
+                (Symbol::new(&env, "LicensingAttested"),),
+                (grant_id, spdx_license, deliverable_hash),
+            );
+
+            Ok(())
+        }
+
+        pub fn get_licensing_attestation(
+            env: Env,
+            grant_id: u64,
+        ) -> Result<LicensingAttestation, GrantsContractError> {
+            env.storage()
+                .persistent()
+                .get(&GrantsDataKey::Licensing(grant_id))
+                .ok_or(GrantsContractError::MissingLicensingAttestation)
         }
 
         pub fn claim(
@@ -1135,8 +1308,9 @@ pub mod contract {
 }
 
 pub use contract::{
-    GrantContractError, GrantRecord, GrantsContractError, GrantsDataKey, MilestoneRecord,
-    ProgramInfo, ProgramRegistry, RefractGrantsContract, RefractGrantsContractClient,
+    GrantContractError, GrantRecord, GrantsContractError, GrantsDataKey, LicensingAttestation,
+    MilestoneRecord, ProgramInfo, ProgramRegistry, RefractGrantsContract,
+    RefractGrantsContractClient,
 };
 
 #[cfg(test)]
@@ -1378,7 +1552,26 @@ mod tests {
         assert_eq!(released, 200);
         assert_eq!(grants.get_program_remaining_budget(pid), 800);
 
-        // Confirm milestone 1 (400)
+        // Confirm milestone 1 (400 - final milestone):
+        // Fails if missing licensing attestation on program grant
+        let missing_lic = grants.confirm_milestone(GOVERNANCE, gid, 1);
+        assert_eq!(missing_lic, Err(GrantsError::MissingLicensingAttestation));
+
+        // Attest with empty license fails
+        let empty_lic = grants.attest_licensing(RECIPIENT, gid, "".to_string(), criteria_hash, None);
+        assert_eq!(empty_lic, Err(GrantsError::InvalidLicense));
+
+        // Valid attestation
+        grants
+            .attest_licensing(RECIPIENT, gid, "MIT".to_string(), criteria_hash, Some(vec![1, 2, 3]))
+            .unwrap();
+
+        let att = grants.get_licensing_attestation(gid).unwrap();
+        assert_eq!(att.spdx_license, "MIT");
+        assert_eq!(att.deliverable_hash, criteria_hash);
+        assert_eq!(att.ip_attestation_signature, Some(vec![1, 2, 3]));
+
+        // Now confirming final milestone 1 succeeds
         grants.confirm_milestone(GOVERNANCE, gid, 1).unwrap();
         assert_eq!(grants.get_program_remaining_budget(pid), 400);
 
@@ -1393,7 +1586,9 @@ mod tests {
 #[cfg(test)]
 mod soroban_grants_tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, Vec};
+    use soroban_sdk::{
+        testutils::Address as _, testutils::Ledger as _, Address, Bytes, BytesN, Env, Symbol, Vec,
+    };
 
     #[test]
     fn test_soroban_program_lifecycle_and_rejections() {
@@ -1453,12 +1648,26 @@ mod soroban_grants_tests {
         // Initial remaining budget is 1000 (0 disbursed)
         assert_eq!(client.get_program_remaining_budget(&pid), 1000);
 
-        // Release milestone 0 (300)
+        // Release milestone 0 (300) - intermediate milestone, no licensing required yet
         let released = client.release_milestone(&gov, &gid, &0);
         assert_eq!(released, 300);
         assert_eq!(client.get_program_remaining_budget(&pid), 700);
 
-        // Confirm milestone 1 (300)
+        // Final milestone 1 (300) without licensing attestation must fail
+        let missing_lic_err = client.try_confirm_milestone(&gov, &gid, &1);
+        assert_eq!(missing_lic_err, Err(Ok(GrantsContractError::MissingLicensingAttestation)));
+
+        // Attesting with empty license must fail
+        let empty_sym = Symbol::new(&env, "");
+        let empty_lic_err = client.try_attest_licensing(&recipient, &gid, &empty_sym, &criteria, &None);
+        assert_eq!(empty_lic_err, Err(Ok(GrantsContractError::InvalidLicense)));
+
+        // Attest with valid SPDX license
+        let mit = Symbol::new(&env, "MIT");
+        let sig = Bytes::from_array(&env, &[9, 8, 7]);
+        client.attest_licensing(&recipient, &gid, &mit, &criteria, &Some(sig));
+
+        // Confirm final milestone 1 now succeeds
         client.confirm_milestone(&gov, &gid, &1);
         assert_eq!(client.get_program_remaining_budget(&pid), 400);
 
@@ -1472,5 +1681,68 @@ mod soroban_grants_tests {
         // Claim funds
         let claimed = client.claim(&recipient, &gid);
         assert_eq!(claimed, 600);
+    }
+
+    #[test]
+    fn test_soroban_licensing_attestation_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, RefractGrantsContract);
+        let client = RefractGrantsContractClient::new(&env, &contract_id);
+
+        let gov = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        client.initialize(&gov);
+
+        let milestones = Vec::from_array(&env, [100i128, 200i128]);
+        let gid = client.create_grant(&gov, &recipient, &300, &milestones);
+
+        let deliverable_hash = BytesN::from_array(&env, &[77u8; 32]);
+        let apache_license = Symbol::new(&env, "Apache_2_0");
+        let sig = Bytes::from_array(&env, &[1, 2, 3, 4, 5]);
+
+        // Unauthorized caller cannot attest licensing
+        let unauth_err = client.try_attest_licensing(
+            &stranger,
+            &gid,
+            &apache_license,
+            &deliverable_hash,
+            &Some(sig.clone()),
+        );
+        assert_eq!(unauth_err, Err(Ok(GrantsContractError::Unauthorized)));
+
+        // Intermediate milestone 0 releases without attestation
+        let m0_released = client.release_milestone(&gov, &gid, &0);
+        assert_eq!(m0_released, 100);
+
+        // Final milestone 1 fails before attestation
+        let final_err = client.try_release_milestone(&gov, &gid, &1);
+        assert_eq!(final_err, Err(Ok(GrantsContractError::MissingLicensingAttestation)));
+
+        // Recipient attests licensing
+        client.attest_licensing(
+            &recipient,
+            &gid,
+            &apache_license,
+            &deliverable_hash,
+            &Some(sig.clone()),
+        );
+
+        // Getter returns exact attestation data
+        let att = client.get_licensing_attestation(&gid);
+        assert_eq!(att.spdx_license, apache_license);
+        assert_eq!(att.deliverable_hash, deliverable_hash);
+        assert_eq!(att.ip_attestation_signature, Some(sig));
+
+        // Final milestone release now succeeds!
+        let m1_released = client.release_milestone(&gov, &gid, &1);
+        assert_eq!(m1_released, 200);
+
+        // Full grant claimable and claimed
+        let claimed = client.claim(&recipient, &gid);
+        assert_eq!(claimed, 300);
     }
 }
