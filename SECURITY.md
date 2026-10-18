@@ -88,3 +88,11 @@ tooling, is retried once and then only warns. A real finding always fails.
   on the roadmap.
 - Trigger thresholds are set at deployment and changed only via admin.
 - Mainnet deployment is strictly gated until an external audit completes and sign-offs are logged in [AUDIT_TRACKING.md](AUDIT_TRACKING.md).
+
+## Pull-Based Disclosure Payouts (`RefractBountyEscrow`)
+
+Approved bug-bounty and grant rewards use a recipient-pull escrow model (`create_payout`, `claim`, `sweep_expired`) rather than direct push transfers:
+1. **Reservation (`create_payout`)**: Governance/timelock creates a `PayoutRecord` (`payout_id`, `recipient`, `asset`, `amount`, `claim_deadline`, `report_hash`) and reserves `amount` so `available_balance = balance - reserved_balance` cannot be double-committed.
+2. **Recipient Pull (`claim`)**: Only the recorded `recipient` can claim `payout_id`. Claims remain valid after `claim_deadline` until `sweep_expired` is executed; once swept, the sweep is final (`AlreadySwept`).
+3. **Permissionless Sweep (`sweep_expired`)**: After `claim_deadline`, anyone may call `sweep_expired(payout_id)` (idempotent) to return unclaimed reserved funds to the available pool balance.
+

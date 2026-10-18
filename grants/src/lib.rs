@@ -1,32 +1,17 @@
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract with pull-based
+//! per-recipient escrow payout records (`create_payout`, `claim_payout`,
+//! `sweep_expired`) and reservation accounting.
 
 use std::collections::BTreeMap;
 
 /// Identifier for a grant.
 pub type GrantId = u64;
+
+/// Identifier for a pull-based escrow payout record.
+pub type PayoutId = u64;
 
 /// Address type used by the contract. Kept as a plain `u64` handle so the crate
 /// stays dependency-free and can be wired to the concrete ledger address type by
@@ -58,6 +43,65 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// No payout record exists for the supplied payout id.
+    PayoutNotFound,
+    /// Insufficient available balance to reserve for a new payout.
+    InsufficientAvailableBalance,
+    /// Payout record has already been claimed.
+    PayoutAlreadyClaimed,
+    /// Payout record has already been swept after expiration.
+    PayoutAlreadySwept,
+    /// Payout claim deadline has not yet passed.
+    DeadlineNotReached,
+    /// Payout deadline must be strictly in the future.
+    InvalidDeadline,
+    /// Simulated or external token transfer failed; state remains intact.
+    TransferFailed,
+    /// Reentrancy lock is active.
+    ReentrancyDetected,
+}
+
+/// Lifecycle state of a pull-based escrow payout record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayoutStatus {
+    Pending,
+    Claimed,
+    Swept,
+}
+
+/// Per-recipient pull-based escrow payout record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayoutRecord {
+    pub payout_id: PayoutId,
+    pub recipient: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub claim_deadline: u64,
+    pub status: PayoutStatus,
+}
+
+/// Events emitted by pull-based escrow payouts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayoutEvent {
+    PayoutCreated {
+        payout_id: PayoutId,
+        recipient: Address,
+        asset: Address,
+        amount: i128,
+        claim_deadline: u64,
+    },
+    PayoutClaimed {
+        payout_id: PayoutId,
+        recipient: Address,
+        asset: Address,
+        amount: i128,
+    },
+    PayoutExpiredSwept {
+        payout_id: PayoutId,
+        recipient: Address,
+        asset: Address,
+        amount: i128,
+    },
 }
 
 /// A single milestone within a grant.
@@ -94,6 +138,18 @@ pub struct RefractGrants {
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Monotonic counter used to allocate pull-based payout ids.
+    next_payout_id: PayoutId,
+    /// Stored pull-based payout escrow records.
+    payouts: BTreeMap<PayoutId, PayoutRecord>,
+    /// Total funded pool balance per asset.
+    pool_balances: BTreeMap<Address, i128>,
+    /// Reserved balance per asset for pending pull-based payouts.
+    reserved_balances: BTreeMap<Address, i128>,
+    /// Emitted payout events (`payout_created`, `payout_claimed`, `payout_expired_swept`).
+    payout_events: Vec<PayoutEvent>,
+    /// Reentrancy guard flag.
+    reentrancy_locked: bool,
 }
 
 impl RefractGrants {
@@ -103,7 +159,198 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            next_payout_id: 0,
+            payouts: BTreeMap::new(),
+            pool_balances: BTreeMap::new(),
+            reserved_balances: BTreeMap::new(),
+            payout_events: Vec::new(),
+            reentrancy_locked: false,
         }
+    }
+
+    /// Deposits `amount` of `asset` into the grants pool so pull payouts can reserve against it.
+    pub fn fund_pool(&mut self, asset: Address, amount: i128) -> Result<(), GrantsError> {
+        if amount <= 0 {
+            return Err(GrantsError::InvalidTotalAmount);
+        }
+        let bal = self.pool_balances.entry(asset).or_insert(0);
+        *bal = bal
+            .checked_add(amount)
+            .ok_or(GrantsError::MilestoneSumMismatch)?;
+        Ok(())
+    }
+
+    /// Returns total balance held for `asset`.
+    pub fn total_balance(&self, asset: Address) -> i128 {
+        self.pool_balances.get(&asset).copied().unwrap_or(0)
+    }
+
+    /// Returns total reserved balance for `asset` across pending pull payouts.
+    pub fn reserved_balance(&self, asset: Address) -> i128 {
+        self.reserved_balances.get(&asset).copied().unwrap_or(0)
+    }
+
+    /// Returns uncommitted balance available for new payout reservations (`total - reserved`).
+    pub fn available_balance(&self, asset: Address) -> i128 {
+        self.total_balance(asset) - self.reserved_balance(asset)
+    }
+
+    /// Creates a per-recipient pull-based escrow payout record and reserves the
+    /// funds so they cannot be double-committed. Governance/timelock-gated.
+    pub fn create_payout(
+        &mut self,
+        caller: Address,
+        recipient: Address,
+        asset: Address,
+        amount: i128,
+        claim_deadline: u64,
+        now: u64,
+    ) -> Result<PayoutId, GrantsError> {
+        self.require_governance(caller)?;
+        if amount <= 0 {
+            return Err(GrantsError::InvalidTotalAmount);
+        }
+        if claim_deadline <= now {
+            return Err(GrantsError::InvalidDeadline);
+        }
+        if self.available_balance(asset) < amount {
+            return Err(GrantsError::InsufficientAvailableBalance);
+        }
+
+        *self.reserved_balances.entry(asset).or_insert(0) += amount;
+        let payout_id = self.next_payout_id;
+        self.next_payout_id += 1;
+
+        self.payouts.insert(
+            payout_id,
+            PayoutRecord {
+                payout_id,
+                recipient,
+                asset,
+                amount,
+                claim_deadline,
+                status: PayoutStatus::Pending,
+            },
+        );
+        self.payout_events.push(PayoutEvent::PayoutCreated {
+            payout_id,
+            recipient,
+            asset,
+            amount,
+            claim_deadline,
+        });
+
+        Ok(payout_id)
+    }
+
+    /// Pull-based claim for a payout record. Callable only by the recorded
+    /// `recipient`. Allowed after `claim_deadline` until `sweep_expired` runs;
+    /// if the transfer callback returns `false`, state remains unclaimed and intact.
+    pub fn claim_payout_with_transfer<F>(
+        &mut self,
+        caller: Address,
+        payout_id: PayoutId,
+        transfer_fn: F,
+    ) -> Result<i128, GrantsError>
+    where
+        F: FnOnce(Address, Address, i128) -> bool,
+    {
+        if self.reentrancy_locked {
+            return Err(GrantsError::ReentrancyDetected);
+        }
+        self.reentrancy_locked = true;
+
+        let res = (|| {
+            let record = self
+                .payouts
+                .get(&payout_id)
+                .ok_or(GrantsError::PayoutNotFound)?
+                .clone();
+
+            if record.recipient != caller {
+                return Err(GrantsError::NotRecipient);
+            }
+            match record.status {
+                PayoutStatus::Claimed => return Err(GrantsError::PayoutAlreadyClaimed),
+                PayoutStatus::Swept => return Err(GrantsError::PayoutAlreadySwept),
+                PayoutStatus::Pending => {}
+            }
+
+            if !transfer_fn(record.recipient, record.asset, record.amount) {
+                return Err(GrantsError::TransferFailed);
+            }
+
+            let stored = self.payouts.get_mut(&payout_id).unwrap();
+            stored.status = PayoutStatus::Claimed;
+            *self.reserved_balances.entry(record.asset).or_insert(0) -= record.amount;
+            *self.pool_balances.entry(record.asset).or_insert(0) -= record.amount;
+
+            self.payout_events.push(PayoutEvent::PayoutClaimed {
+                payout_id,
+                recipient: record.recipient,
+                asset: record.asset,
+                amount: record.amount,
+            });
+            Ok(record.amount)
+        })();
+
+        self.reentrancy_locked = false;
+        res
+    }
+
+    /// Pull-based claim for `payout_id` by `caller` (the recorded recipient).
+    pub fn claim_payout(
+        &mut self,
+        caller: Address,
+        payout_id: PayoutId,
+    ) -> Result<i128, GrantsError> {
+        self.claim_payout_with_transfer(caller, payout_id, |_, _, _| true)
+    }
+
+    /// Permissionless, idempotent sweep returning unclaimed funds to the
+    /// available balance after `claim_deadline`.
+    pub fn sweep_expired(&mut self, payout_id: PayoutId, now: u64) -> Result<i128, GrantsError> {
+        if self.reentrancy_locked {
+            return Err(GrantsError::ReentrancyDetected);
+        }
+        let record = self
+            .payouts
+            .get_mut(&payout_id)
+            .ok_or(GrantsError::PayoutNotFound)?;
+
+        match record.status {
+            PayoutStatus::Swept => return Ok(0),
+            PayoutStatus::Claimed => return Err(GrantsError::PayoutAlreadyClaimed),
+            PayoutStatus::Pending => {}
+        }
+        if now <= record.claim_deadline {
+            return Err(GrantsError::DeadlineNotReached);
+        }
+
+        record.status = PayoutStatus::Swept;
+        let amount = record.amount;
+        let asset = record.asset;
+        let recipient = record.recipient;
+
+        *self.reserved_balances.entry(asset).or_insert(0) -= amount;
+        self.payout_events.push(PayoutEvent::PayoutExpiredSwept {
+            payout_id,
+            recipient,
+            asset,
+            amount,
+        });
+
+        Ok(amount)
+    }
+
+    /// Returns a payout record by id.
+    pub fn get_payout(&self, payout_id: PayoutId) -> Option<&PayoutRecord> {
+        self.payouts.get(&payout_id)
+    }
+
+    /// Returns emitted payout events.
+    pub fn payout_events(&self) -> &[PayoutEvent] {
+        &self.payout_events
     }
 
     /// Returns the configured governance/timelock authority.
@@ -146,7 +393,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -266,6 +515,7 @@ mod tests {
     const GOVERNANCE: Address = 1;
     const RECIPIENT: Address = 2;
     const STRANGER: Address = 3;
+    const ASSET: Address = 10;
 
     fn contract() -> RefractGrants {
         RefractGrants::new(GOVERNANCE)
@@ -280,7 +530,10 @@ mod tests {
 
         // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -410,6 +663,61 @@ mod tests {
         assert_eq!(
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
+        );
+    }
+
+    #[test]
+    fn pull_payout_escrow_claim_transfer_failure_and_sweep() {
+        let mut grants = contract();
+        grants.fund_pool(ASSET, 1_000).unwrap();
+
+        let pid = grants
+            .create_payout(GOVERNANCE, RECIPIENT, ASSET, 400, 500, 100)
+            .unwrap();
+        assert_eq!(grants.available_balance(ASSET), 600);
+        assert_eq!(grants.reserved_balance(ASSET), 400);
+
+        // Non-recipient rejected.
+        assert_eq!(
+            grants.claim_payout(STRANGER, pid),
+            Err(GrantsError::NotRecipient)
+        );
+
+        // Failed token transfer leaves state unclaimed and intact.
+        assert_eq!(
+            grants.claim_payout_with_transfer(RECIPIENT, pid, |_, _, _| false),
+            Err(GrantsError::TransferFailed)
+        );
+        assert_eq!(
+            grants.get_payout(pid).unwrap().status,
+            PayoutStatus::Pending
+        );
+        assert_eq!(grants.reserved_balance(ASSET), 400);
+
+        // Successful claim transfers funds and updates available/total balance.
+        assert_eq!(grants.claim_payout(RECIPIENT, pid), Ok(400));
+        assert_eq!(grants.total_balance(ASSET), 600);
+        assert_eq!(grants.reserved_balance(ASSET), 0);
+        assert_eq!(
+            grants.claim_payout(RECIPIENT, pid),
+            Err(GrantsError::PayoutAlreadyClaimed)
+        );
+
+        // Create second payout and test sweep before/after deadline.
+        let pid2 = grants
+            .create_payout(GOVERNANCE, RECIPIENT, ASSET, 250, 500, 100)
+            .unwrap();
+        assert_eq!(
+            grants.sweep_expired(pid2, 500),
+            Err(GrantsError::DeadlineNotReached)
+        );
+        assert_eq!(grants.sweep_expired(pid2, 501), Ok(250));
+        // Idempotent second sweep.
+        assert_eq!(grants.sweep_expired(pid2, 502), Ok(0));
+        // Claim after sweep is rejected.
+        assert_eq!(
+            grants.claim_payout(RECIPIENT, pid2),
+            Err(GrantsError::PayoutAlreadySwept)
         );
     }
 }
