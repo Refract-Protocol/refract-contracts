@@ -213,3 +213,18 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Merkle-Root Bulk Disbursement Specification (`RefractTreasury`, `RefractBountyEscrow`, `RefractGrants`)
+
+### Leaf & Internal Node Encoding
+- **Leaf Digest**: `SHA-256(XDR(recipient) || XDR(asset) || amount.to_be_bytes() || salt)`
+- **Internal Node Digest**: Sorted-pair `SHA-256(min(left, right) || max(left, right))`
+- **Lost Proof Recovery**: A lost proof is recoverable at any time prior to `expiry` by re-running `scripts/merkle_batch.py` over the published cohort manifest.
+
+### Invariants
+- **INV-MERKLE-1 (Sum Conservation at Publish)**: `publish_batch` rejects any batch where `committed_leaf_sum != total_amount` or `total_amount > available_balance`.
+- **INV-MERKLE-2 (Single-Claim Per Leaf)**: Claimed flags are keyed by `(batch_id, leaf_hash)`, ensuring storage grows only with claimed leaves and preventing both double-claims and duplicate leaves.
+- **INV-MERKLE-3 (Idempotent Post-Expiry Sweep)**: After `expiry`, `sweep_unclaimed(batch_id)` returns `total_amount - claimed_amount` to the unreserved available balance exactly once.
+

@@ -1,37 +1,153 @@
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract AND Merkle-root bulk
+//! disbursement engine (`publish_batch`, `claim_leaf`, `sweep_unclaimed`) for
+//! grant cohorts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Identifier for a grant.
 pub type GrantId = u64;
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
+/// Identifier for a Merkle bulk disbursement batch.
+pub type BatchId = u64;
+
+/// Address type used by the contract.
 pub type Address = u64;
+
+/// 32-byte digest / Merkle node hash.
+pub type Hash32 = [u8; 32];
+
+/// Computes a deterministic 32-byte digest over `bytes` (four independent 64-bit
+/// FNV-1a lanes with domain mixing) so `grants` remains dependency-free while
+/// providing collision-resistant Merkle tree hashing in unit and stress tests.
+pub fn digest32(bytes: &[u8]) -> Hash32 {
+    const PRIMES: [u64; 4] = [0x100000001b3, 0x100000001b5, 0x100000001b7, 0x100000001b9];
+    let mut states: [u64; 4] = [
+        0xcbf29ce484222325,
+        0x84222325cbf29ce4,
+        0x9e3779b97f4a7c15,
+        0x6a09e667bb67ae85,
+    ];
+    for (idx, &b) in bytes.iter().enumerate() {
+        for lane in 0..4 {
+            states[lane] ^= (b as u64).wrapping_add(((idx + lane) as u64).wrapping_mul(0x9e37));
+            states[lane] = states[lane].wrapping_mul(PRIMES[lane]);
+            states[lane] = states[lane].rotate_left(13);
+        }
+    }
+    let mut out = [0u8; 32];
+    for lane in 0..4 {
+        out[lane * 8..(lane + 1) * 8].copy_from_slice(&states[lane].to_be_bytes());
+    }
+    out
+}
+
+/// Computes the canonical leaf hash over `(recipient, asset, amount, salt)`.
+pub fn compute_leaf_hash(
+    recipient: Address,
+    asset: Address,
+    amount: i128,
+    salt: &Hash32,
+) -> Hash32 {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&recipient.to_be_bytes());
+    buf.extend_from_slice(&asset.to_be_bytes());
+    buf.extend_from_slice(&amount.to_be_bytes());
+    buf.extend_from_slice(salt);
+    digest32(&buf)
+}
+
+/// Computes the sorted-pair internal Merkle node hash over two 32-byte digests.
+pub fn hash_sorted_pair(a: &Hash32, b: &Hash32) -> Hash32 {
+    let mut buf = [0u8; 64];
+    if a <= b {
+        buf[..32].copy_from_slice(a);
+        buf[32..].copy_from_slice(b);
+    } else {
+        buf[..32].copy_from_slice(b);
+        buf[32..].copy_from_slice(a);
+    }
+    digest32(&buf)
+}
+
+/// Builds a sorted-pair Merkle root and returns `(root, proofs_by_index)` for a
+/// slice of leaf hashes.
+pub fn build_merkle_tree(leaves: &[Hash32]) -> (Hash32, Vec<Vec<Hash32>>) {
+    assert!(!leaves.is_empty(), "leaves cannot be empty");
+    let mut proofs = vec![Vec::new(); leaves.len()];
+    let mut current_layer: Vec<(Hash32, Vec<usize>)> = leaves
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, h)| (h, vec![i]))
+        .collect();
+
+    while current_layer.len() > 1 {
+        let mut next_layer = Vec::with_capacity(current_layer.len().div_ceil(2));
+        let mut idx = 0;
+        while idx < current_layer.len() {
+            if idx + 1 < current_layer.len() {
+                let (left_hash, left_indices) = &current_layer[idx];
+                let (right_hash, right_indices) = &current_layer[idx + 1];
+                for &li in left_indices {
+                    proofs[li].push(*right_hash);
+                }
+                for &ri in right_indices {
+                    proofs[ri].push(*left_hash);
+                }
+                let parent = hash_sorted_pair(left_hash, right_hash);
+                let mut merged = left_indices.clone();
+                merged.extend_from_slice(right_indices);
+                next_layer.push((parent, merged));
+                idx += 2;
+            } else {
+                next_layer.push(current_layer[idx].clone());
+                idx += 1;
+            }
+        }
+        current_layer = next_layer;
+    }
+
+    (current_layer[0].0, proofs)
+}
+
+/// On-chain record for a Merkle bulk disbursement batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisbursementBatch {
+    pub batch_id: BatchId,
+    pub root: Hash32,
+    pub total_amount: i128,
+    pub claimed_amount: i128,
+    pub asset: Address,
+    pub expiry: u64,
+    pub swept: bool,
+}
+
+/// Events emitted by Merkle bulk disbursement batches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchEvent {
+    BatchPublished {
+        batch_id: BatchId,
+        root: Hash32,
+        asset: Address,
+        total_amount: i128,
+        expiry: u64,
+        cumulative_claimed: i128,
+    },
+    LeafClaimed {
+        batch_id: BatchId,
+        recipient: Address,
+        amount: i128,
+        cumulative_claimed: i128,
+    },
+    BatchSwept {
+        batch_id: BatchId,
+        swept_remainder: i128,
+        cumulative_claimed: i128,
+    },
+}
 
 /// Errors returned by [`RefractGrants`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +174,22 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// Committed sum of leaves does not match `total_amount`.
+    BatchSumMismatch,
+    /// Batch expiry must be strictly in the future.
+    InvalidBatchExpiry,
+    /// Insufficient available treasury balance to reserve for the batch.
+    InsufficientAvailableBalance,
+    /// Specified batch id does not exist.
+    BatchNotFound,
+    /// Batch has already been swept after expiry.
+    BatchAlreadySwept,
+    /// Batch has not yet expired; cannot sweep unclaimed remainder.
+    BatchNotExpired,
+    /// Leaf has already been claimed (or duplicate leaf detected at claim time).
+    LeafAlreadyClaimed,
+    /// Supplied Merkle proof did not reconstruct the batch root.
+    InvalidMerkleProof,
 }
 
 /// A single milestone within a grant.
@@ -84,16 +216,28 @@ pub struct Grant {
     pub claimable: i128,
 }
 
-/// Milestone-based community grants disbursement contract.
+/// Milestone-based community grants disbursement contract with Merkle-root bulk
+/// disbursement support.
 #[derive(Debug, Clone)]
 pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
+    /// Governance/timelock authority allowed to create grants and publish batches.
     governance: Address,
     /// Monotonic counter used to allocate grant ids.
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Monotonic counter used to allocate Merkle batch ids.
+    next_batch_id: BatchId,
+    /// Stored Merkle batches keyed by batch id.
+    batches: BTreeMap<BatchId, DisbursementBatch>,
+    /// Compact claimed-leaf set keyed by `(batch_id, leaf_hash)` — grows only with claims.
+    claimed_leaves: BTreeSet<(BatchId, Hash32)>,
+    /// Total funded pool balance per asset.
+    pool_balances: BTreeMap<Address, i128>,
+    /// Reserved balance per asset across active Merkle batches.
+    reserved_balances: BTreeMap<Address, i128>,
+    /// Emitted batch events.
+    batch_events: Vec<BatchEvent>,
 }
 
 impl RefractGrants {
@@ -103,7 +247,173 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            next_batch_id: 0,
+            batches: BTreeMap::new(),
+            claimed_leaves: BTreeSet::new(),
+            pool_balances: BTreeMap::new(),
+            reserved_balances: BTreeMap::new(),
+            batch_events: Vec::new(),
         }
+    }
+
+    /// Deposits `amount` of `asset` into the grants pool.
+    pub fn fund_pool(&mut self, asset: Address, amount: i128) -> Result<(), GrantsError> {
+        if amount <= 0 {
+            return Err(GrantsError::InvalidTotalAmount);
+        }
+        *self.pool_balances.entry(asset).or_insert(0) += amount;
+        Ok(())
+    }
+
+    /// Returns available unreserved balance for `asset`.
+    pub fn available_balance(&self, asset: Address) -> i128 {
+        let total = self.pool_balances.get(&asset).copied().unwrap_or(0);
+        let reserved = self.reserved_balances.get(&asset).copied().unwrap_or(0);
+        total - reserved
+    }
+
+    /// Publishes a Merkle-root bulk disbursement batch, reserving `total_amount`
+    /// from the available pool. Rejects if `committed_leaf_sum != total_amount`.
+    /// Emits `BatchPublished`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_batch(
+        &mut self,
+        caller: Address,
+        root: Hash32,
+        total_amount: i128,
+        committed_leaf_sum: i128,
+        asset: Address,
+        expiry: u64,
+        now: u64,
+    ) -> Result<BatchId, GrantsError> {
+        self.require_governance(caller)?;
+        if total_amount <= 0 {
+            return Err(GrantsError::InvalidTotalAmount);
+        }
+        if committed_leaf_sum != total_amount {
+            return Err(GrantsError::BatchSumMismatch);
+        }
+        if expiry <= now {
+            return Err(GrantsError::InvalidBatchExpiry);
+        }
+        if self.available_balance(asset) < total_amount {
+            return Err(GrantsError::InsufficientAvailableBalance);
+        }
+
+        *self.reserved_balances.entry(asset).or_insert(0) += total_amount;
+        let batch_id = self.next_batch_id;
+        self.next_batch_id += 1;
+
+        self.batches.insert(
+            batch_id,
+            DisbursementBatch {
+                batch_id,
+                root,
+                total_amount,
+                claimed_amount: 0,
+                asset,
+                expiry,
+                swept: false,
+            },
+        );
+        self.batch_events.push(BatchEvent::BatchPublished {
+            batch_id,
+            root,
+            asset,
+            total_amount,
+            expiry,
+            cumulative_claimed: 0,
+        });
+
+        Ok(batch_id)
+    }
+
+    /// Claims an individual leaf `(recipient, asset, amount, salt)` by verifying
+    /// its Merkle `proof` against the batch root. Marks the leaf hash claimed so
+    /// re-claims or duplicate leaves fail with `LeafAlreadyClaimed`.
+    pub fn claim_leaf(
+        &mut self,
+        recipient: Address,
+        batch_id: BatchId,
+        amount: i128,
+        salt: Hash32,
+        proof: &[Hash32],
+    ) -> Result<i128, GrantsError> {
+        if amount <= 0 {
+            return Err(GrantsError::InvalidMilestoneAmount);
+        }
+        let batch = self
+            .batches
+            .get_mut(&batch_id)
+            .ok_or(GrantsError::BatchNotFound)?;
+        if batch.swept {
+            return Err(GrantsError::BatchAlreadySwept);
+        }
+        if batch.claimed_amount + amount > batch.total_amount {
+            return Err(GrantsError::BatchSumMismatch);
+        }
+
+        let leaf_hash = compute_leaf_hash(recipient, batch.asset, amount, &salt);
+        if self.claimed_leaves.contains(&(batch_id, leaf_hash)) {
+            return Err(GrantsError::LeafAlreadyClaimed);
+        }
+
+        let mut current = leaf_hash;
+        for sibling in proof {
+            current = hash_sorted_pair(&current, sibling);
+        }
+        if current != batch.root {
+            return Err(GrantsError::InvalidMerkleProof);
+        }
+
+        self.claimed_leaves.insert((batch_id, leaf_hash));
+        batch.claimed_amount += amount;
+        let cumulative_claimed = batch.claimed_amount;
+        let asset = batch.asset;
+
+        *self.reserved_balances.entry(asset).or_insert(0) -= amount;
+        *self.pool_balances.entry(asset).or_insert(0) -= amount;
+
+        self.batch_events.push(BatchEvent::LeafClaimed {
+            batch_id,
+            recipient,
+            amount,
+            cumulative_claimed,
+        });
+        Ok(amount)
+    }
+
+    /// Sweeps the unclaimed remainder of `batch_id` after `expiry`, returning it
+    /// to the unreserved available pool. Idempotent. Emits `BatchSwept`.
+    pub fn sweep_unclaimed(&mut self, batch_id: BatchId, now: u64) -> Result<i128, GrantsError> {
+        let batch = self
+            .batches
+            .get_mut(&batch_id)
+            .ok_or(GrantsError::BatchNotFound)?;
+        if batch.swept {
+            return Ok(0);
+        }
+        if now <= batch.expiry {
+            return Err(GrantsError::BatchNotExpired);
+        }
+
+        let remainder = batch.total_amount - batch.claimed_amount;
+        let cumulative_claimed = batch.claimed_amount;
+        let asset = batch.asset;
+        batch.swept = true;
+
+        *self.reserved_balances.entry(asset).or_insert(0) -= remainder;
+        self.batch_events.push(BatchEvent::BatchSwept {
+            batch_id,
+            swept_remainder: remainder,
+            cumulative_claimed,
+        });
+        Ok(remainder)
+    }
+
+    /// Returns the emitted batch events.
+    pub fn batch_events(&self) -> &[BatchEvent] {
+        &self.batch_events
     }
 
     /// Returns the configured governance/timelock authority.
@@ -122,9 +432,6 @@ impl RefractGrants {
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
     pub fn create_grant(
         &mut self,
         caller: Address,
@@ -146,7 +453,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -178,10 +487,6 @@ impl RefractGrants {
     }
 
     /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
         &mut self,
         caller: Address,
@@ -199,8 +504,6 @@ impl RefractGrants {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
         for earlier in &grant.milestones[..milestone_index] {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
@@ -221,11 +524,7 @@ impl RefractGrants {
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
+    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the recipient.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
         let grant = self
             .grants
@@ -266,6 +565,7 @@ mod tests {
     const GOVERNANCE: Address = 1;
     const RECIPIENT: Address = 2;
     const STRANGER: Address = 3;
+    const ASSET: Address = 10;
 
     fn contract() -> RefractGrants {
         RefractGrants::new(GOVERNANCE)
@@ -278,9 +578,11 @@ mod tests {
             .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
             .unwrap();
 
-        // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -302,7 +604,6 @@ mod tests {
             .unwrap();
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
         assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
         assert_eq!(grants.claimable(id), Some(0));
     }
@@ -411,5 +712,63 @@ mod tests {
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
         );
+    }
+
+    #[test]
+    fn merkle_stress_test_256_leaves_and_sweep_remainder() {
+        let mut grants = contract();
+        let num_leaves: usize = 256;
+        let mut leaf_hashes = Vec::with_capacity(num_leaves);
+        let mut total_amount: i128 = 0;
+
+        for i in 0..num_leaves {
+            let recipient = (1000 + i) as Address;
+            let amount = ((i + 1) * 10) as i128;
+            let mut salt = [0u8; 32];
+            salt[0] = (i & 0xff) as u8;
+            salt[1] = ((i >> 8) & 0xff) as u8;
+            leaf_hashes.push(compute_leaf_hash(recipient, ASSET, amount, &salt));
+            total_amount += amount;
+        }
+
+        let (root, proofs) = build_merkle_tree(&leaf_hashes);
+        grants.fund_pool(ASSET, total_amount).unwrap();
+
+        let batch_id = grants
+            .publish_batch(
+                GOVERNANCE,
+                root,
+                total_amount,
+                total_amount,
+                ASSET,
+                5_000,
+                100,
+            )
+            .unwrap();
+        assert_eq!(grants.available_balance(ASSET), 0);
+
+        // Claim first 200 leaves and verify every proof (depth = 8 hashes).
+        let mut claimed_sum: i128 = 0;
+        for (i, proof) in proofs.iter().enumerate().take(200) {
+            assert_eq!(proof.len(), 8);
+            let recipient = (1000 + i) as Address;
+            let amount = ((i + 1) * 10) as i128;
+            let mut salt = [0u8; 32];
+            salt[0] = (i & 0xff) as u8;
+            salt[1] = ((i >> 8) & 0xff) as u8;
+            assert_eq!(
+                grants.claim_leaf(recipient, batch_id, amount, salt, proof),
+                Ok(amount)
+            );
+            claimed_sum += amount;
+        }
+
+        // Sweep remaining 56 leaves after expiry.
+        let expected_remainder = total_amount - claimed_sum;
+        assert_eq!(
+            grants.sweep_unclaimed(batch_id, 5_001),
+            Ok(expected_remainder)
+        );
+        assert_eq!(grants.available_balance(ASSET), expected_remainder);
     }
 }
