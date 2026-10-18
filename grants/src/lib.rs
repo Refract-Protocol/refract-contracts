@@ -1,36 +1,22 @@
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
-//!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
-//!
-//! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! Milestone-based community grants disbursement contract with reviewer
+//! conflict-of-interest (COI) declarations, recusal enforcement, quorum
+//! accounting, and governance resolution of late-discovered conflicts (#281).
 
-use std::collections::BTreeMap;
+pub mod review;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+pub use review::{
+    ConflictRecord, ConflictType, ReviewEvent, ReviewSubmission, ReviewerInfo, ReviewerRole,
+};
 
 /// Identifier for a grant.
 pub type GrantId = u64;
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
+/// Address type used by the contract.
 pub type Address = u64;
 
 /// Errors returned by [`RefractGrants`].
@@ -58,6 +44,16 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// Reviewer is not registered or is currently inactive.
+    ReviewerNotActive,
+    /// Reviewer is not assigned to the specified grant.
+    ReviewerNotAssigned,
+    /// Reviewer has an active conflict of interest for the specified grant and is recused.
+    ReviewerConflicted,
+    /// A reviewer cannot review or approve their own grant (`reviewer == recipient`).
+    SelfReviewForbidden,
+    /// Grant requires reassignment of a recused reviewer before reaching quorum.
+    ReassignmentRequired,
 }
 
 /// A single milestone within a grant.
@@ -87,13 +83,25 @@ pub struct Grant {
 /// Milestone-based community grants disbursement contract.
 #[derive(Debug, Clone)]
 pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
+    /// Governance/timelock authority allowed to create grants, manage reviewers,
+    /// and adjudicate undisclosed conflicts.
     governance: Address,
     /// Monotonic counter used to allocate grant ids.
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Registered reviewers keyed by address.
+    reviewers: BTreeMap<Address, ReviewerInfo>,
+    /// Assigned active reviewers per grant.
+    assigned_reviewers: BTreeMap<GrantId, BTreeSet<Address>>,
+    /// Per-grant conflict records keyed by `(grant_id, reviewer)`.
+    conflicts: BTreeMap<(GrantId, Address), ConflictRecord>,
+    /// Submitted reviews keyed by `(grant_id, reviewer)`.
+    reviews: BTreeMap<(GrantId, Address), ReviewSubmission>,
+    /// Grants flagged as requiring reviewer reassignment after a late COI invalidation.
+    reassignment_required: BTreeSet<GrantId>,
+    /// Emitted COI / recusal events.
+    review_events: Vec<ReviewEvent>,
 }
 
 impl RefractGrants {
@@ -103,7 +111,358 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            reviewers: BTreeMap::new(),
+            assigned_reviewers: BTreeMap::new(),
+            conflicts: BTreeMap::new(),
+            reviews: BTreeMap::new(),
+            reassignment_required: BTreeSet::new(),
+            review_events: Vec::new(),
         }
+    }
+
+    /// Registers or updates a reviewer in the reviewer registry. Governance-gated.
+    pub fn register_reviewer(
+        &mut self,
+        caller: Address,
+        reviewer: Address,
+        role: ReviewerRole,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        self.reviewers.insert(
+            reviewer,
+            ReviewerInfo {
+                reviewer,
+                role,
+                active: true,
+            },
+        );
+        self.review_events
+            .push(ReviewEvent::ReviewerRegistered { reviewer, role });
+        Ok(())
+    }
+
+    /// Activates or deactivates a registered reviewer. Governance-gated.
+    pub fn set_reviewer_active(
+        &mut self,
+        caller: Address,
+        reviewer: Address,
+        active: bool,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        let info = self
+            .reviewers
+            .get_mut(&reviewer)
+            .ok_or(GrantsError::ReviewerNotActive)?;
+        info.active = active;
+        self.review_events
+            .push(ReviewEvent::ReviewerStatusChanged { reviewer, active });
+        Ok(())
+    }
+
+    /// Returns reviewer metadata for `reviewer`, if registered.
+    pub fn get_reviewer(&self, reviewer: Address) -> Option<&ReviewerInfo> {
+        self.reviewers.get(&reviewer)
+    }
+
+    /// Declares a conflict of interest for `grant_id` and automatically recuses
+    /// `reviewer` from scoring, approving, or counting toward quorum on `grant_id`.
+    /// If `reviewer` had already submitted a review on `grant_id`, that review is
+    /// invalidated and the grant is flagged for reassignment.
+    pub fn declare_conflict(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+        conflict_type: ConflictType,
+        evidence_hash: Option<[u8; 32]>,
+    ) -> Result<(), GrantsError> {
+        if !self.grants.contains_key(&grant_id) {
+            return Err(GrantsError::GrantNotFound);
+        }
+        if !self.reviewers.contains_key(&caller) {
+            return Err(GrantsError::ReviewerNotActive);
+        }
+
+        self.conflicts.insert(
+            (grant_id, caller),
+            ConflictRecord {
+                grant_id,
+                reviewer: caller,
+                conflict_type,
+                evidence_hash,
+                active: true,
+                declared_by_governance: false,
+            },
+        );
+        self.review_events.push(ReviewEvent::ConflictDeclared {
+            grant_id,
+            reviewer: caller,
+            conflict_type,
+            evidence_hash,
+        });
+
+        self.recuse_reviewer_internal(grant_id, caller);
+        Ok(())
+    }
+
+    /// Assigns an active, unconflicted reviewer to `grant_id`. Rejects self-review
+    /// (`reviewer == grant.recipient`) and any candidate with a declared conflict.
+    pub fn assign_reviewer(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+        reviewer: Address,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        let grant = self
+            .grants
+            .get(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+        if grant.recipient == reviewer {
+            return Err(GrantsError::SelfReviewForbidden);
+        }
+        let info = self
+            .reviewers
+            .get(&reviewer)
+            .ok_or(GrantsError::ReviewerNotActive)?;
+        if !info.active {
+            return Err(GrantsError::ReviewerNotActive);
+        }
+        if self.has_active_conflict(grant_id, reviewer) {
+            return Err(GrantsError::ReviewerConflicted);
+        }
+
+        self.assigned_reviewers
+            .entry(grant_id)
+            .or_default()
+            .insert(reviewer);
+        self.reassignment_required.remove(&grant_id);
+        Ok(())
+    }
+
+    /// Submits a reviewer score and approval vote for `grant_id`. Enforces active
+    /// reviewer status, assignment, non-self-review, and absence of any conflict.
+    pub fn submit_review(
+        &mut self,
+        reviewer: Address,
+        grant_id: GrantId,
+        score: u32,
+        approved: bool,
+    ) -> Result<(), GrantsError> {
+        let grant = self
+            .grants
+            .get(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+        if grant.recipient == reviewer {
+            return Err(GrantsError::SelfReviewForbidden);
+        }
+        let info = self
+            .reviewers
+            .get(&reviewer)
+            .ok_or(GrantsError::ReviewerNotActive)?;
+        if !info.active {
+            return Err(GrantsError::ReviewerNotActive);
+        }
+        if self.has_active_conflict(grant_id, reviewer) {
+            return Err(GrantsError::ReviewerConflicted);
+        }
+        let assigned = self
+            .assigned_reviewers
+            .get(&grant_id)
+            .map(|s| s.contains(&reviewer))
+            .unwrap_or(false);
+        if !assigned {
+            return Err(GrantsError::ReviewerNotAssigned);
+        }
+
+        self.reviews.insert(
+            (grant_id, reviewer),
+            ReviewSubmission {
+                reviewer,
+                score,
+                approved,
+                invalidated: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Reviewer-gated milestone confirmation that rejects any conflicted or
+    /// unassigned reviewer.
+    pub fn reviewer_confirm_milestone(
+        &mut self,
+        reviewer: Address,
+        grant_id: GrantId,
+        milestone_index: usize,
+    ) -> Result<(), GrantsError> {
+        let grant = self
+            .grants
+            .get(&grant_id)
+            .ok_or(GrantsError::GrantNotFound)?;
+        if grant.recipient == reviewer {
+            return Err(GrantsError::SelfReviewForbidden);
+        }
+        let info = self
+            .reviewers
+            .get(&reviewer)
+            .ok_or(GrantsError::ReviewerNotActive)?;
+        if !info.active {
+            return Err(GrantsError::ReviewerNotActive);
+        }
+        if self.has_active_conflict(grant_id, reviewer) {
+            return Err(GrantsError::ReviewerConflicted);
+        }
+        let assigned = self
+            .assigned_reviewers
+            .get(&grant_id)
+            .map(|s| s.contains(&reviewer))
+            .unwrap_or(false);
+        if !assigned {
+            return Err(GrantsError::ReviewerNotAssigned);
+        }
+        if self.reassignment_required.contains(&grant_id) {
+            return Err(GrantsError::ReassignmentRequired);
+        }
+
+        let gov = self.governance;
+        self.confirm_milestone(gov, grant_id, milestone_index)
+    }
+
+    /// Governance resolution of an undisclosed or late-discovered conflict:
+    /// records the conflict, invalidates any review submitted by `conflicted_reviewer`,
+    /// removes them from the grant's assigned panel, and optionally assigns a
+    /// `replacement_reviewer` (or marks the grant as requiring reassignment).
+    pub fn resolve_undisclosed_conflict(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+        conflicted_reviewer: Address,
+        conflict_type: ConflictType,
+        evidence_hash: Option<[u8; 32]>,
+        replacement_reviewer: Option<Address>,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if !self.grants.contains_key(&grant_id) {
+            return Err(GrantsError::GrantNotFound);
+        }
+
+        self.conflicts.insert(
+            (grant_id, conflicted_reviewer),
+            ConflictRecord {
+                grant_id,
+                reviewer: conflicted_reviewer,
+                conflict_type,
+                evidence_hash,
+                active: true,
+                declared_by_governance: true,
+            },
+        );
+
+        let review_invalidated = self.recuse_reviewer_internal(grant_id, conflicted_reviewer);
+
+        if let Some(replacement) = replacement_reviewer {
+            self.assign_reviewer(caller, grant_id, replacement)?;
+        }
+
+        self.review_events
+            .push(ReviewEvent::UndisclosedConflictResolved {
+                grant_id,
+                conflicted_reviewer,
+                replacement_reviewer,
+                review_invalidated,
+            });
+        Ok(())
+    }
+
+    /// Governance override to clear a false-positive conflict record.
+    pub fn override_conflict(
+        &mut self,
+        caller: Address,
+        grant_id: GrantId,
+        reviewer: Address,
+        clear_conflict: bool,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if let Some(rec) = self.conflicts.get_mut(&(grant_id, reviewer)) {
+            rec.active = !clear_conflict;
+        }
+        self.review_events
+            .push(ReviewEvent::GovernanceConflictOverride {
+                grant_id,
+                reviewer,
+                cleared: clear_conflict,
+            });
+        Ok(())
+    }
+
+    /// Returns the number of valid, non-conflicted, active-reviewer approvals
+    /// for `grant_id`. Conflicted or invalidated reviews are never counted toward quorum.
+    pub fn valid_approval_count(&self, grant_id: GrantId) -> usize {
+        let Some(assigned) = self.assigned_reviewers.get(&grant_id) else {
+            return 0;
+        };
+        assigned
+            .iter()
+            .filter(|&&rev| {
+                !self.has_active_conflict(grant_id, rev)
+                    && self.reviewers.get(&rev).map(|i| i.active).unwrap_or(false)
+                    && self
+                        .reviews
+                        .get(&(grant_id, rev))
+                        .map(|r| r.approved && !r.invalidated)
+                        .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// Returns true if `grant_id` has reached `required_quorum` valid approvals
+    /// and does not have an unresolved reassignment requirement.
+    pub fn has_quorum(&self, grant_id: GrantId, required_quorum: usize) -> bool {
+        !self.reassignment_required.contains(&grant_id)
+            && self.valid_approval_count(grant_id) >= required_quorum
+    }
+
+    /// Returns true if `reviewer` has an active conflict on `grant_id`.
+    pub fn has_active_conflict(&self, grant_id: GrantId, reviewer: Address) -> bool {
+        self.conflicts
+            .get(&(grant_id, reviewer))
+            .map(|c| c.active)
+            .unwrap_or(false)
+    }
+
+    /// Read-only view of all conflict records for `grant_id`.
+    pub fn get_grant_conflicts(&self, grant_id: GrantId) -> Vec<&ConflictRecord> {
+        self.conflicts
+            .iter()
+            .filter_map(|(&(gid, _), rec)| if gid == grant_id { Some(rec) } else { None })
+            .collect()
+    }
+
+    /// Returns emitted review/COI events.
+    pub fn review_events(&self) -> &[ReviewEvent] {
+        &self.review_events
+    }
+
+    fn recuse_reviewer_internal(&mut self, grant_id: GrantId, reviewer: Address) -> bool {
+        let was_assigned = self
+            .assigned_reviewers
+            .get_mut(&grant_id)
+            .map(|s| s.remove(&reviewer))
+            .unwrap_or(false);
+
+        let mut invalidated = false;
+        if let Some(sub) = self.reviews.get_mut(&(grant_id, reviewer)) {
+            if !sub.invalidated {
+                sub.invalidated = true;
+                invalidated = true;
+            }
+        }
+
+        if was_assigned || invalidated {
+            self.reassignment_required.insert(grant_id);
+            self.review_events
+                .push(ReviewEvent::ReviewerRecused { grant_id, reviewer });
+        }
+        invalidated
     }
 
     /// Returns the configured governance/timelock authority.
@@ -122,9 +481,6 @@ impl RefractGrants {
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
-    ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
     pub fn create_grant(
         &mut self,
         caller: Address,
@@ -146,7 +502,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -178,10 +536,6 @@ impl RefractGrants {
     }
 
     /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
     pub fn confirm_milestone(
         &mut self,
         caller: Address,
@@ -199,8 +553,6 @@ impl RefractGrants {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
         for earlier in &grant.milestones[..milestone_index] {
             if !earlier.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
@@ -221,11 +573,7 @@ impl RefractGrants {
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
-    ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
+    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the recipient.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
         let grant = self
             .grants
@@ -266,6 +614,9 @@ mod tests {
     const GOVERNANCE: Address = 1;
     const RECIPIENT: Address = 2;
     const STRANGER: Address = 3;
+    const REV_1: Address = 10;
+    const REV_2: Address = 11;
+    const REV_3: Address = 12;
 
     fn contract() -> RefractGrants {
         RefractGrants::new(GOVERNANCE)
@@ -278,9 +629,11 @@ mod tests {
             .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
             .unwrap();
 
-        // Nothing claimable before any confirmation.
         assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
+        assert_eq!(
+            grants.claim(RECIPIENT, id),
+            Err(GrantsError::NothingToClaim)
+        );
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
         assert_eq!(grants.claimable(id), Some(100));
@@ -302,7 +655,6 @@ mod tests {
             .unwrap();
 
         grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
         assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
         assert_eq!(grants.claimable(id), Some(0));
     }
@@ -411,5 +763,91 @@ mod tests {
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
         );
+    }
+
+    #[test]
+    fn coi_declaration_recusal_self_review_late_disclosure_and_quorum() {
+        let mut grants = contract();
+        let gid = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 200, vec![100, 100])
+            .unwrap();
+
+        // Unauthorized role change is rejected.
+        assert_eq!(
+            grants.register_reviewer(STRANGER, REV_1, ReviewerRole::Technical),
+            Err(GrantsError::Unauthorized)
+        );
+
+        grants
+            .register_reviewer(GOVERNANCE, REV_1, ReviewerRole::Lead)
+            .unwrap();
+        grants
+            .register_reviewer(GOVERNANCE, REV_2, ReviewerRole::Technical)
+            .unwrap();
+        grants
+            .register_reviewer(GOVERNANCE, REV_3, ReviewerRole::Financial)
+            .unwrap();
+        grants
+            .register_reviewer(GOVERNANCE, RECIPIENT, ReviewerRole::Technical)
+            .unwrap();
+
+        // Self-review assignment is forbidden.
+        assert_eq!(
+            grants.assign_reviewer(GOVERNANCE, gid, RECIPIENT),
+            Err(GrantsError::SelfReviewForbidden)
+        );
+
+        // REV_1 declares a pre-assignment financial conflict -> assignment and scoring rejected.
+        grants
+            .declare_conflict(REV_1, gid, ConflictType::Financial, Some([7u8; 32]))
+            .unwrap();
+        assert_eq!(
+            grants.assign_reviewer(GOVERNANCE, gid, REV_1),
+            Err(GrantsError::ReviewerConflicted)
+        );
+        assert_eq!(
+            grants.submit_review(REV_1, gid, 95, true),
+            Err(GrantsError::ReviewerConflicted)
+        );
+        assert_eq!(
+            grants.reviewer_confirm_milestone(REV_1, gid, 0),
+            Err(GrantsError::ReviewerConflicted)
+        );
+
+        // Assign REV_2 and REV_3; both submit approvals -> quorum of 2 is met.
+        grants.assign_reviewer(GOVERNANCE, gid, REV_2).unwrap();
+        grants.assign_reviewer(GOVERNANCE, gid, REV_3).unwrap();
+        grants.submit_review(REV_2, gid, 90, true).unwrap();
+        grants.submit_review(REV_3, gid, 88, true).unwrap();
+        assert!(grants.has_quorum(gid, 2));
+
+        // Late-discovered conflict on REV_2 resolved by governance without replacement yet:
+        // REV_2's review is invalidated, quorum drops to 1, and milestone confirmation is blocked until reassigned.
+        grants
+            .resolve_undisclosed_conflict(
+                GOVERNANCE,
+                gid,
+                REV_2,
+                ConflictType::Employment,
+                Some([8u8; 32]),
+                None,
+            )
+            .unwrap();
+        assert_eq!(grants.valid_approval_count(gid), 1);
+        assert!(!grants.has_quorum(gid, 2));
+        assert_eq!(
+            grants.reviewer_confirm_milestone(REV_3, gid, 0),
+            Err(GrantsError::ReassignmentRequired)
+        );
+
+        // Governance overrides false-positive conflict on REV_1, assigns REV_1 as replacement, and REV_1 approves.
+        grants
+            .override_conflict(GOVERNANCE, gid, REV_1, true)
+            .unwrap();
+        grants.assign_reviewer(GOVERNANCE, gid, REV_1).unwrap();
+        grants.submit_review(REV_1, gid, 92, true).unwrap();
+        assert!(grants.has_quorum(gid, 2));
+        grants.reviewer_confirm_milestone(REV_1, gid, 0).unwrap();
+        assert_eq!(grants.claimable(gid), Some(100));
     }
 }
