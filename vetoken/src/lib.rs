@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
@@ -10,6 +11,7 @@ const MAX_LOCK_TIME: u64 = 4 * 365 * 24 * 60 * 60;
 pub struct LockInfo {
     pub amount: i128,
     pub unlock_at: u64,
+    pub locked_at: u64,
 }
 
 #[contracttype]
@@ -117,10 +119,11 @@ impl RefractVeToken {
             &LockInfo {
                 amount: new_amount,
                 unlock_at: new_unlock_at,
+                locked_at: now,
             },
         );
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller)?;
         Ok(())
     }
 
@@ -155,11 +158,12 @@ impl RefractVeToken {
         Self::settle_fee_account(&env, &caller)?;
 
         lock.unlock_at = proposed;
+        lock.locked_at = now;
         env.storage()
             .persistent()
             .set(&DataKey::Lock(caller.clone()), &lock);
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller)?;
         Ok(())
     }
 
@@ -180,7 +184,9 @@ impl RefractVeToken {
         Self::settle_fee_account(&env, &caller)?;
 
         let amount = lock.amount;
-        env.storage().persistent().remove(&DataKey::Lock(caller.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Lock(caller.clone()));
 
         let token = Self::token(&env)?;
         token::Client::new(&env, &token).transfer(
@@ -189,22 +195,29 @@ impl RefractVeToken {
             &amount,
         );
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller)?;
         Ok(amount)
     }
 
     /// Time-weighted voting power using the standard linear-decay veToken curve:
     /// `amount * remaining_lock_time / max_lock_time`, decaying to zero at expiry.
     pub fn voting_power(env: Env, address: Address) -> i128 {
-        let lock = Self::get_lock(&env, &address);
-        if lock.amount <= 0 {
-            return 0;
-        }
         let now = env.ledger().timestamp();
-        if now >= lock.unlock_at {
+        Self::voting_power_at(env, address, now)
+    }
+
+    /// Snapshot voting power at `snapshot_timestamp`. Locks created or mutated
+    /// strictly after `snapshot_timestamp` yield 0 weight so late token purchases
+    /// cannot manipulate retroactive funding round tallies.
+    pub fn voting_power_at(env: Env, address: Address, snapshot_timestamp: u64) -> i128 {
+        let lock = Self::get_lock(&env, &address);
+        if lock.amount <= 0 || lock.locked_at > snapshot_timestamp {
             return 0;
         }
-        let remaining = (lock.unlock_at - now) as i128;
+        if snapshot_timestamp >= lock.unlock_at {
+            return 0;
+        }
+        let remaining = (lock.unlock_at - snapshot_timestamp) as i128;
         lock.amount * remaining / (MAX_LOCK_TIME as i128)
     }
 
@@ -285,6 +298,7 @@ impl RefractVeToken {
             .unwrap_or(LockInfo {
                 amount: 0,
                 unlock_at: 0,
+                locked_at: 0,
             })
     }
 
@@ -326,14 +340,13 @@ impl RefractVeToken {
     }
 
     /// Recompute the aggregate voting power used as the fee-distribution denominator.
-    fn refresh_total_power(env: &Env) -> Result<(), VeTokenError> {
+    fn refresh_total_power(env: &Env, caller: &Address) -> Result<(), VeTokenError> {
         let mut checkpoint = Self::fee_checkpoint(env);
-        // Total power is tracked lazily; recompute from the caller's perspective is
-        // not possible without enumeration, so we approximate by summing known locks
-        // via the stored checkpoint plus the delta of the current caller.
-        // For correctness across multiple lockers we recompute using the caller's
-        // freshly-updated power, which is the only lock mutated in this call.
-        let _ = &mut checkpoint;
+        let caller_power = Self::voting_power(env.clone(), caller.clone());
+        checkpoint.total_power += caller_power;
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeCheckpoint, &checkpoint);
         Ok(())
     }
 }
@@ -344,7 +357,13 @@ mod test {
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{token, Env};
 
-    fn setup() -> (Env, RefractVeTokenClient<'static>, Address, Address, Address) {
+    fn setup() -> (
+        Env,
+        RefractVeTokenClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RefractVeToken);
@@ -352,7 +371,9 @@ mod test {
 
         let admin = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let treasury = Address::generate(&env);
 
         client.initialize(&token_id, &treasury);
@@ -365,17 +386,28 @@ mod test {
     }
 
     #[test]
-    fn lock_and_decay() {
+    fn lock_and_decay_and_snapshot_power() {
         let (env, client, user, token_id, _) = setup();
+        let late_user = Address::generate(&env);
         mint(&env, &token_id, &user, 1_000);
+        mint(&env, &token_id, &late_user, 1_000);
 
+        env.ledger().with_mut(|l| l.timestamp = 100);
         client.lock(&user, &1_000, &MAX_LOCK_TIME);
         assert_eq!(client.voting_power(&user), 1_000);
 
-        env.ledger().with_mut(|l| l.timestamp += MAX_LOCK_TIME / 2);
+        let snapshot_ts = 100;
+        env.ledger().with_mut(|l| l.timestamp = 200);
+        // Late user locks after snapshot_ts -> 0 power at snapshot_ts.
+        client.lock(&late_user, &1_000, &MAX_LOCK_TIME);
+        assert_eq!(client.voting_power_at(&user, &snapshot_ts), 1_000);
+        assert_eq!(client.voting_power_at(&late_user, &snapshot_ts), 0);
+
+        env.ledger()
+            .with_mut(|l| l.timestamp = 100 + MAX_LOCK_TIME / 2);
         assert_eq!(client.voting_power(&user), 500);
 
-        env.ledger().with_mut(|l| l.timestamp += MAX_LOCK_TIME / 2);
+        env.ledger().with_mut(|l| l.timestamp = 100 + MAX_LOCK_TIME);
         assert_eq!(client.voting_power(&user), 0);
     }
 

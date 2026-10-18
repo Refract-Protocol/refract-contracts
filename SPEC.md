@@ -213,3 +213,20 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Retroactive Public-Goods Funding Rounds (`RefractGrants`)
+
+### INV-RETRO-1  Budget Conservation & Remainder Distribution
+For every finalized retroactive round (`RoundStatus::Finalized` with `total_votes > 0`), integer pro-rata allocations $\lfloor \text{budget} \times \text{votes}_i / \text{total\_votes} \rfloor$ plus largest-remainder distribution (tie-broken deterministically by lowest `project_id`) satisfy exact budget conservation:
+```
+Σ_{i ∈ projects} allocation_i == round.budget
+```
+
+### INV-RETRO-2  Pre-Round Snapshot Eligibility & Whale Cap
+Only veToken locks recorded at `locked_at <= snapshot_ledger` are eligible to vote (`voting_power_at`), and each voter's cumulative votes in a round are bounded by `min(snapshot_power, max_voter_weight_cap)`.
+
+### INV-RETRO-3  Upfront Reservation & Zero-Vote / Cancellation Refund
+Opening a round reserves `round.budget` from `available_treasury_budget`, preventing multi-round over-commitment. Cancelling during the challenge window (`cancel_round`) or finalizing a zero-vote round (`RefundedZeroVotes`) releases the full reservation back to the available treasury pool.
+
