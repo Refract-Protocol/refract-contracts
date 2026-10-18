@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, clippy::inconsistent_digit_grouping)]
+#![no_std]
 //! Refract Timelock Contract
 //!
 //! A delay primitive that sits between a controller (initially the single
@@ -15,169 +17,8 @@
 //!
 //! `min_delay` itself is changed through the timelock's own queue/execute
 //! flow (self-governing), preventing instant delay-reduction attacks.
-//!
-//! =============================================================================
-//! Issue #121 — [High] Add a security-council veto path to cancel a queued
-//! governance-timelock action
-//! https://github.com/Refract-Protocol/refract-contracts/issues/121
-//!
-//! ─── PROBLEM ─────────────────────────────────────────────────────────────────
-//!
-//! The timelock delay window exists to create a reaction window after a
-//! governance vote. But without an on-chain veto mechanism, the community
-//! can only OBSERVE a dangerous queued proposal — they have no way to STOP
-//! it within the delay window other than hoping a second competing proposal
-//! can be mobilized before the first executes (often an unrealistic timeline).
-//!
-//! ─── PROPOSED IMPLEMENTATION ─────────────────────────────────────────────────
-//!
-//! Add a `SecurityCouncil` role: a separate small multisig address (distinct
-//! from the Guardian pause role and from full DAO governance) with the SOLE
-//! power to cancel a queued-but-not-yet-executed action.
-//!
-//! Step 1 — DataKey::SecurityCouncil
-//! ----------------------------------
-//! Add to the DataKey enum:
-//!
-//!   SecurityCouncil,   // Address — settable only via the timelock itself
-//!
-//! The security council address is set ONLY through the full timelock-governed
-//! path (queue → delay → execute), following the meta-governance pattern
-//! already used for min_delay changes. The admin cannot set it directly:
-//!
-//!   // NOT a new admin entrypoint — set via the timelock queue only
-//!   // The only path to DataKey::SecurityCouncil is through a queued action
-//!
-//! Step 2 — veto(caller, proposal_id) entrypoint
-//! -----------------------------------------------
-//! Add the following entry point to #[contractimpl]:
-//!
-//!   /// Veto a queued action before it is executed.
-//!   ///
-//!   /// Only callable by the registered SecurityCouncil address.
-//!   /// The council can cancel any queued action but cannot queue, execute,
-//!   /// or modify any action — strictly a cancellation-only power.
-//!   ///
-//!   /// Returns TimelockError::AlreadyExecuted if the action has already
-//!   /// been executed — veto is only valid during the delay window.
-//!   pub fn veto(env: Env, caller: Address, proposal_id: u64) -> Result<(), TimelockError> {
-//!       caller.require_auth();
-//!
-//!       // Verify caller is the registered security council
-//!       let council: Address = env
-//!           .storage()
-//!           .instance()
-//!           .get(&DataKey::SecurityCouncil)
-//!           .ok_or(TimelockError::Unauthorized)?;
-//!       if caller != council {
-//!           return Err(TimelockError::Unauthorized);
-//!       }
-//!
-//!       // Reuse the existing cancel logic internally — veto is a thin
-//!       // wrapper with a different authorization check.
-//!       // Do NOT duplicate the state-transition code; call the shared helper:
-//!       Self::_cancel_internal(&env, proposal_id)
-//!   }
-//!
-//!   /// Internal: cancel a queued action by ID. Used by both cancel() and veto().
-//!   /// Errors if the proposal does not exist or has already been executed.
-//!   fn _cancel_internal(env: &Env, proposal_id: u64) -> Result<(), TimelockError> {
-//!       let proposal: TimelockProposal = env
-//!           .storage()
-//!           .persistent()
-//!           .get(&DataKey::Proposal(proposal_id))
-//!           .ok_or(TimelockError::ProposalNotFound)?;
-//!
-//!       if proposal.executed {
-//!           return Err(TimelockError::AlreadyExecuted);
-//!       }
-//!
-//!       env.storage()
-//!           .persistent()
-//!           .remove(&DataKey::Proposal(proposal_id));
-//!
-//!       env.events().publish(
-//!           (symbol_short!("vetoed"), proposal_id),
-//!           (),
-//!       );
-//!       Ok(())
-//!   }
-//!
-//! Step 3 — Security council blast-radius constraints
-//! ---------------------------------------------------
-//! The security council's power is STRICTLY LIMITED to cancellation:
-//!
-//!   CAN do:
-//!     veto(proposal_id)  — cancel any queued, not-yet-executed action
-//!
-//!   CANNOT do:
-//!     queue(...)         — only the controller can queue
-//!     execute(...)       — permissionless after delay, but council has no
-//!                          special execute privilege
-//!     set_council(...)   — council cannot appoint its own successor;
-//!                          changing the council requires a queued action
-//!
-//! ─── EDGE CASES ──────────────────────────────────────────────────────────────
-//!
-//! Post-execution veto attempt:
-//!   veto() on an already-executed proposal returns AlreadyExecuted.
-//!   The council's power is strictly within the delay window, never retroactive.
-//!   Mirrors cancel()'s existing post-execution rejection.
-//!
-//! No security council registered:
-//!   veto() returns Unauthorized if DataKey::SecurityCouncil has never been set.
-//!   The council must be provisioned via the timelock queue before it has any power.
-//!
-//! Council address repoint:
-//!   Changing DataKey::SecurityCouncil requires a full timelock cycle.
-//!   A compromised council key cannot appoint its own successor — the council
-//!   can only cancel; it cannot queue a "repoint council" action.
-//!
-//! Optional reason parameter:
-//!   The issue notes an optional `reason: Symbol` parameter is "reasonable,
-//!   low-cost... but not required." Include it as Option<Symbol> for
-//!   auditability without making it mandatory:
-//!
-//!     pub fn veto(env: Env, caller: Address, proposal_id: u64,
-//!                 reason: Option<Symbol>) -> Result<(), TimelockError>
-//!
-//! ─── TESTS TO ADD ────────────────────────────────────────────────────────────
-//!
-//! test_council_veto_during_delay_window_succeeds()
-//!   Setup: queue a proposal, advance time to within delay window, call veto().
-//!   Assert: proposal no longer exists in storage, "vetoed" event emitted.
-//!
-//! test_council_veto_after_execution_rejected()
-//!   Setup: queue → advance past eta → execute → call veto() on same proposal.
-//!   Assert: veto() returns Err(TimelockError::AlreadyExecuted).
-//!
-//! test_non_council_veto_rejected()
-//!   Setup: queue a proposal, call veto() from a non-council address.
-//!   Assert: veto() returns Err(TimelockError::Unauthorized).
-//!
-//! ─── ACCEPTANCE CRITERIA MAPPING ─────────────────────────────────────────────
-//!
-//!  ✅  DataKey::SecurityCouncil added, settable only via timelock queue
-//!  ✅  veto(caller, proposal_id) added, authorized only by council
-//!  ✅  Council power is cancellation-only (cannot queue, execute, or set council)
-//!  ✅  Post-execution veto rejected (mirrors cancel()'s guard)
-//!  ✅  veto() reuses _cancel_internal — no duplicated state-transition code
-//!  ✅  Three tests: success during window, post-execution rejection, non-council rejection
-//!
-//! ─── FILES TO MODIFY ─────────────────────────────────────────────────────────
-//!
-//!   timelock/src/lib.rs  ← (THIS FILE)
-//!     1. Add DataKey::SecurityCouncil to DataKey enum
-//!     2. Add TimelockError::AlreadyExecuted if not present
-//!     3. Add _cancel_internal() private helper (refactor cancel() to use it)
-//!     4. Add veto() entry point
-//!   timelock/src/tests/  ← add the three test scenarios above
-//!
-//! =============================================================================
-
-#![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, TryFromVal, Val, Vec,
 };
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -197,6 +38,14 @@ pub enum TimelockError {
     NotReady = 6,
     /// The operation has already been executed or cancelled.
     AlreadyDone = 7,
+    /// Bootstrap phase has already been completed and permanently locked.
+    BootstrapCompleted = 8,
+    /// Contract address is already assigned to a role in the registry.
+    DuplicateRoleAddress = 9,
+    /// Target contract address is not registered in the trusted allowlist.
+    UntrustedTarget = 10,
+    /// Requested contract role has not been registered.
+    RoleNotRegistered = 11,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -208,6 +57,35 @@ pub enum OperationStatus {
     Pending = 0,
     Executed = 1,
     Cancelled = 2,
+}
+
+/// Well-known protocol contract roles tracked in the trusted contract registry.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractRole {
+    Pool = 0,
+    Oracle = 1,
+    Policy = 2,
+    Governance = 3,
+    Timelock = 4,
+    Treasury = 5,
+    Backstop = 6,
+    Bounty = 7,
+    Grants = 8,
+    VeToken = 9,
+    Multisig = 10,
+}
+
+/// Immutable audit record appended whenever a role's contract address is
+/// registered or rotated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleRotationRecord {
+    pub role: ContractRole,
+    pub old_address: Option<Address>,
+    pub new_address: Address,
+    pub rotated_at: u64,
 }
 
 /// A queued cross-contract call.
@@ -233,6 +111,11 @@ pub enum DataKey {
     MinDelay,
     NextId,
     Operation(u64),
+    BootstrapCompleted,
+    EnforceTargetAllowlist,
+    RoleAddress(ContractRole),
+    AddressRole(Address),
+    RotationHistory(ContractRole),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -257,6 +140,12 @@ impl RefractTimelock {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MinDelay, &min_delay);
         env.storage().instance().set(&DataKey::NextId, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::BootstrapCompleted, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::EnforceTargetAllowlist, &false);
         env.events()
             .publish((Symbol::new(&env, "tl_init"),), (admin, min_delay));
         Ok(())
@@ -277,6 +166,188 @@ impl RefractTimelock {
             .unwrap_or(0)
     }
 
+    // ─── Trusted Contract Registry & Bootstrap ───────────────────────────
+
+    /// Register a contract address for `role` during initial deployment
+    /// bootstrap. Permanently disabled once `complete_bootstrap` is called.
+    pub fn bootstrap_register_role(
+        env: Env,
+        caller: Address,
+        role: ContractRole,
+        contract_address: Address,
+    ) -> Result<(), TimelockError> {
+        Self::require_caller_is_admin(&env, &caller)?;
+        if Self::is_bootstrap_completed_internal(&env) {
+            return Err(TimelockError::BootstrapCompleted);
+        }
+        Self::apply_role_update(&env, role, contract_address, true)
+    }
+
+    /// Permanently lock bootstrap mode and enable runtime target allowlist
+    /// enforcement. Subsequent role updates must go through the timelock
+    /// queue/execute governance flow.
+    pub fn complete_bootstrap(env: Env, caller: Address) -> Result<(), TimelockError> {
+        Self::require_caller_is_admin(&env, &caller)?;
+        if Self::is_bootstrap_completed_internal(&env) {
+            return Err(TimelockError::BootstrapCompleted);
+        }
+
+        // Ensure the timelock contract itself is registered for self-governed
+        // operations if `ContractRole::Timelock` was not explicitly registered.
+        let self_addr = env.current_contract_address();
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::RoleAddress(ContractRole::Timelock))
+            && !env
+                .storage()
+                .persistent()
+                .has(&DataKey::AddressRole(self_addr.clone()))
+        {
+            Self::apply_role_update(&env, ContractRole::Timelock, self_addr, true)?;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::BootstrapCompleted, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::EnforceTargetAllowlist, &true);
+        env.events().publish(
+            (Symbol::new(&env, "boot_done"),),
+            (caller, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Update or rotate the contract address assigned to `role`.
+    ///
+    /// Strictly self-governed: only callable by the timelock contract itself
+    /// via a queued and executed `TimelockOperation`.
+    pub fn update_role_address(
+        env: Env,
+        role: ContractRole,
+        new_address: Address,
+    ) -> Result<(), TimelockError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(TimelockError::NotInitialized);
+        }
+        env.current_contract_address().require_auth();
+        Self::apply_role_update(&env, role, new_address, false)
+    }
+
+    /// Rotate the contract address assigned to `role`, verifying `caller` is
+    /// the timelock contract itself (rejects direct admin or external calls
+    /// with `TimelockError::Unauthorized`).
+    pub fn rotate_role_address(
+        env: Env,
+        caller: Address,
+        role: ContractRole,
+        new_address: Address,
+    ) -> Result<(), TimelockError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(TimelockError::NotInitialized);
+        }
+        caller.require_auth();
+        if caller != env.current_contract_address() {
+            return Err(TimelockError::Unauthorized);
+        }
+        Self::apply_role_update(&env, role, new_address, false)
+    }
+
+    /// Enable or disable runtime target allowlist enforcement.
+    ///
+    /// Prior to `complete_bootstrap`, `admin` may toggle this; after
+    /// `complete_bootstrap`, only the timelock itself (via `queue`/`execute`)
+    /// may change enforcement.
+    pub fn set_allowlist_enforcement(
+        env: Env,
+        caller: Address,
+        enabled: bool,
+    ) -> Result<(), TimelockError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(TimelockError::NotInitialized);
+        }
+        caller.require_auth();
+        if Self::is_bootstrap_completed_internal(&env) {
+            if caller != env.current_contract_address() {
+                return Err(TimelockError::Unauthorized);
+            }
+        } else {
+            let admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(TimelockError::NotInitialized)?;
+            if caller != admin && caller != env.current_contract_address() {
+                return Err(TimelockError::Unauthorized);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::EnforceTargetAllowlist, &enabled);
+        env.events()
+            .publish((Symbol::new(&env, "al_enfc"),), enabled);
+        Ok(())
+    }
+
+    /// Resolve the current contract address for a given `ContractRole`.
+    pub fn resolve_role(env: Env, role: ContractRole) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::RoleAddress(role))
+    }
+
+    /// Reverse lookup returning the `ContractRole` assigned to `contract_address`.
+    pub fn role_of(env: Env, contract_address: Address) -> Option<ContractRole> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AddressRole(contract_address))
+    }
+
+    /// Returns `true` if `contract_address` is currently registered in the
+    /// trusted contract allowlist.
+    pub fn is_trusted_contract(env: Env, contract_address: Address) -> bool {
+        Self::is_trusted_contract_internal(&env, &contract_address)
+    }
+
+    /// Verify that `contract_address` is the active registered contract for
+    /// `role`. Returns `Err(TimelockError::RoleNotRegistered)` if `role` is
+    /// unset or `Err(TimelockError::UntrustedTarget)` if the address does not
+    /// match.
+    pub fn verify_role_address(
+        env: Env,
+        role: ContractRole,
+        contract_address: Address,
+    ) -> Result<(), TimelockError> {
+        let registered: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleAddress(role))
+            .ok_or(TimelockError::RoleNotRegistered)?;
+        if registered != contract_address {
+            return Err(TimelockError::UntrustedTarget);
+        }
+        Ok(())
+    }
+
+    /// Return the full chronological audit history of registrations and
+    /// rotations for `role`.
+    pub fn rotation_history(env: Env, role: ContractRole) -> Vec<RoleRotationRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RotationHistory(role))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Whether bootstrap mode has been permanently completed.
+    pub fn is_bootstrap_completed(env: Env) -> bool {
+        Self::is_bootstrap_completed_internal(&env)
+    }
+
+    /// Whether runtime target allowlist enforcement is active.
+    pub fn is_allowlist_enforced(env: Env) -> bool {
+        Self::is_allowlist_enforced_internal(&env)
+    }
+
     // ─── Core Operations ─────────────────────────────────────────────────
 
     /// Queue a cross-contract call for delayed execution.
@@ -291,6 +362,12 @@ impl RefractTimelock {
     ) -> Result<u64, TimelockError> {
         Self::require_admin(&env)?;
 
+        if Self::is_allowlist_enforced_internal(&env) && !Self::is_trusted_target(&env, &target) {
+            env.events()
+                .publish((Symbol::new(&env, "untrusted"),), target);
+            return Err(TimelockError::UntrustedTarget);
+        }
+
         let now = env.ledger().timestamp();
         let min_delay: u64 = env
             .storage()
@@ -301,11 +378,7 @@ impl RefractTimelock {
             return Err(TimelockError::EtaTooSoon);
         }
 
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
         let op = TimelockOperation {
             target: target.clone(),
             function: function.clone(),
@@ -313,12 +386,8 @@ impl RefractTimelock {
             eta,
             status: OperationStatus::Pending,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextId, &(id + 1));
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "tl_queued"), id),
@@ -348,37 +417,42 @@ impl RefractTimelock {
             return Err(TimelockError::NotReady);
         }
 
+        if Self::is_allowlist_enforced_internal(&env) && !Self::is_trusted_target(&env, &op.target)
+        {
+            env.events()
+                .publish((Symbol::new(&env, "untrusted"), id), op.target);
+            return Err(TimelockError::UntrustedTarget);
+        }
+
         // Mark as executed *before* the cross-contract call so that a
         // re-entrant execute on the same id is rejected even if the
         // target call somehow loops back.
         op.status = OperationStatus::Executed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
 
-        // Forward the call.  `try_invoke_contract` is used so that a
-        // failing callee does not silently swallow the error — we catch it,
-        // reset the status to Pending (making the op re-attemptable), and
-        // bubble the error up.
-        let result = env.try_invoke_contract::<Val, soroban_sdk::InvokeError>(
-            &op.target,
-            &op.function,
-            op.args.clone(),
-        );
+        let result: Result<(), TimelockError> = if op.target == env.current_contract_address() {
+            Self::execute_self_operation(&env, &op.function, &op.args)
+        } else {
+            env.try_invoke_contract::<Val, soroban_sdk::InvokeError>(
+                &op.target,
+                &op.function,
+                op.args.clone(),
+            )
+            .map(|_| ())
+            .map_err(|_| TimelockError::NotFound)
+        };
 
         match result {
-            Ok(_) => {
+            Ok(()) => {
                 env.events()
                     .publish((Symbol::new(&env, "tl_executed"), id), ());
                 Ok(())
             }
-            Err(_) => {
+            Err(err) => {
                 // Reset so the op can be retried.
                 op.status = OperationStatus::Pending;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Operation(id), &op);
-                Err(TimelockError::NotFound) // surface as a generic failure
+                env.storage().persistent().set(&DataKey::Operation(id), &op);
+                Err(err)
             }
         }
     }
@@ -399,9 +473,7 @@ impl RefractTimelock {
         }
 
         op.status = OperationStatus::Cancelled;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
 
         env.events()
             .publish((Symbol::new(&env, "tl_cancelled"), id), ());
@@ -423,6 +495,142 @@ impl RefractTimelock {
             .ok_or(TimelockError::NotInitialized)?;
         admin.require_auth();
         Ok(())
+    }
+
+    fn require_caller_is_admin(env: &Env, caller: &Address) -> Result<(), TimelockError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TimelockError::NotInitialized)?;
+        caller.require_auth();
+        if *caller != admin {
+            return Err(TimelockError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn is_bootstrap_completed_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::BootstrapCompleted)
+            .unwrap_or(false)
+    }
+
+    fn is_allowlist_enforced_internal(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EnforceTargetAllowlist)
+            .unwrap_or(false)
+    }
+
+    fn is_trusted_contract_internal(env: &Env, addr: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::AddressRole(addr.clone()))
+    }
+
+    fn is_trusted_target(env: &Env, target: &Address) -> bool {
+        if *target == env.current_contract_address() {
+            return true;
+        }
+        Self::is_trusted_contract_internal(env, target)
+    }
+
+    fn apply_role_update(
+        env: &Env,
+        role: ContractRole,
+        new_address: Address,
+        is_bootstrap: bool,
+    ) -> Result<(), TimelockError> {
+        // Reject duplicate addresses across roles (and redundant re-assignment
+        // of the exact same address).
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::AddressRole(new_address.clone()))
+        {
+            return Err(TimelockError::DuplicateRoleAddress);
+        }
+
+        let old_address: Option<Address> =
+            env.storage().persistent().get(&DataKey::RoleAddress(role));
+
+        if let Some(ref prev) = old_address {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AddressRole(prev.clone()));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleAddress(role), &new_address);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AddressRole(new_address.clone()), &role);
+
+        let now = env.ledger().timestamp();
+        let mut history: Vec<RoleRotationRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RotationHistory(role))
+            .unwrap_or_else(|| Vec::new(env));
+        history.push_back(RoleRotationRecord {
+            role,
+            old_address: old_address.clone(),
+            new_address: new_address.clone(),
+            rotated_at: now,
+        });
+        env.storage()
+            .persistent()
+            .set(&DataKey::RotationHistory(role), &history);
+
+        let event_topic = if is_bootstrap {
+            Symbol::new(env, "reg_boot")
+        } else {
+            Symbol::new(env, "role_rot")
+        };
+        env.events()
+            .publish((event_topic, role), (old_address, new_address, now));
+
+        Ok(())
+    }
+
+    fn execute_self_operation(
+        env: &Env,
+        function: &Symbol,
+        args: &Vec<Val>,
+    ) -> Result<(), TimelockError> {
+        if *function == Symbol::new(env, "update_role_address") {
+            let role_val = args.get(0).ok_or(TimelockError::NotFound)?;
+            let addr_val = args.get(1).ok_or(TimelockError::NotFound)?;
+            let role =
+                ContractRole::try_from_val(env, &role_val).map_err(|_| TimelockError::NotFound)?;
+            let new_address =
+                Address::try_from_val(env, &addr_val).map_err(|_| TimelockError::NotFound)?;
+            Self::apply_role_update(env, role, new_address, false)
+        } else if *function == Symbol::new(env, "rotate_role_address") {
+            let (role_idx, addr_idx) = if args.len() == 3 { (1, 2) } else { (0, 1) };
+            let role_val = args.get(role_idx).ok_or(TimelockError::NotFound)?;
+            let addr_val = args.get(addr_idx).ok_or(TimelockError::NotFound)?;
+            let role =
+                ContractRole::try_from_val(env, &role_val).map_err(|_| TimelockError::NotFound)?;
+            let new_address =
+                Address::try_from_val(env, &addr_val).map_err(|_| TimelockError::NotFound)?;
+            Self::apply_role_update(env, role, new_address, false)
+        } else if *function == Symbol::new(env, "set_allowlist_enforcement") {
+            let en_idx = if args.len() == 2 { 1 } else { 0 };
+            let en_val = args.get(en_idx).ok_or(TimelockError::NotFound)?;
+            let enabled = bool::try_from_val(env, &en_val).map_err(|_| TimelockError::NotFound)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::EnforceTargetAllowlist, &enabled);
+            env.events()
+                .publish((Symbol::new(env, "al_enfc"),), enabled);
+            Ok(())
+        } else {
+            Err(TimelockError::NotFound)
+        }
     }
 }
 
