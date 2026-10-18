@@ -213,3 +213,26 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Rounding, Dust, and Remainder-Distribution Semantics (`RefractBackstop`, `RefractBountyEscrow`, `RefractGrants`, `RefractTreasury`)
+
+All four contracts operate on 1e7 fixed-point integers (`i128` with `u128` intermediates to prevent overflow) and enforce the following deterministic allocation and rounding rules:
+
+### 8.1 Largest-Remainder Allocation (`allocate_largest_remainder`)
+Used for multi-recipient bounty splits (`award_split`), weighted grant milestone schedules (`create_grant_by_weights`), and pro-rata round distributions:
+1. For weights $w_0, \dots, w_{n-1}$ with $W = \sum_{i=0}^{n-1} w_i > 0$, each recipient $i$ receives the floor share $q_i = \lfloor (\text{total} \times w_i) / W \rfloor$ with remainder $r_i = (\text{total} \times w_i) \bmod W$.
+2. The residual $R = \text{total} - \sum_{i=0}^{n-1} q_i$ ($0 \le R < n$) is distributed 1 unit at a time to the $R$ entries with the largest $r_i$, tie-broken deterministically by the **lowest index $i$**.
+3. If $W = 0$, all recipient outputs are `0` and `dust = total` is routed to the protocol dust account in `RefractTreasury`.
+
+### 8.2 Safe Floor Truncation & Conserving Two-Way Splits
+- **Share Minting & Redemptions (`RefractBackstop`)**: Deposit share minting and withdrawal quotes round down (`floor`) in the pool's favor. When the final shares are burned (`total_shares == 0`), any residual truncation dust is captured in `accumulated_dust`.
+- **Basis-Point Splits (`split_bps_conserving` / `split_bond_slash`)**: Given `amount` and `bps`, the primary leg is `cut = floor(amount * bps / 10_000)` and the complementary leg is `remainder = amount - cut`, guaranteeing `cut + remainder == amount`.
+
+### 8.3 Conservation Invariant (`INV-ALLOC-1`)
+```
+∀ total >= 0, weights:
+    sum(outputs) + routed_dust == total
+```
+
