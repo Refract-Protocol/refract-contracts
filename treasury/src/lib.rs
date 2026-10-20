@@ -70,7 +70,9 @@ mod test {
         assert_eq!(client.admin(), admin);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let token_client = token::Client::new(&env, &token_id);
         let sac = token::StellarAssetClient::new(&env, &token_id);
 
@@ -82,5 +84,36 @@ mod test {
         client.withdraw(&admin, &token_id, &400, &to);
         assert_eq!(token_client.balance(&to), 400);
         assert_eq!(token_client.balance(&contract_id), 600);
+    }
+
+    /// Resource benchmark (issue #221): prints one `BUDGET` line per
+    /// state-changing entrypoint for `cargo xtask budget-check`.
+    #[test]
+    fn budget_entrypoints() {
+        extern crate std;
+        fn measure<T>(env: &Env, ep: &str, f: impl FnOnce() -> T) -> T {
+            env.budget().reset_default();
+            let r = f();
+            std::println!(
+                "BUDGET refract_treasury {ep} {} {}",
+                env.budget().cpu_instruction_cost(),
+                env.budget().memory_bytes_cost()
+            );
+            r
+        }
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, RefractTreasury);
+        let client = RefractTreasuryClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        token::StellarAssetClient::new(&env, &token).mint(&id, &1_000);
+        measure(&env, "initialize", || client.initialize(&admin));
+        let to = Address::generate(&env);
+        measure(&env, "withdraw", || {
+            client.withdraw(&admin, &token, &400, &to)
+        });
     }
 }

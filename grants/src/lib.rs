@@ -1,415 +1,487 @@
+#![no_std]
+
 //! # RefractGrants
 //!
-//! Milestone-based community grants disbursement contract.
+//! Milestone-based community grants contract with on-chain application intake
+//! and governance/timelock-gated reviewer approval.
 //!
-//! Governance (via the timelock) approves a grant with a total amount and a set
-//! of milestones. Funds are released to the grantee incrementally as each
-//! milestone is separately confirmed, rather than disbursing the entire
-//! approved amount in one lump sum.
+//! ## Application lifecycle
+//! ```text
+//! submit_application()   → Pending
+//! approve_application()  → Approved   (reviewer/governance only)
+//! reject_application()   → Rejected   (reviewer/governance only)
+//! withdraw_application() → Withdrawn  (applicant only, while Pending)
+//! ```
+//!
+//! ## Grant (post-approval) lifecycle
+//! ```text
+//! Approved application → auto-creates a Grant record
+//! confirm_milestone()  → marks a milestone confirmed (governance only, in order)
+//! claim()              → recipient pulls confirmed-but-unclaimed funds
+//! ```
 //!
 //! ## Design notes
-//!
-//! * `create_grant` and `confirm_milestone` are governance/timelock-gated.
-//!   Confirmation is deliberately separate from creation so different reviewers
-//!   can confirm delivery of individual milestones.
-//! * `claim` is permissionless for the recipient and releases whatever
-//!   confirmed-but-unclaimed amount exists (mirrors the vesting-claim pattern).
-//! * Milestone amounts must sum to exactly `total_amount` at creation.
-//! * Milestones must be confirmed strictly in order. Out-of-order confirmation
-//!   is rejected.
-//! * Zero-milestone grants are explicitly rejected at creation.
-//!
-//! Proof-of-delivery/attestation for what counts as milestone completion is made
-//! off-chain by governance; this contract only enforces the funds-release
-//! mechanics once a milestone is confirmed on-chain.
+//! * Applications are stored under an incrementing counter key.
+//! * Reviewer/approver is the configured governance address (ultimately the
+//!   timelock), matching the pattern used by `RefractBounty`.
+//! * Self-approval (reviewer == applicant) is rejected.
+//! * Rejected and withdrawn applications are retained for audit but can never
+//!   transition to Approved.
+//! * The whole contract is `#![no_std]` — no `std::collections::BTreeMap`.
 
-use std::collections::BTreeMap;
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+};
 
-/// Identifier for a grant.
-pub type GrantId = u64;
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-/// Address type used by the contract. Kept as a plain `u64` handle so the crate
-/// stays dependency-free and can be wired to the concrete ledger address type by
-/// the integrating runtime.
-pub type Address = u64;
+/// Lifecycle state of an application.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ApplicationStatus {
+    Pending = 0,
+    Approved = 1,
+    Rejected = 2,
+    Withdrawn = 3,
+}
 
-/// Errors returned by [`RefractGrants`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GrantsError {
-    /// Caller is not the configured governance/timelock authority.
-    Unauthorized,
-    /// No grant exists for the supplied id.
-    GrantNotFound,
-    /// A grant must declare at least one milestone.
-    NoMilestones,
-    /// Milestone amounts do not sum to the declared total amount.
-    MilestoneSumMismatch,
-    /// A milestone amount was zero or negative.
-    InvalidMilestoneAmount,
-    /// The total amount was zero or negative.
-    InvalidTotalAmount,
-    /// The milestone index is out of range for the grant.
-    InvalidMilestoneIndex,
-    /// The milestone has already been confirmed.
-    MilestoneAlreadyConfirmed,
-    /// Milestones must be confirmed in order; an earlier one is still pending.
-    MilestoneOutOfOrder,
-    /// The caller is not the grant recipient.
-    NotRecipient,
-    /// There is no confirmed-but-unclaimed amount to release.
-    NothingToClaim,
+/// An on-chain grant application.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Application {
+    pub id: u64,
+    pub applicant: Address,
+    /// Requested total amount (1e7 fixed-point).
+    pub amount: i128,
+    /// SHA-256 hash commitment to the off-chain milestone outline.
+    pub milestone_outline_hash: soroban_sdk::BytesN<32>,
+    /// Ledger sequence of the delivery deadline (informational / auditable).
+    pub deadline_ledger: u32,
+    pub status: ApplicationStatus,
 }
 
 /// A single milestone within a grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct Milestone {
     /// Amount released when this milestone is confirmed.
     pub amount: i128,
-    /// Whether governance has confirmed delivery of this milestone.
+    /// Whether governance has confirmed delivery.
     pub confirmed: bool,
-    /// Whether the confirmed amount has already been claimed.
+    /// Whether the confirmed amount has been claimed.
     pub claimed: bool,
 }
 
-/// A grant approved by governance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An approved, milestone-bearing grant.
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct Grant {
-    /// Account that receives released funds.
+    pub id: u64,
     pub recipient: Address,
-    /// Total amount approved across all milestones.
     pub total_amount: i128,
-    /// Ordered milestones; index 0 is confirmed first.
     pub milestones: Vec<Milestone>,
     /// Sum of confirmed-but-unclaimed milestone amounts.
     pub claimable: i128,
 }
 
-/// Milestone-based community grants disbursement contract.
-#[derive(Debug, Clone)]
-pub struct RefractGrants {
-    /// Governance/timelock authority allowed to create grants and confirm
-    /// milestones.
-    governance: Address,
-    /// Monotonic counter used to allocate grant ids.
-    next_grant_id: GrantId,
-    /// Stored grants keyed by id.
-    grants: BTreeMap<GrantId, Grant>,
+// ── Storage keys ──────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    /// Governance/timelock address.
+    Governance,
+    /// SEP-41 token used for disbursements.
+    Token,
+    /// Monotonic counter for application ids.
+    NextApplicationId,
+    /// Application record.
+    Application(u64),
+    /// Grant record (same id as the source application).
+    Grant(u64),
 }
 
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum GrantsError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    ApplicationNotFound = 4,
+    GrantNotFound = 5,
+    /// Requested amount must be positive.
+    InvalidAmount = 6,
+    /// A grant must have at least one milestone.
+    NoMilestones = 7,
+    /// Milestone amounts do not sum to the approved total.
+    MilestoneSumMismatch = 8,
+    /// Individual milestone amount must be positive.
+    InvalidMilestoneAmount = 9,
+    /// Application is not in the expected state for this transition.
+    WrongStatus = 10,
+    /// Reviewer may not approve their own application.
+    SelfApproval = 11,
+    /// Milestone index is out of range.
+    InvalidMilestoneIndex = 12,
+    /// Milestone has already been confirmed.
+    MilestoneAlreadyConfirmed = 13,
+    /// An earlier milestone has not yet been confirmed (in-order enforcement).
+    MilestoneOutOfOrder = 14,
+    /// Caller is not the grant recipient.
+    NotRecipient = 15,
+    /// No confirmed-but-unclaimed amount to release.
+    NothingToClaim = 16,
+    /// Arithmetic overflow.
+    Overflow = 17,
+}
+
+// ── Contract ──────────────────────────────────────────────────────────────────
+
+#[contract]
+pub struct RefractGrants;
+
+#[contractimpl]
 impl RefractGrants {
-    /// Creates a new grants contract governed by `governance` (the timelock).
-    pub fn new(governance: Address) -> Self {
-        Self {
-            governance,
-            next_grant_id: 0,
-            grants: BTreeMap::new(),
+    // ── Initialization ────────────────────────────────────────────────────
+
+    /// One-time initialization wiring the governance/timelock address and the
+    /// disbursement token.
+    pub fn initialize(env: Env, governance: Address, token: Address) -> Result<(), GrantsError> {
+        if env.storage().instance().has(&DataKey::Governance) {
+            return Err(GrantsError::AlreadyInitialized);
         }
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
+        env.storage().instance().set(&DataKey::Token, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextApplicationId, &0u64);
+        Ok(())
     }
 
-    /// Returns the configured governance/timelock authority.
-    pub fn governance(&self) -> Address {
-        self.governance
-    }
+    // ── Application intake ────────────────────────────────────────────────
 
-    /// Returns the grant for `grant_id`, if any.
-    pub fn get_grant(&self, grant_id: GrantId) -> Option<&Grant> {
-        self.grants.get(&grant_id)
-    }
-
-    /// Returns the confirmed-but-unclaimed amount for `grant_id`.
-    pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
-        self.grants.get(&grant_id).map(|grant| grant.claimable)
-    }
-
-    /// Approves a new grant with `total_amount` split across `milestones`.
+    /// Submit a grant application.
     ///
-    /// Governance/timelock-gated. Milestone amounts must be strictly positive
-    /// and sum to exactly `total_amount`. At least one milestone is required.
-    pub fn create_grant(
-        &mut self,
-        caller: Address,
-        recipient: Address,
-        total_amount: i128,
-        milestones: Vec<i128>,
-    ) -> Result<GrantId, GrantsError> {
-        self.require_governance(caller)?;
+    /// `milestone_outline_hash` is a 32-byte commitment to the off-chain
+    /// milestone plan. `deadline_ledger` is the expected delivery ledger
+    /// (recorded for audit; not enforced on-chain here).
+    pub fn submit_application(
+        env: Env,
+        applicant: Address,
+        amount: i128,
+        milestone_outline_hash: soroban_sdk::BytesN<32>,
+        deadline_ledger: u32,
+    ) -> Result<u64, GrantsError> {
+        applicant.require_auth();
+        Self::ensure_initialized(&env)?;
+        if amount <= 0 {
+            return Err(GrantsError::InvalidAmount);
+        }
 
-        if total_amount <= 0 {
-            return Err(GrantsError::InvalidTotalAmount);
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextApplicationId)
+            .ok_or(GrantsError::NotInitialized)?;
+
+        let app = Application {
+            id,
+            applicant,
+            amount,
+            milestone_outline_hash,
+            deadline_ledger,
+            status: ApplicationStatus::Pending,
+        };
+        put_persistent(&env, &DataKey::Application(id), &app);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextApplicationId, &(id + 1));
+
+        env.events()
+            .publish((Symbol::new(&env, "application_submitted"), id), amount);
+        Ok(id)
+    }
+
+    /// Approve a pending application, creating the grant record.
+    ///
+    /// `milestones` is an ordered list of amounts that must sum exactly to
+    /// `application.amount`. Only the configured governance address may call
+    /// this; self-approval is rejected.
+    pub fn approve_application(
+        env: Env,
+        reviewer: Address,
+        application_id: u64,
+        milestones: Vec<i128>,
+    ) -> Result<u64, GrantsError> {
+        reviewer.require_auth();
+        let governance = Self::load_governance(&env)?;
+        if reviewer != governance {
+            return Err(GrantsError::Unauthorized);
+        }
+
+        let mut app = Self::load_application(&env, application_id)?;
+        if app.status != ApplicationStatus::Pending {
+            return Err(GrantsError::WrongStatus);
+        }
+        if reviewer == app.applicant {
+            return Err(GrantsError::SelfApproval);
         }
         if milestones.is_empty() {
             return Err(GrantsError::NoMilestones);
         }
 
+        // Validate milestone amounts sum to approved total
         let mut sum: i128 = 0;
-        for amount in &milestones {
-            if *amount <= 0 {
+        let mut ms_vec: Vec<Milestone> = Vec::new(&env);
+        for amount in milestones.iter() {
+            if amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
-        }
-        if sum != total_amount {
-            return Err(GrantsError::MilestoneSumMismatch);
-        }
-
-        let grant_id = self.next_grant_id;
-        self.next_grant_id += 1;
-
-        let stored = milestones
-            .into_iter()
-            .map(|amount| Milestone {
+            sum = sum.checked_add(amount).ok_or(GrantsError::Overflow)?;
+            ms_vec.push_back(Milestone {
                 amount,
                 confirmed: false,
                 claimed: false,
-            })
-            .collect();
+            });
+        }
+        if sum != app.amount {
+            return Err(GrantsError::MilestoneSumMismatch);
+        }
 
-        self.grants.insert(
-            grant_id,
-            Grant {
-                recipient,
-                total_amount,
-                milestones: stored,
-                claimable: 0,
-            },
+        app.status = ApplicationStatus::Approved;
+        put_persistent(&env, &DataKey::Application(application_id), &app);
+
+        let grant = Grant {
+            id: application_id,
+            recipient: app.applicant.clone(),
+            total_amount: app.amount,
+            milestones: ms_vec,
+            claimable: 0,
+        };
+        put_persistent(&env, &DataKey::Grant(application_id), &grant);
+
+        env.events().publish(
+            (Symbol::new(&env, "application_approved"), application_id),
+            (reviewer, app.amount),
         );
-
-        Ok(grant_id)
+        Ok(application_id)
     }
 
-    /// Confirms delivery of a single milestone, making its amount claimable.
-    ///
-    /// Governance/timelock-gated and separate from creation so different
-    /// reviewers can confirm individual milestones. Milestones must be confirmed
-    /// strictly in order.
-    pub fn confirm_milestone(
-        &mut self,
-        caller: Address,
-        grant_id: GrantId,
-        milestone_index: usize,
+    /// Reject a pending application. Only governance may call this.
+    /// Rejected applications are retained for audit and may never be approved.
+    pub fn reject_application(
+        env: Env,
+        reviewer: Address,
+        application_id: u64,
     ) -> Result<(), GrantsError> {
-        self.require_governance(caller)?;
+        reviewer.require_auth();
+        let governance = Self::load_governance(&env)?;
+        if reviewer != governance {
+            return Err(GrantsError::Unauthorized);
+        }
+        let mut app = Self::load_application(&env, application_id)?;
+        if app.status != ApplicationStatus::Pending {
+            return Err(GrantsError::WrongStatus);
+        }
+        app.status = ApplicationStatus::Rejected;
+        put_persistent(&env, &DataKey::Application(application_id), &app);
+        env.events().publish(
+            (Symbol::new(&env, "application_rejected"), application_id),
+            (reviewer, app.amount),
+        );
+        Ok(())
+    }
 
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
+    /// Withdraw a pending application. Only the applicant may call this.
+    pub fn withdraw_application(
+        env: Env,
+        applicant: Address,
+        application_id: u64,
+    ) -> Result<(), GrantsError> {
+        applicant.require_auth();
+        let mut app = Self::load_application(&env, application_id)?;
+        if applicant != app.applicant {
+            return Err(GrantsError::Unauthorized);
+        }
+        if app.status != ApplicationStatus::Pending {
+            return Err(GrantsError::WrongStatus);
+        }
+        app.status = ApplicationStatus::Withdrawn;
+        put_persistent(&env, &DataKey::Application(application_id), &app);
+        env.events().publish(
+            (Symbol::new(&env, "application_withdrawn"), application_id),
+            (),
+        );
+        Ok(())
+    }
 
-        if milestone_index >= grant.milestones.len() {
+    // ── Grant milestone flow ──────────────────────────────────────────────
+
+    /// Confirm delivery of a single milestone. Governance/timelock-gated.
+    /// Milestones must be confirmed strictly in order.
+    pub fn confirm_milestone(
+        env: Env,
+        caller: Address,
+        grant_id: u64,
+        milestone_index: u32,
+    ) -> Result<(), GrantsError> {
+        caller.require_auth();
+        let governance = Self::load_governance(&env)?;
+        if caller != governance {
+            return Err(GrantsError::Unauthorized);
+        }
+        let mut grant = Self::load_grant(&env, grant_id)?;
+        let idx = milestone_index as usize;
+
+        if idx >= grant.milestones.len() as usize {
             return Err(GrantsError::InvalidMilestoneIndex);
         }
 
-        // Enforce in-order confirmation: every earlier milestone must already be
-        // confirmed before this one can be.
-        for earlier in &grant.milestones[..milestone_index] {
-            if !earlier.confirmed {
+        // Enforce in-order confirmation
+        for i in 0..idx {
+            let ms: Milestone = grant.milestones.get_unchecked(i as u32);
+            if !ms.confirmed {
                 return Err(GrantsError::MilestoneOutOfOrder);
             }
         }
 
-        let milestone = &mut grant.milestones[milestone_index];
-        if milestone.confirmed {
+        let mut ms: Milestone = grant.milestones.get_unchecked(milestone_index);
+        if ms.confirmed {
             return Err(GrantsError::MilestoneAlreadyConfirmed);
         }
-
-        milestone.confirmed = true;
+        let amount = ms.amount;
+        ms.confirmed = true;
+        grant.milestones.set(milestone_index, ms);
         grant.claimable = grant
             .claimable
-            .checked_add(milestone.amount)
-            .ok_or(GrantsError::MilestoneSumMismatch)?;
-
+            .checked_add(amount)
+            .ok_or(GrantsError::Overflow)?;
+        put_persistent(&env, &DataKey::Grant(grant_id), &grant);
         Ok(())
     }
 
-    /// Releases the confirmed-but-unclaimed amount for `grant_id` to the
-    /// recipient.
+    /// Release confirmed-but-unclaimed milestone amounts to the recipient.
     ///
-    /// Permissionless for the recipient: any caller may trigger the release as
-    /// long as they are the grant recipient. Returns the amount released.
-    pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
+    /// Permissionless for the recipient. Returns the amount released.
+    pub fn claim(env: Env, recipient: Address, grant_id: u64) -> Result<i128, GrantsError> {
+        recipient.require_auth();
+        let token = Self::token(&env)?;
+        let mut grant = Self::load_grant(&env, grant_id)?;
 
         if grant.recipient != recipient {
             return Err(GrantsError::NotRecipient);
         }
-
         let amount = grant.claimable;
         if amount <= 0 {
             return Err(GrantsError::NothingToClaim);
         }
 
-        grant.claimable = 0;
-        for milestone in grant.milestones.iter_mut() {
-            if milestone.confirmed {
-                milestone.claimed = true;
+        // Mark confirmed milestones as claimed
+        let len = grant.milestones.len();
+        for i in 0..len {
+            let mut ms: Milestone = grant.milestones.get_unchecked(i);
+            if ms.confirmed && !ms.claimed {
+                ms.claimed = true;
+                grant.milestones.set(i, ms);
             }
         }
+        grant.claimable = 0;
+        put_persistent(&env, &DataKey::Grant(grant_id), &grant);
 
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "grant_claimed"), grant_id), amount);
         Ok(amount)
     }
 
-    fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
-        if caller != self.governance {
-            return Err(GrantsError::Unauthorized);
+    // ── Views ─────────────────────────────────────────────────────────────
+
+    /// Read an application record.
+    pub fn get_application(env: Env, application_id: u64) -> Option<Application> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Application(application_id))
+    }
+
+    /// Read a grant record.
+    pub fn get_grant(env: Env, grant_id: u64) -> Option<Grant> {
+        env.storage().persistent().get(&DataKey::Grant(grant_id))
+    }
+
+    /// Current confirmed-but-unclaimed balance for a grant.
+    pub fn claimable(env: Env, grant_id: u64) -> Result<i128, GrantsError> {
+        let grant = Self::load_grant(&env, grant_id)?;
+        Ok(grant.claimable)
+    }
+
+    /// The governance/timelock address.
+    pub fn governance(env: Env) -> Result<Address, GrantsError> {
+        Self::load_governance(&env)
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────
+
+    fn load_governance(env: &Env) -> Result<Address, GrantsError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(GrantsError::NotInitialized)
+    }
+
+    fn token(env: &Env) -> Result<Address, GrantsError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(GrantsError::NotInitialized)
+    }
+
+    fn ensure_initialized(env: &Env) -> Result<(), GrantsError> {
+        if !env.storage().instance().has(&DataKey::Governance) {
+            return Err(GrantsError::NotInitialized);
         }
         Ok(())
     }
+
+    fn load_application(env: &Env, id: u64) -> Result<Application, GrantsError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Application(id))
+            .ok_or(GrantsError::ApplicationNotFound)
+    }
+
+    fn load_grant(env: &Env, id: u64) -> Result<Grant, GrantsError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Grant(id))
+            .ok_or(GrantsError::GrantNotFound)
+    }
+}
+
+const PERSISTENT_TTL_THRESHOLD: u32 = 100_000;
+const PERSISTENT_TTL_EXTEND: u32 = 500_000;
+
+/// Persistent write with an explicit TTL bump so audit records do not expire.
+fn put_persistent<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &DataKey,
+    val: &V,
+) {
+    env.storage().persistent().set(key, val);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const GOVERNANCE: Address = 1;
-    const RECIPIENT: Address = 2;
-    const STRANGER: Address = 3;
-
-    fn contract() -> RefractGrants {
-        RefractGrants::new(GOVERNANCE)
-    }
-
-    #[test]
-    fn full_lifecycle_create_confirm_claim() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        // Nothing claimable before any confirmation.
-        assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        assert_eq!(grants.claimable(id), Some(100));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-        assert_eq!(grants.claimable(id), Some(0));
-
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 2).unwrap();
-        assert_eq!(grants.claimable(id), Some(200));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn claim_releases_only_confirmed_amounts() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
-            .unwrap();
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn rejects_milestone_sum_mismatch() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_milestones() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![]),
-            Err(GrantsError::NoMilestones)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 0, vec![0]),
-            Err(GrantsError::InvalidTotalAmount)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![100, 0]),
-            Err(GrantsError::InvalidMilestoneAmount)
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_order_confirmation() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneAlreadyConfirmed)
-        );
-    }
-
-    #[test]
-    fn enforces_governance_gating() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
-            Err(GrantsError::Unauthorized)
-        );
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-
-        assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
-        );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
-        );
-    }
-}
+mod test;
