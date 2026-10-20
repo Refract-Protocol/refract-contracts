@@ -17,6 +17,9 @@ This repository holds the three on-chain contracts that make up Refract's settle
 | `pool/` | `RefractPool` | Holds USDC risk capital, prices & sells policies, settles claims against oracle data |
 | `policy/` | `RefractPolicyRegistry` | Queryable on-chain index of policies per holder (sidecar to the pool) |
 | `oracle/` | `RefractOracle` | Permissioned price/event feed with staleness enforcement and trigger evaluation |
+| `backstop/` | `RefractBackstop` | Second-loss capital tranche, with governance-set deposit caps, per-staker caps and a minimum stake |
+| `bounty/` | `RefractBountyEscrow` | Governance-controlled bug bounty escrow, with single and multi-recipient (split) payouts |
+| `treasury/` | `RefractTreasury` | Token-custody vault that tags every deposit by funding source |
 
 All amounts use **1e7 fixed-point** (the Stellar USDC convention). The contracts are `#![no_std]` and never touch floating point.
 
@@ -90,6 +93,15 @@ If you rebuild the same commit with the same toolchain (see `toolchain.rustc` in
   ]
 }
 ```
+```
+
+### State snapshots and reconciliation
+
+`scripts/contract_state.py` dumps the state of `backstop`, `bounty`, `grants` and `treasury` to versioned JSON. It also checks that recorded liabilities match token balances. It is read-only (no keys, no signing). See [docs/contract-state-snapshots.md](./docs/contract-state-snapshots.md).
+
+```bash
+cargo xtask contract-state snapshot --network <rpc> --contracts backstop=C...,treasury=C... --out state.json
+cargo xtask contract-state reconcile state.json
 ```
 
 ## Deploy (testnet)

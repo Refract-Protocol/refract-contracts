@@ -127,7 +127,55 @@
 //
 // =============================================================================
 
+use std::path::PathBuf;
+use std::process::{exit, Command};
+
+const USAGE: &str = "usage: cargo xtask <task> [args...]
+
+tasks:
+  contract-state <snapshot|reconcile> [args...]
+      Read-only state snapshot and reconciliation for backstop, bounty,
+      grants and treasury. Delegates to scripts/contract_state.py; see
+      docs/contract-state-snapshots.md.
+  authz-matrix
+      Not implemented yet (#133).";
+
 fn main() {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("contract-state") => exit(contract_state(args.collect())),
+        Some("authz-matrix") => authz_matrix(),
+        Some("-h") | Some("--help") => println!("{USAGE}"),
+        _ => {
+            eprintln!("{USAGE}");
+            exit(2);
+        }
+    }
+}
+
+/// Runs `python3 scripts/contract_state.py` from the workspace root and
+/// passes its exit code through (0 ok, 1 mismatch, 2 error).
+fn contract_state(args: Vec<String>) -> i32 {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
+    match Command::new(&python)
+        .arg(root.join("scripts").join("contract_state.py"))
+        .args(&args)
+        .current_dir(&root)
+        .status()
+    {
+        Ok(status) => status.code().unwrap_or(2),
+        Err(err) => {
+            eprintln!("error: could not run {python}: {err}");
+            2
+        }
+    }
+}
+
+fn authz_matrix() {
     // TODO (#133): Implement the authz-matrix verifier.
     //
     // Suggested implementation order:
@@ -146,5 +194,5 @@ fn main() {
     //   anyhow = "1"
 
     eprintln!("TODO: implement authz-matrix verifier (see documentation above)");
-    std::process::exit(0);
+    exit(0);
 }
