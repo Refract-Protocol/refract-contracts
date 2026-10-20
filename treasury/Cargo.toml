@@ -2,12 +2,14 @@
 name = "refract-treasury"
 version = "0.1.0"
 edition = "2021"
+description = "Refract token-custody vault with source-tagged inflow accounting"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "20.0.0"
+soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
