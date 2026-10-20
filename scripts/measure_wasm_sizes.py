@@ -9,10 +9,11 @@ import sys
 import json
 import glob
 
+# Keep in sync with verify_sdk_upgrade.py, which explains the raises.
 BUDGETS = {
-    "refract_pool.wasm": 65000,
+    "refract_pool.wasm": 80000,
     "refract_policy.wasm": 45000,
-    "refract_oracle.wasm": 40000,
+    "refract_oracle.wasm": 48000,
 }
 
 def measure_sizes():

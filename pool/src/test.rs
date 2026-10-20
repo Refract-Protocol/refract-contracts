@@ -53,6 +53,9 @@ fn setup<'a>() -> Fixture<'a> {
     oracle.initialize(&admin);
     let relayer = Address::generate(&env);
     oracle.add_relayer(&relayer);
+    // Relayers go through a 48h notice period before they can submit.
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
+    oracle.activate_relayer(&relayer);
 
     Fixture {
         env,
@@ -96,6 +99,7 @@ fn oracle_submit(f: &Fixture, feed: &str, value: i128) {
 }
 
 /// Helper: advance time past the rate-limit cooldown (60s) then submit.
+#[allow(dead_code)]
 /// Use when you need two consecutive submissions to the same feed in a test.
 fn oracle_submit_after_cooldown(f: &Fixture, feed: &str, value: i128) {
     f.env.ledger().with_mut(|li| li.timestamp += 60);
@@ -442,7 +446,6 @@ fn set_pool_config_replaces_the_operational_parameters() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
-        min_relayers_for_claim: 0,
     };
 
     f.pool.set_pool_config(&f.admin, &new_config);
@@ -472,7 +475,6 @@ fn set_pool_config_rejects_non_admin() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
-        min_relayers_for_claim: 0,
     };
     let res = f.pool.try_set_pool_config(&stranger, &new_config);
     assert_eq!(res, Err(Ok(PoolError::Unauthorized)));
@@ -487,7 +489,6 @@ fn set_pool_config_emits_an_event() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
-        min_relayers_for_claim: 0,
     };
 
     let before = f.env.events().all().len();
@@ -530,7 +531,6 @@ fn pool_config_reflects_defaults_and_tracks_updates() {
         min_coverage: 50 * ONE_USDC,
         max_coverage: 10_000 * ONE_USDC,
         lockup_days: 14,
-        min_relayers_for_claim: 0,
     };
     f.pool.set_pool_config(&f.admin, &new_config);
     assert_eq!(f.pool.pool_config(), Some(new_config));
@@ -1188,7 +1188,10 @@ fn griefing_stranger_process_claim_payout_strictly_credited_to_holder() {
     // 3. Stranger received 0 USDC (cannot divert funds)
     assert_eq!(stranger_after, stranger_before);
     // 4. Policy status is Claimed
-    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Claimed);
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Claimed
+    );
 }
 
 #[test]
@@ -1199,21 +1202,6 @@ fn griefing_stranger_cannot_prematurely_expire_active_policy() {
 
     let holder = funded(&f, 1_000 * ONE_USDC);
 
-    let params = PolicyParams {
-        coverage_amount: 1_000 * ONE_USDC,
-        coverage_type: CoverageType::StablecoinDepeg,
-        duration_days: 30,
-        trigger_threshold: 500,
-    };
-    let id = f.pool.buy_policy(&holder, &params);
-
-    // Advance 10 days (policy is active, duration is 30 days)
-    f.env.ledger().with_mut(|li| {
-        li.timestamp += 10 * 86_400;
-    });
-
-    // Stranger attempts to call expire_policy prematurely
-    let res = f.pool.try_expire_polic
     let params = PolicyParams {
         coverage_amount: 1_000 * ONE_USDC,
         coverage_type: CoverageType::StablecoinDepeg,
@@ -1240,9 +1228,11 @@ fn griefing_stranger_cannot_prematurely_expire_active_policy() {
     });
 
     // Now expire_policy succeeds
-    let res_after = f.pool.expire_policy(&id);
-    assert_eq!(res_after, ());
-    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Expired);
+    f.pool.expire_policy(&id);
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Expired
+    );
 }
 
 #[test]
@@ -1278,7 +1268,6 @@ fn griefing_stranger_untriggered_claim_fails_cleanly() {
     assert_eq!(f.usdc.balance(&holder), holder_before);
 }
 
-
 // ─── Issues #20, #21: Differential Premium & Precision Loss Tests ─────────────
 
 #[test]
@@ -1299,14 +1288,10 @@ fn test_differential_calc_premium_against_reference_model() {
     };
 
     let actual = RefractPool::_calc_premium(&config, &params);
-    let expected = (10_000 * ONE_USDC as i128 * 300 * 30 * 100) / (10_000 * 365 * 100);
+    let expected = (10_000 * ONE_USDC * 300 * 30 * 100) / (10_000 * 365 * 100);
     assert_eq!(actual, expected);
     assert!(actual > 0);
 }
-
-#[test]
-fn test_precision_loss_bounds_in_deferred_division() {
-    let confi
 
 #[test]
 fn test_lockup_overflow_handled_safely() {
@@ -1319,9 +1304,13 @@ fn test_lockup_overflow_handled_safely() {
     config.lockup_days = u32::MAX;
     f.pool.set_pool_config(&f.admin, &config);
 
-    // lockup_expires_at should saturate safely without overflowing/panicking
+    // u32::MAX days still fits in u64 seconds, so the result is exact and
+    // nothing overflows or panics.
     let expires = f.pool.lockup_expires_at(&provider).unwrap();
-    assert_eq!(expires, u64::MAX);
+    assert_eq!(
+        expires,
+        f.env.ledger().timestamp() + u32::MAX as u64 * 86_400
+    );
 
     // Withdrawing before u64::MAX should return LockupActive
     let res = f.pool.try_withdraw_capital(&provider, &(10 * ONE_USDC));
@@ -1334,20 +1323,20 @@ fn test_buy_policy_duration_overflow_handled_safely() {
     let provider = funded(&f, 100 * ONE_USDC);
     f.pool.provide_capital(&provider, &(100 * ONE_USDC));
 
-    let buyer = funded(&f, 10 * ONE_USDC);
-    // Buy policy with extreme duration_days: u32::MAX
-    let id = f.pool.buy_policy(
-        &buyer,
-        &PolicyParams {
-            coverage_type: CoverageType::FlightDelay,
-            coverage_amount: 10 * ONE_USDC,
-            duration_days: u32::MAX,
-            trigger_threshold: 100,
-        },
-    );
+    let params = PolicyParams {
+        coverage_type: CoverageType::FlightDelay,
+        coverage_amount: 10 * ONE_USDC,
+        duration_days: u32::MAX,
+        trigger_threshold: 100,
+    };
+    // The premium for u32::MAX days is large; fund the buyer for it.
+    let buyer = funded(&f, f.pool.quote_premium(&params));
+    let now = f.env.ledger().timestamp();
+    let id = f.pool.buy_policy(&buyer, &params);
 
+    // u32::MAX days fits in u64 seconds: the end time is exact, no overflow.
     let policy = f.pool.get_policy(&id).unwrap();
-    assert_eq!(policy.end_time, u64::MAX);
+    assert_eq!(policy.end_time, now + u32::MAX as u64 * 86_400);
 }
 
 // ─── Issues #22, #23, #28, #29: Economic Conservation & Auth Invariants ───────
@@ -1369,26 +1358,19 @@ fn economic_conservation_inflows_equal_outflows_and_pool_balance() {
     let mut expected_inflows = deposit_amount;
     let mut expected_outflows = 0i128;
 
-    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
-    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+    assert_eq!(
+        f.usdc.balance(&pool_addr),
+        expected_inflows - expected_outflows
+    );
+    assert_eq!(
+        f.pool.pool_stats().total_capital,
+        f.usdc.balance(&pool_addr)
+    );
 
     // 3. Buy policy with premium
-    let holder = funded(&f, 10_000 * ONE_USDC);
+    let holder = funded(&f, 5_000 * ONE_USDC);
     let params = PolicyParams {
-        coverage_amount: 10_000 * ONE_USDC,
-        coverage_type: CoverageType::StablecoinDepeg,
-        duration_days: 30,
-        trigger_threshold: 500,
-    };
-    let mut expected_outflows = 0i128;
-
-    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
-    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
-
-    // 3. Buy policy with premium
-    let holder = funded(&f, 10_000 * ONE_USDC);
-    let params = PolicyParams {
-        coverage_amount: 10_000 * ONE_USDC,
+        coverage_amount: 5_000 * ONE_USDC,
         coverage_type: CoverageType::StablecoinDepeg,
         duration_days: 30,
         trigger_threshold: 500,
@@ -1397,8 +1379,14 @@ fn economic_conservation_inflows_equal_outflows_and_pool_balance() {
     let _id = f.pool.buy_policy(&holder, &params);
 
     expected_inflows += premium;
-    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
-    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+    assert_eq!(
+        f.usdc.balance(&pool_addr),
+        expected_inflows - expected_outflows
+    );
+    assert_eq!(
+        f.pool.pool_stats().total_capital,
+        f.usdc.balance(&pool_addr)
+    );
 
     // 4. Past lockup, withdraw capital
     past_lockup(&f);
@@ -1406,8 +1394,14 @@ fn economic_conservation_inflows_equal_outflows_and_pool_balance() {
     let usdc_out = f.pool.withdraw_capital(&lp, &shares_to_withdraw);
 
     expected_outflows += usdc_out;
-    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
-    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+    assert_eq!(
+        f.usdc.balance(&pool_addr),
+        expected_inflows - expected_outflows
+    );
+    assert_eq!(
+        f.pool.pool_stats().total_capital,
+        f.usdc.balance(&pool_addr)
+    );
 }
 
 #[test]
@@ -1463,7 +1457,10 @@ fn share_price_monotonicity_under_premium_accrual() {
     f.pool.buy_policy(&holder, &params);
 
     let price_1 = f.pool.pool_stats().share_price;
-    assert!(price_1 >= price_0, "Share price must never decrease upon premium accrual");
+    assert!(
+        price_1 >= price_0,
+        "Share price must never decrease upon premium accrual"
+    );
 }
 
 #[test]
@@ -1529,11 +1526,26 @@ fn test_spec_pool_interface_and_error_snapshot() {
 
 #[test]
 fn test_spec_mirrored_registry_types_match() {
-    assert_eq!(RegistryCoverageType::StablecoinDepeg as u32, refract_policy::CoverageType::StablecoinDepeg as u32);
-    assert_eq!(RegistryCoverageType::MarketCrash as u32, refract_policy::CoverageType::MarketCrash as u32);
-    assert_eq!(RegistryCoverageType::LiquidationShield as u32, refract_policy::CoverageType::LiquidationShield as u32);
-    assert_eq!(RegistryCoverageType::SmartContractRisk as u32, refract_policy::CoverageType::SmartContractRisk as u32);
-    assert_eq!(RegistryCoverageType::FlightDelay as u32, refract_policy::CoverageType::FlightDelay as u32);
+    assert_eq!(
+        RegistryCoverageType::StablecoinDepeg as u32,
+        refract_policy::CoverageType::StablecoinDepeg as u32
+    );
+    assert_eq!(
+        RegistryCoverageType::MarketCrash as u32,
+        refract_policy::CoverageType::MarketCrash as u32
+    );
+    assert_eq!(
+        RegistryCoverageType::LiquidationShield as u32,
+        refract_policy::CoverageType::LiquidationShield as u32
+    );
+    assert_eq!(
+        RegistryCoverageType::SmartContractRisk as u32,
+        refract_policy::CoverageType::SmartContractRisk as u32
+    );
+    assert_eq!(
+        RegistryCoverageType::FlightDelay as u32,
+        refract_policy::CoverageType::FlightDelay as u32
+    );
 
     let env = Env::default();
     let holder = Address::generate(&env);
@@ -1680,7 +1692,8 @@ fn test_calc_premium_matches_expected_formula() {
     };
 
     let actual = RefractPool::_calc_premium(&config, &params);
-    let expected = (10_000 * ONE_USDC as i128 * 300 * 30 * 100) / (10_000 * 365 * 100);
+    // MarketCrash carries a 1.5x risk multiplier.
+    let expected = (10_000 * ONE_USDC * 300 * 30 * 150) / (10_000 * 365 * 100);
     assert_eq!(actual, expected);
     assert!(actual > 0);
 }
@@ -1704,10 +1717,336 @@ fn test_precision_loss_bounds_in_deferred_division() {
         };
         let premium = RefractPool::_calc_premium(&config, &params);
         let naive = (params.coverage_amount * (config.base_premium_rate_bps as i128) / 10_000)
-            * (days as i128) / 365
-            * 150 / 100;
+            * (days as i128)
+            / 365
+            * 150
+            / 100;
         assert!(premium >= naive);
     }
 }
 
+// ─── Backstop drawdown on pool shortfall (issue #218) ─────────────────────────
+
+use refract_backstop::{RefractBackstop, RefractBackstopClient};
+
+/// A pool wired to a real `RefractBackstop`, configured at 300% utilization
+/// so it can sell more coverage than it holds and must lean on the backstop.
+struct BackstopFixture<'a> {
+    f: Fixture<'a>,
+    backstop: RefractBackstopClient<'a>,
+}
+
+fn setup_with_backstop<'a>() -> BackstopFixture<'a> {
+    let f = setup();
+    let id = f.env.register_contract(None, RefractBackstop);
+    let backstop = RefractBackstopClient::new(&f.env, &id);
+    backstop.initialize(&f.pool.address, &f.admin, &f.usdc.address, &500);
+    f.pool.set_backstop(&f.admin, &id);
+
+    let mut config = f.pool.pool_config().unwrap();
+    config.max_utilization_bps = 30_000;
+    f.pool.set_pool_config(&f.admin, &config);
+    BackstopFixture { f, backstop }
+}
+
+fn stake(bf: &BackstopFixture, amount: i128) -> Address {
+    let staker = funded(&bf.f, amount);
+    bf.backstop.deposit(&staker, &amount);
+    staker
+}
+
+/// Pool capital `capital`, one depeg policy for `coverage`, trigger fired.
+/// Returns the policy id and the holder.
+fn triggered_policy(f: &Fixture, capital: i128, coverage: i128) -> (u64, Address) {
+    let lp = funded(f, capital);
+    f.pool.provide_capital(&lp, &capital);
+    let params = PolicyParams {
+        coverage_amount: coverage,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let holder = funded(f, f.pool.quote_premium(&params));
+    let id = f.pool.buy_policy(&holder, &params);
+    oracle_submit(f, "USDC_PRICE", 9 * ONE_USDC / 10);
+    (id, holder)
+}
+
+/// Everything a failed settlement must leave untouched.
+#[derive(Debug, PartialEq)]
+struct Snapshot {
+    policy_status: PolicyStatus,
+    pool_accounting: PoolAccounting,
+    pool_balance: i128,
+    holder_balance: i128,
+    backstop_state: refract_interfaces::BackstopState,
+    backstop_balance: i128,
+}
+
+fn snapshot(bf: &BackstopFixture, id: u64, holder: &Address) -> Snapshot {
+    Snapshot {
+        policy_status: bf.f.pool.get_policy(&id).unwrap().status,
+        pool_accounting: bf.f.pool.accounting(),
+        pool_balance: bf.f.usdc.balance(&bf.f.pool.address),
+        holder_balance: bf.f.usdc.balance(holder),
+        backstop_state: bf.backstop.state(),
+        backstop_balance: bf.f.usdc.balance(&bf.backstop.address),
+    }
+}
+
+#[test]
+fn claim_within_pool_capital_does_not_touch_the_backstop() {
+    let bf = setup_with_backstop();
+    stake(&bf, 2_000 * ONE_USDC);
+    let (id, holder) = triggered_policy(&bf.f, 10_000 * ONE_USDC, 1_000 * ONE_USDC);
+
+    assert_eq!(bf.f.pool.process_claim(&id), 1_000 * ONE_USDC);
+    assert_eq!(bf.f.usdc.balance(&holder), 1_000 * ONE_USDC);
+    assert_eq!(bf.backstop.state().total_drawdowns, 0);
+    assert_eq!(bf.backstop.drawdown_of(&id), None);
+}
+
+#[test]
+fn shortfall_is_drawn_from_the_backstop_for_the_exact_amount() {
+    let bf = setup_with_backstop();
+    stake(&bf, 2_000 * ONE_USDC);
+    let coverage = 2_500 * ONE_USDC;
+    let (id, holder) = triggered_policy(&bf.f, 1_000 * ONE_USDC, coverage);
+
+    let pool_capital = bf.f.pool.accounting().total_capital;
+    let shortfall = coverage - pool_capital;
+    assert!(shortfall > 0);
+
+    assert_eq!(bf.f.pool.process_claim(&id), coverage);
+
+    // Holder paid in full; pool used all its own capital first.
+    assert_eq!(bf.f.usdc.balance(&holder), coverage);
+    assert_eq!(bf.f.pool.accounting().total_capital, 0);
+    assert_eq!(bf.f.usdc.balance(&bf.f.pool.address), 0);
+    assert_eq!(
+        bf.f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Claimed
+    );
+
+    // Backstop paid exactly the shortfall and recorded it against the claim.
+    let state = bf.backstop.state();
+    assert_eq!(state.total_drawdowns, shortfall);
+    assert_eq!(state.total_capital, 2_000 * ONE_USDC - shortfall);
+    assert_eq!(bf.backstop.drawdown_of(&id), Some(shortfall));
+    assert_eq!(
+        bf.f.usdc.balance(&bf.backstop.address),
+        2_000 * ONE_USDC - shortfall
+    );
+}
+
+#[test]
+fn shortfall_draw_emits_pool_side_event() {
+    let bf = setup_with_backstop();
+    stake(&bf, 2_000 * ONE_USDC);
+    let coverage = 2_500 * ONE_USDC;
+    let (id, _) = triggered_policy(&bf.f, 1_000 * ONE_USDC, coverage);
+    let shortfall = coverage - bf.f.pool.accounting().total_capital;
+
+    bf.f.pool.process_claim(&id);
+
+    let topic = Symbol::new(&bf.f.env, "BKSTOP_DR");
+    let found =
+        bf.f.env
+            .events()
+            .all()
+            .iter()
+            .any(|(contract, topics, data)| {
+                if contract != bf.f.pool.address {
+                    return false;
+                }
+                let t0: Result<Symbol, _> =
+                    soroban_sdk::TryFromVal::try_from_val(&bf.f.env, &topics.get(0).unwrap());
+                if t0 != Ok(topic.clone()) {
+                    return false;
+                }
+                let (claim, amount, _now): (u64, i128, u64) =
+                    soroban_sdk::TryFromVal::try_from_val(&bf.f.env, &data).unwrap();
+                claim == id && amount == shortfall
+            });
+    assert!(found, "BKSTOP_DR event with claim id and shortfall");
+}
+
+#[test]
+fn backstop_too_small_reverts_and_changes_nothing() {
+    let bf = setup_with_backstop();
+    stake(&bf, 100 * ONE_USDC);
+    let (id, holder) = triggered_policy(&bf.f, 1_000 * ONE_USDC, 2_500 * ONE_USDC);
+
+    let before = snapshot(&bf, id, &holder);
+    assert_eq!(
+        bf.f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::InsufficientFunds))
+    );
+    assert_eq!(snapshot(&bf, id, &holder), before);
+    assert_eq!(before.policy_status, PolicyStatus::Active);
+}
+
+#[test]
+fn empty_backstop_reverts_and_changes_nothing() {
+    let bf = setup_with_backstop();
+    let (id, holder) = triggered_policy(&bf.f, 1_000 * ONE_USDC, 2_500 * ONE_USDC);
+
+    let before = snapshot(&bf, id, &holder);
+    assert_eq!(
+        bf.f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::InsufficientFunds))
+    );
+    assert_eq!(snapshot(&bf, id, &holder), before);
+}
+
+#[test]
+fn paused_backstop_reverts_and_changes_nothing() {
+    let bf = setup_with_backstop();
+    stake(&bf, 2_000 * ONE_USDC);
+    let (id, holder) = triggered_policy(&bf.f, 1_000 * ONE_USDC, 2_500 * ONE_USDC);
+    bf.backstop.pause(&bf.f.admin);
+
+    let before = snapshot(&bf, id, &holder);
+    assert_eq!(
+        bf.f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::InsufficientFunds))
+    );
+    assert_eq!(snapshot(&bf, id, &holder), before);
+
+    // Once unpaused the same claim settles.
+    bf.backstop.unpause(&bf.f.admin);
+    assert_eq!(bf.f.pool.process_claim(&id), 2_500 * ONE_USDC);
+}
+
+#[test]
+fn backstop_wired_to_another_pool_refuses_the_draw() {
+    let bf = setup_with_backstop();
+    stake(&bf, 2_000 * ONE_USDC);
+    let (id, holder) = triggered_policy(&bf.f, 1_000 * ONE_USDC, 2_500 * ONE_USDC);
+    bf.backstop
+        .set_pool(&bf.f.admin, &Address::generate(&bf.f.env));
+
+    let before = snapshot(&bf, id, &holder);
+    assert_eq!(
+        bf.f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::InsufficientFunds))
+    );
+    assert_eq!(snapshot(&bf, id, &holder), before);
+}
+
+#[test]
+fn shortfall_without_a_backstop_reverts() {
+    let f = setup();
+    let mut config = f.pool.pool_config().unwrap();
+    config.max_utilization_bps = 30_000;
+    f.pool.set_pool_config(&f.admin, &config);
+    let (id, holder) = triggered_policy(&f, 1_000 * ONE_USDC, 2_500 * ONE_USDC);
+
+    let capital = f.pool.accounting().total_capital;
+    assert_eq!(
+        f.pool.try_process_claim(&id),
+        Err(Ok(PoolError::InsufficientFunds))
+    );
+    assert_eq!(f.pool.accounting().total_capital, capital);
+    assert_eq!(f.usdc.balance(&holder), 0);
+    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Active);
+}
+
+#[test]
+fn drawdown_is_shared_pro_rata_by_stakers() {
+    let bf = setup_with_backstop();
+    let small = stake(&bf, 500 * ONE_USDC);
+    let large = stake(&bf, 1_500 * ONE_USDC);
+    let coverage = 2_500 * ONE_USDC;
+    let (id, _) = triggered_policy(&bf.f, 1_000 * ONE_USDC, coverage);
+    let shortfall = coverage - bf.f.pool.accounting().total_capital;
+
+    bf.f.pool.process_claim(&id);
+
+    let small_loss = bf.backstop.drawdown_impact_of(&small);
+    let large_loss = bf.backstop.drawdown_impact_of(&large);
+    // 1:3 split. The loss index and each staker's share are both rounded
+    // down, so each figure may be one unit under the exact split, and the
+    // total never exceeds what was drawn.
+    assert!((shortfall / 4 - small_loss).abs() <= 1);
+    assert!((shortfall * 3 / 4 - large_loss).abs() <= 1);
+    assert!(small_loss + large_loss <= shortfall);
+
+    // Stake values are rounded down too (dust stays in the backstop).
+    let small_value = bf.backstop.get_stake(&small).active_value;
+    let large_value = bf.backstop.get_stake(&large).active_value;
+    assert!((500 * ONE_USDC - shortfall / 4 - small_value).abs() <= 1);
+    assert!(small_value + large_value <= 2_000 * ONE_USDC - shortfall);
+}
+
+#[test]
+fn backstop_mirror_client_matches_real_contract() {
+    // The pool only talks to the backstop through refract_interfaces'
+    // BackstopClient; make sure that client reads the real contract.
+    let bf = setup_with_backstop();
+    stake(&bf, 2_000 * ONE_USDC);
+    let typed = refract_interfaces::BackstopClient::new(&bf.f.env, &bf.backstop.address);
+    assert_eq!(typed.drawable_capital(), 2_000 * ONE_USDC);
+    assert_eq!(bf.f.pool.backstop(), Some(bf.backstop.address.clone()));
+}
+
+#[test]
+fn pool_and_backstop_report_the_same_failure_with_the_same_code() {
+    use refract_interfaces::RefractError;
+    let bf = setup_with_backstop();
+    stake(&bf, 100 * ONE_USDC);
+    let (id, _) = triggered_policy(&bf.f, 1_000 * ONE_USDC, 2_500 * ONE_USDC);
+
+    // Insufficient funds: the pool (legacy PoolError) and the backstop
+    // (shared RefractError) return the same discriminant.
+    let pool_err = match bf.f.pool.try_process_claim(&id) {
+        Err(Ok(e)) => e,
+        other => panic!("expected a pool error, got {other:?}"),
+    };
+    let backstop_err =
+        match bf
+            .backstop
+            .try_draw_down(&bf.f.pool.address, &id, &(10_000 * ONE_USDC))
+        {
+            Err(Ok(e)) => e,
+            other => panic!("expected a backstop error, got {other:?}"),
+        };
+    assert_eq!(pool_err, PoolError::InsufficientFunds);
+    assert_eq!(backstop_err, RefractError::InsufficientFunds);
+    assert_eq!(pool_err as u32, backstop_err.code());
+    assert_eq!(
+        RefractError::from_code(pool_err as u32),
+        Some(RefractError::InsufficientFunds)
+    );
+
+    // Unauthorized: same story.
+    let stranger = Address::generate(&bf.f.env);
+    assert_eq!(
+        bf.f.pool.try_set_backstop(&stranger, &stranger),
+        Err(Ok(PoolError::Unauthorized))
+    );
+    assert_eq!(
+        bf.backstop.try_set_pool(&stranger, &stranger),
+        Err(Ok(RefractError::Unauthorized))
+    );
+    assert_eq!(
+        PoolError::Unauthorized as u32,
+        RefractError::Unauthorized.code()
+    );
+}
+
+#[test]
+fn pool_mirror_client_matches_real_contract() {
+    // Other contracts reach the pool through refract_interfaces::PoolClient.
+    use refract_interfaces::{PoolClient, RefractError};
+    let bf = setup_with_backstop();
+    let typed = PoolClient::new(&bf.f.env, &bf.f.pool.address);
+    assert_eq!(typed.backstop(), Some(bf.backstop.address.clone()));
+    assert_eq!(typed.admin(), Some(bf.f.admin.clone()));
+    // PoolError::Unauthorized (3) decodes as the shared RefractError.
+    let stranger = Address::generate(&bf.f.env);
+    assert_eq!(
+        typed.try_set_backstop(&stranger, &stranger),
+        Err(Ok(RefractError::Unauthorized))
+    );
 }

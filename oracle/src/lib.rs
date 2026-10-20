@@ -56,7 +56,7 @@
 //! reputation scoring left as a follow-up once trustless aggregation lands.
 //!
 //! ### Weighting formula
-//! [`RefractOracle::get_weighted_reading`] computes the reputation-weighted
+//! `get_weighted_reading` (not yet restored in this file) computes the reputation-weighted
 //! mean across all registered relayers' most-recent submissions to a feed:
 //!
 //! ```text
@@ -73,7 +73,10 @@
 //! toward the floor (1) but never to zero.
 
 #![no_std]
-#![warn(missing_docs)]
+// `missing_docs` is not enabled: soroban-sdk's `#[contracttype]`,
+// `#[contracterror]` and `#[contractimpl]` emit undocumented helper items
+// (spec statics, generated client functions) that cannot carry docs, so the
+// lint can never pass CI's `-D warnings` build in a contract crate.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
@@ -250,10 +253,10 @@ pub enum OracleError {
     FutureTimestamp = 7,
     /// Submitted reading timestamp is older than the reading already stored for this feed.
     StaleSubmission = 8,
-    NoPendingAdmin = 9,  // Issue #88: no pending admin to accept
+    NoPendingAdmin = 9,          // Issue #88: no pending admin to accept
     SubmittedTooSoon = 10, // rate-limit: same (relayer, feed_id) within MIN_SUBMISSION_INTERVAL_SECS
-    InsufficientBond = 11,    // Issue #94: relayer bond too low
-    RelayerNotBonded = 12,   // Issue #94: relayer has no stake
+    InsufficientBond = 11, // Issue #94: relayer bond too low
+    RelayerNotBonded = 12, // Issue #94: relayer has no stake
     InvalidSlashAmount = 13, // Issue #94: slash exceeds bond
     RelayerNotPending = 14, // activate_relayer called for a relayer that was never queued
     NoticePeriodNotElapsed = 15, // activate_relayer called before min_addition_notice_period
@@ -308,21 +311,6 @@ pub struct RelayerBondRecord {
     pub unstake_available_at: u64,
 }
 
-/// Oracle reading stored on-chain.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct OracleReading {
-    /// Signed integer value in 1e7 precision.
-    /// For prices: USD price * 1e7.
-    /// For percentages: percent * 1e7 (e.g. -30% = -3_000_000).
-    /// For durations: minutes.
-    pub value: i128,
-    /// Unix timestamp when the reading was captured.
-    pub timestamp: u64,
-    /// Source or provider identifier for the reading.
-    pub source: Symbol,
-}
-
 /// Structured metadata describing a feed's shape.
 ///
 /// Settable by the admin via [`RefractOracle::set_feed_metadata`].
@@ -358,18 +346,7 @@ pub enum DataKey {
     /// List of authorized relayer addresses (instance storage).
     Relayers,
     /// Oracle reading mapped by feed symbol (persistent storage).
-    Reading(Symbol),
-    /// Issue #95: Fallback oracle address for failover on primary staleness
-    FallbackOracle,
-    /// Issue #91: Per-relayer readings
-#[contracttype]
-pub enum DataKey {
-    /// Contract administrator address key (instance storage).
-    Admin,
-    /// List of authorized relayer addresses (instance storage).
-    Relayers,
-    /// Oracle reading mapped by feed symbol (persistent storage).
-    Reading(Symbol),                   // feed_id → OracleReading
+    Reading(Symbol), // feed_id → OracleReading
     /// Issue #95: Fallback oracle address for failover on primary staleness
     FallbackOracle,
     /// Issue #91: Per-relayer readings for median aggregation
@@ -442,10 +419,8 @@ impl RefractOracle {
         env.storage()
             .instance()
             .set(&DataKey::PendingRelayer(relayer.clone()), &queued_at);
-        env.events().publish(
-            (Symbol::new(&env, "relayer_queued"),),
-            (relayer, queued_at),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "relayer_queued"),), (relayer, queued_at));
         Ok(())
     }
 
@@ -477,13 +452,11 @@ impl RefractOracle {
                 &REPUTATION_INITIAL,
             );
             env.events()
-                .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
+                .publish((Symbol::new(&env, "relayer_added"),), (relayer.clone(),));
         }
         env.storage()
             .instance()
-            .remove(&DataKey::PendingRelayer(relayer.clone()));
-        env.events()
-            .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
+            .remove(&DataKey::PendingRelayer(relayer));
         Ok(())
     }
 
@@ -543,7 +516,9 @@ impl RefractOracle {
     /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
     pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
         env.events()
             .publish((Symbol::new(&env, "admin_proposed"),), (new_admin,));
         Ok(())
@@ -580,17 +555,15 @@ impl RefractOracle {
 
     /// Issue #92: Get the configured threshold for a feed, or None if using default.
     pub fn get_threshold(env: Env, feed_id: Symbol) -> Option<i128> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Threshold(feed_id))
+        env.storage().instance().get(&DataKey::Threshold(feed_id))
     }
 
     /// #70: Admin-gated contract upgrade. Caller supplies the new WASM hash.
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
 
-        let old_wasm_hash = env.deployer().get_current_contract_wasm().unwrap_or_default();
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
 
         // Bump contract version for migration tracking
         let version: u32 = env
@@ -602,10 +575,8 @@ impl RefractOracle {
             .instance()
             .set(&DataKey::ContractVersion, &(version + 1));
 
-        env.events().publish(
-            (Symbol::new(&env, "upgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
         Ok(())
     }
 
@@ -624,10 +595,8 @@ impl RefractOracle {
         env.storage()
             .persistent()
             .set(&DataKey::FeedMetadata(feed_id.clone()), &metadata);
-        env.events().publish(
-            (Symbol::new(&env, "feed_metadata_set"), feed_id),
-            (),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "feed_metadata_set"), feed_id), ());
         Ok(())
     }
 
@@ -668,18 +637,16 @@ impl RefractOracle {
     /// off-chain monitoring job that detects outlier submissions and calls
     /// this function).  Fully-automated, trustless reputation updates are
     /// left as a follow-up once on-chain aggregation lands.
-    pub fn update_reputation(
-        env: Env,
-        relayer: Address,
-        delta: i128,
-    ) -> Result<(), OracleError> {
+    pub fn update_reputation(env: Env, relayer: Address, delta: i128) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
         let current: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::RelayerReputation(relayer.clone()))
             .unwrap_or(REPUTATION_INITIAL);
-        let updated = (current + delta).max(REPUTATION_FLOOR).min(REPUTATION_CEILING);
+        let updated = current
+            .saturating_add(delta)
+            .clamp(REPUTATION_FLOOR, REPUTATION_CEILING);
         env.storage()
             .persistent()
             .set(&DataKey::RelayerReputation(relayer.clone()), &updated);
@@ -688,7 +655,6 @@ impl RefractOracle {
             (delta, updated),
         );
         Ok(())
-    }
     }
 
     // ─── Data submission ─────────────────────────────────────────────────
@@ -747,11 +713,7 @@ impl RefractOracle {
         // The admin is intentionally subject to the same check — uniformity
         // means the guarantee is easier to audit and reason about.
         let rate_key = DataKey::LastSubmissionAt(relayer.clone(), feed_id.clone());
-        if let Some(last_at) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u64>(&rate_key)
-        {
+        if let Some(last_at) = env.storage().persistent().get::<DataKey, u64>(&rate_key) {
             let elapsed = ledger_time.saturating_sub(last_at);
             if elapsed < MIN_SUBMISSION_INTERVAL_SECS {
                 return Err(OracleError::SubmittedTooSoon);
@@ -863,7 +825,6 @@ impl RefractOracle {
         let recent_rejection_count: u32 = 0;
 
         FeedHealth {
-            feed_id,
             last_updated_at,
             active_relayer_count,
             recent_rejection_count,

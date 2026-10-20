@@ -1,6 +1,53 @@
+//! # RefractVeToken
+//!
+//! Vote-escrowed governance weight with protocol fee sharing.
+//!
+//! ## Voting power
+//!
+//! An account's governance weight ([`VotingPowerInterface::get_voting_power`])
+//! has two parts:
+//!
+//! * **Lock power** — `amount * remaining_lock_time / MAX_LOCK_TIME`, the
+//!   standard linear-decay veToken curve ([`RefractVeToken::voting_power`]).
+//! * **Backstop power** — weight for capital at risk in `RefractBackstop`:
+//!
+//!   ```text
+//!   backstop_power = min(active_value * weight_bps / 10_000, max_power)
+//!   ```
+//!
+//!   `active_value` is the current value of the account's *active* backstop
+//!   shares (after any drawdown losses). Shares in the unstake cooldown count
+//!   for **zero**: a staker who has asked to leave no longer bears the
+//!   protocol's long-term risk. `max_power = 0` means no cap. Rounded down.
+//!   Configured by the admin with [`RefractVeToken::set_backstop_weight`];
+//!   with no backstop configured, backstop power is zero. See SPEC.md
+//!   § "Backstop voting power".
+//!
+//! Backstop power is **pulled** at read time: every call reads
+//! `RefractBackstop::get_stake` through the typed
+//! [`refract_interfaces::BackstopClient`], so a `deposit`,
+//! `request_unstake`, `cancel_unstake` or `withdraw` is visible to the next
+//! `get_voting_power` call in the same transaction. The backstop never calls
+//! this contract, so there is no re-entrant path and nothing to keep in sync.
+//! Each read is one cross-contract call with no iteration over stakers.
+//!
+//! Fee sharing ([`RefractVeToken::distribute_fees`]) uses lock power only.
+//!
+//! ## Authorization
+//!
+//! | Entrypoint | Required principal |
+//! |------------|--------------------|
+//! | `set_backstop_weight`, `propose_admin` | admin (meant to be the timelock) |
+//! | `accept_admin` | pending admin |
+//! | `lock`, `extend_lock`, `withdraw`, `claim_fees` | the account |
+//! | `distribute_fees` | the treasury |
+
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use refract_interfaces::{access, apply_bps, Bps, RefractError, VotingPowerInterface, BPS_DENOM};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+};
 
 /// Maximum lock duration in seconds (4 years), used as the veToken decay denominator.
 const MAX_LOCK_TIME: u64 = 4 * 365 * 24 * 60 * 60;
@@ -30,6 +77,20 @@ pub struct FeeAccount {
     pub pending: i128,
 }
 
+/// How backstop stake turns into voting power. See the crate docs.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopWeight {
+    /// The `RefractBackstop` contract whose stakes count.
+    pub backstop: Address,
+    /// Voting power per unit of active backstop value, in basis points
+    /// (`10_000` = one vote per token, 1e7 fixed point like lock power).
+    pub weight_bps: Bps,
+    /// Upper bound on one account's backstop power. `0` means no cap.
+    pub max_power: i128,
+}
+
+/// Storage keys.
 #[contracttype]
 pub enum DataKey {
     Token,
@@ -37,7 +98,14 @@ pub enum DataKey {
     Lock(Address),
     FeeAccount(Address),
     FeeCheckpoint,
+    /// [`BackstopWeight`] (instance). Absent until configured.
+    BackstopWeight,
+    /// Lock power recorded at the account's last lock change (persistent).
+    RecordedPower(Address),
 }
+
+/// Highest weight the admin may set: 10 votes per backstop token.
+pub const MAX_BACKSTOP_WEIGHT_BPS: Bps = 10 * BPS_DENOM;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -58,11 +126,18 @@ pub struct RefractVeToken;
 
 #[contractimpl]
 impl RefractVeToken {
-    /// Initialize the contract with the locked token and the treasury that routes fees.
-    pub fn initialize(env: Env, token: Address, treasury: Address) -> Result<(), VeTokenError> {
+    /// Initialize the contract with its admin (meant to be the timelock), the
+    /// locked token and the treasury that routes fees.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        token: Address,
+        treasury: Address,
+    ) -> Result<(), VeTokenError> {
         if env.storage().instance().has(&DataKey::Token) {
             return Err(VeTokenError::AlreadyInitialized);
         }
+        access::init(&env, &admin).map_err(|_| VeTokenError::AlreadyInitialized)?;
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(
@@ -120,7 +195,7 @@ impl RefractVeToken {
             },
         );
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller);
         Ok(())
     }
 
@@ -159,7 +234,7 @@ impl RefractVeToken {
             .persistent()
             .set(&DataKey::Lock(caller.clone()), &lock);
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller);
         Ok(())
     }
 
@@ -180,7 +255,9 @@ impl RefractVeToken {
         Self::settle_fee_account(&env, &caller)?;
 
         let amount = lock.amount;
-        env.storage().persistent().remove(&DataKey::Lock(caller.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Lock(caller.clone()));
 
         let token = Self::token(&env)?;
         token::Client::new(&env, &token).transfer(
@@ -189,7 +266,7 @@ impl RefractVeToken {
             &amount,
         );
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller);
         Ok(amount)
     }
 
@@ -206,6 +283,66 @@ impl RefractVeToken {
         }
         let remaining = (lock.unlock_at - now) as i128;
         lock.amount * remaining / (MAX_LOCK_TIME as i128)
+    }
+
+    // --- backstop weight & admin ---
+
+    /// Count active `RefractBackstop` stake towards voting power. Admin only.
+    /// `weight_bps` is capped at [`MAX_BACKSTOP_WEIGHT_BPS`]; `max_power`
+    /// must not be negative (`0` = no cap).
+    pub fn set_backstop_weight(
+        env: Env,
+        caller: Address,
+        weight: BackstopWeight,
+    ) -> Result<(), RefractError> {
+        access::require_admin(&env, &caller)?;
+        if weight.weight_bps > MAX_BACKSTOP_WEIGHT_BPS || weight.max_power < 0 {
+            return Err(RefractError::InvalidArgument);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::BackstopWeight, &weight);
+        env.events().publish(
+            (
+                Symbol::new(&env, "ve_backstop_weight"),
+                weight.backstop.clone(),
+            ),
+            (weight.weight_bps, weight.max_power),
+        );
+        Ok(())
+    }
+
+    /// Stop counting backstop stake. Admin only.
+    pub fn clear_backstop_weight(env: Env, caller: Address) -> Result<(), RefractError> {
+        access::require_admin(&env, &caller)?;
+        env.storage().instance().remove(&DataKey::BackstopWeight);
+        env.events()
+            .publish((Symbol::new(&env, "ve_backstop_cleared"),), caller);
+        Ok(())
+    }
+
+    /// The backstop weighting in force, if any.
+    pub fn backstop_weight(env: Env) -> Option<BackstopWeight> {
+        env.storage().instance().get(&DataKey::BackstopWeight)
+    }
+
+    /// Current admin.
+    pub fn admin(env: Env) -> Result<Address, RefractError> {
+        access::admin(&env)
+    }
+
+    /// Step one of the admin handover. Admin only.
+    pub fn propose_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), RefractError> {
+        access::propose_admin(&env, &caller, &new_admin)
+    }
+
+    /// Step two of the admin handover. Pending admin only.
+    pub fn accept_admin(env: Env, caller: Address) -> Result<(), RefractError> {
+        access::accept_admin(&env, &caller)
     }
 
     /// Route protocol fees from the treasury into the fee-sharing pool for lockers.
@@ -254,7 +391,7 @@ impl RefractVeToken {
     pub fn claimable_fees(env: Env, address: Address) -> i128 {
         let checkpoint = Self::fee_checkpoint(&env);
         let account = Self::fee_account(&env, &address);
-        let power = Self::voting_power(env.clone(), address);
+        let power = Self::recorded_power(&env, &address);
         let delta = checkpoint.acc_fee_per_power - account.reward_per_power_paid;
         if delta <= 0 {
             return account.pending;
@@ -263,6 +400,34 @@ impl RefractVeToken {
     }
 
     // --- internal helpers ---
+
+    /// See the crate docs for the formula. Any failure to read the backstop
+    /// (not configured, not initialized, call reverted) counts as zero, so a
+    /// broken backstop can never block governance.
+    fn backstop_power_of(env: &Env, address: &Address) -> i128 {
+        let Some(weight) = env
+            .storage()
+            .instance()
+            .get::<DataKey, BackstopWeight>(&DataKey::BackstopWeight)
+        else {
+            return 0;
+        };
+        let stake = match refract_interfaces::BackstopClient::new(env, &weight.backstop)
+            .try_get_stake(address)
+        {
+            Ok(Ok(stake)) => stake,
+            _ => return 0,
+        };
+        if stake.active_value <= 0 {
+            return 0;
+        }
+        let power = apply_bps(stake.active_value, weight.weight_bps).unwrap_or(0);
+        if weight.max_power > 0 && power > weight.max_power {
+            weight.max_power
+        } else {
+            power
+        }
+    }
 
     fn token(env: &Env) -> Result<Address, VeTokenError> {
         env.storage()
@@ -313,7 +478,7 @@ impl RefractVeToken {
     fn settle_fee_account(env: &Env, address: &Address) -> Result<i128, VeTokenError> {
         let checkpoint = Self::fee_checkpoint(env);
         let mut account = Self::fee_account(env, address);
-        let power = Self::voting_power(env.clone(), address.clone());
+        let power = Self::recorded_power(env, address);
         let delta = checkpoint.acc_fee_per_power - account.reward_per_power_paid;
         if delta > 0 {
             account.pending += power * delta / 1_000_000_000;
@@ -325,18 +490,58 @@ impl RefractVeToken {
         Ok(account.pending)
     }
 
-    /// Recompute the aggregate voting power used as the fee-distribution denominator.
-    fn refresh_total_power(env: &Env) -> Result<(), VeTokenError> {
+    /// Lock power recorded for `address` at its last lock change. Fees are
+    /// split by recorded power, so the shares always add up to what was
+    /// distributed; decay between an account's own actions is not counted.
+    fn recorded_power(env: &Env, address: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecordedPower(address.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Re-record `address`'s lock power after its lock changed and update the
+    /// total used as the fee-distribution denominator. Call after
+    /// `settle_fee_account`, so fees up to now use the old power.
+    fn refresh_total_power(env: &Env, address: &Address) {
+        let old = Self::recorded_power(env, address);
+        let new = Self::voting_power(env.clone(), address.clone());
+        let key = DataKey::RecordedPower(address.clone());
+        if new == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &new);
+        }
         let mut checkpoint = Self::fee_checkpoint(env);
-        // Total power is tracked lazily; recompute from the caller's perspective is
-        // not possible without enumeration, so we approximate by summing known locks
-        // via the stored checkpoint plus the delta of the current caller.
-        // For correctness across multiple lockers we recompute using the caller's
-        // freshly-updated power, which is the only lock mutated in this call.
-        let _ = &mut checkpoint;
-        Ok(())
+        checkpoint.total_power = (checkpoint.total_power - old + new).max(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeCheckpoint, &checkpoint);
     }
 }
+
+#[contractimpl]
+impl VotingPowerInterface for RefractVeToken {
+    /// Lock power plus backstop power. This is the weight governance uses
+    /// for proposal thresholds and votes.
+    fn get_voting_power(env: Env, account: Address) -> i128 {
+        let locked = Self::voting_power(env.clone(), account.clone());
+        locked.saturating_add(Self::backstop_power_of(&env, &account))
+    }
+
+    /// Lock power only (same as `voting_power`).
+    fn locked_power(env: Env, account: Address) -> i128 {
+        Self::voting_power(env, account)
+    }
+
+    /// Backstop power only.
+    fn backstop_power(env: Env, account: Address) -> i128 {
+        Self::backstop_power_of(&env, &account)
+    }
+}
+
+#[cfg(test)]
+mod backstop_test;
 
 #[cfg(test)]
 mod test {
@@ -344,7 +549,13 @@ mod test {
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{token, Env};
 
-    fn setup() -> (Env, RefractVeTokenClient<'static>, Address, Address, Address) {
+    fn setup() -> (
+        Env,
+        RefractVeTokenClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RefractVeToken);
@@ -352,10 +563,12 @@ mod test {
 
         let admin = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let treasury = Address::generate(&env);
 
-        client.initialize(&token_id, &treasury);
+        client.initialize(&admin, &token_id, &treasury);
         (env, client, admin, token_id, treasury)
     }
 

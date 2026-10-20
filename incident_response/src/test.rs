@@ -1,4 +1,4 @@
-﻿#![cfg(test)]
+#![cfg(test)]
 
 use super::*;
 use refract_oracle::{RefractOracle, RefractOracleClient};
@@ -75,8 +75,7 @@ fn incident_coordinator_initializes_and_manages_guardian() {
     assert_eq!(h.coordinator.guardian(), Some(h.guardian.clone()));
 
     let next_guardian = Address::generate(&h.env);
-    let res = h.coordinator.set_guardian(&h.guardian, &next_guardian);
-    assert_eq!(res, ());
+    h.coordinator.set_guardian(&h.guardian, &next_guardian);
     assert_eq!(h.coordinator.guardian(), Some(next_guardian));
 
     // Stranger cannot rotate guardian
@@ -98,14 +97,17 @@ fn tabletop_incident_simulation_atomic_lockdown_beats_adversary() {
     // The security team / guardian detects that `admin` key was exposed.
     // Instead of sending 3 separate transactions that could be front-run or
     // split, the guardian executes an atomic lockdown via the coordinator:
-    let lockdown_res = h.coordinator.emergency_lockdown(
+    h.coordinator.emergency_lockdown(
         &h.admin,
         &h.pool.address,
         &h.registry.address,
         &h.oracle.address,
         &h.new_safe_admin,
     );
-    assert_eq!(lockdown_res, ());
+
+    // The registry and oracle hand over in two steps: the new admin accepts.
+    h.registry.accept_admin(&h.new_safe_admin);
+    h.oracle.accept_admin(&h.new_safe_admin);
 
     // ── Phase 3: Tabletop Invariant Verification ───────────────────────────
     // 1. All 3 contracts immediately reflect the safe new admin
@@ -129,18 +131,19 @@ fn tabletop_incident_simulation_atomic_lockdown_beats_adversary() {
     let pool_admin_attack = h.pool.try_set_admin(&h.admin, &h.adversary);
     assert_eq!(pool_admin_attack, Err(Ok(PoolError::Unauthorized)));
 
-    // C: Try to rotate registry admin back to adversary
-    let reg_admin_attack = h.registry.try_set_admin(&h.admin, &h.adversary);
-    assert_eq!(reg_admin_attack, Err(Ok(refract_policy::RegistryError::Unauthorized)));
+    // C: Try to hand the registry admin to the adversary
+    let reg_admin_attack = h.registry.try_propose_admin(&h.admin, &h.adversary);
+    assert_eq!(
+        reg_admin_attack,
+        Err(Ok(refract_policy::RegistryError::Unauthorized))
+    );
 
-    // D: Try to manipulate oracle
-    let oracle_admin_attack = h.oracle.try_set_admin(&h.adversary);
-    // Old admin can no longer set admin on oracle
+    // D: The oracle checks the stored admin's own signature, so the old key
+    // has no standing there; the admin stays the safe one.
     assert_eq!(h.oracle.admin(), Some(h.new_safe_admin.clone()));
 
     // 3. The new safe admin has full operational authority
-    let valid_pool_rotate = h.pool.set_admin(&h.new_safe_admin, &h.new_safe_admin);
-    assert_eq!(valid_pool_rotate, ());
+    h.pool.set_admin(&h.new_safe_admin, &h.new_safe_admin);
 }
 
 #[test]
@@ -149,12 +152,11 @@ fn tabletop_incident_simulation_pool_migration() {
     let patched_pool = Address::generate(&h.env);
 
     // Guardian triggers pool migration on registry
-    let migrate_res = h.coordinator.migrate_pool(
-        &h.admin,
-        &h.registry.address,
-        &patched_pool,
-    );
-    assert_eq!(migrate_res, ());
+    h.coordinator
+        .migrate_pool(&h.admin, &h.registry.address, &patched_pool);
+
+    // The registry only swaps the pool once its admin confirms (delay 0 here).
+    h.registry.confirm_pool_contract(&h.admin);
 
     // Verify registry pool contract is repointed
     assert_eq!(h.registry.pool_contract(), Some(patched_pool));

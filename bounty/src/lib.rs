@@ -1,157 +1,148 @@
+//! # RefractBounty
+//!
+//! On-chain bug-bounty escrow. Anyone (including the treasury) can top up
+//! the reward pool; payouts need the [`Role::Approver`] role. Only a
+//! commitment to each report (its hash) is stored on-chain, so vulnerability
+//! details stay off-chain per SECURITY.md, and each report can be paid once.
+//!
+//! ## Authorization
+//!
+//! Roles, two-step admin handover and pausing come from the shared
+//! [`refract_interfaces::access`] module (see `impl_access_control!`). The
+//! admin is meant to be the `RefractTimelock` contract, so a single deployer
+//! key never keeps payout authority.
+//!
+//! | Entrypoint | Required role / principal | Refused while paused |
+//! |------------|---------------------------|----------------------|
+//! | `initialize` | — (one-time) | — |
+//! | `fund` | the funder | no |
+//! | `award` | `Approver` | yes |
+//! | `grant_role` / `revoke_role` | `Admin` | yes, except the `Pauser` role |
+//! | `propose_admin` / `accept_admin` | `Admin` / pending admin | no |
+//! | `pause` / `unpause` | `Pauser` | — |
+//! | `upgrade` | `Upgrader` | no |
+
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
+use refract_interfaces::{access, Amount, AwardRecord, BountyInterface, RefractError, Role};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Symbol};
 
-/// Storage keys for the bounty escrow.
+/// Storage keys. The access-control module owns its own keys.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// The governance/timelock address authorized to award payouts.
-    Governance,
-    /// The token used to fund and pay out bounties.
+    /// The token used to fund and pay out bounties (instance).
     Token,
-    /// Running total of funds currently held in escrow.
+    /// Funds currently held in escrow (instance).
     Balance,
-    /// Immutable, timestamped record of a rewarded disclosure.
+    /// Immutable record of a rewarded disclosure (persistent).
     Award(BytesN<32>),
 }
 
-/// Immutable, timestamped record that a specific disclosure was rewarded.
-/// Only the commitment (hash) is stored on-chain; vulnerability details stay
-/// off-chain per SECURITY.md.
-#[contracttype]
-#[derive(Clone)]
-pub struct AwardRecord {
-    pub researcher: Address,
-    pub amount: i128,
-    pub report_hash: BytesN<32>,
-    pub timestamp: u64,
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum BountyError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    InvalidAmount = 3,
-    InsufficientBalance = 4,
-    Unauthorized = 5,
-    DuplicateReport = 6,
-}
-
-/// Governance-controlled bug bounty escrow.
-///
-/// The reward pool can be topped up by anyone (including the treasury), but
-/// payouts can only be authorized by the governance/timelock address. There is
-/// deliberately no single admin key with payout authority: a compromised admin
-/// key authorizing arbitrary "bounty" payouts is a direct fund-drain vector.
+/// Bug-bounty escrow controlled through the shared access-control module.
 #[contract]
-pub struct RefractBountyEscrow;
+pub struct RefractBounty;
+
+refract_interfaces::impl_access_control!(RefractBounty);
 
 #[contractimpl]
-impl RefractBountyEscrow {
-    /// One-time initialization wiring the governance/timelock address and the
-    /// token used for funding and payouts.
-    pub fn initialize(env: Env, governance: Address, token: Address) -> Result<(), BountyError> {
-        if env.storage().instance().has(&DataKey::Governance) {
-            return Err(BountyError::AlreadyInitialized);
-        }
-        env.storage().instance().set(&DataKey::Governance, &governance);
+impl BountyInterface for RefractBounty {
+    fn initialize(env: Env, admin: Address, token: Address) -> Result<(), RefractError> {
+        access::init(&env, &admin)?;
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Balance, &0i128);
+        env.events()
+            .publish((Symbol::new(&env, "bounty_init"), admin), token);
         Ok(())
     }
 
-    /// Top up the reward pool. Callable by anyone, including the treasury.
-    pub fn fund(env: Env, from: Address, amount: i128) -> Result<(), BountyError> {
+    fn fund(env: Env, from: Address, amount: Amount) -> Result<(), RefractError> {
         from.require_auth();
         if amount <= 0 {
-            return Err(BountyError::InvalidAmount);
+            return Err(RefractError::InvalidAmount);
         }
-        let token = Self::token(&env)?;
+        let token = token_of(&env)?;
+        let balance = balance_of(&env)?;
+        let new_balance = balance.checked_add(amount).ok_or(RefractError::Overflow)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
-        let balance = Self::balance(&env)?;
-        env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &new_balance);
+        env.events()
+            .publish((Symbol::new(&env, "bounty_funded"), from), amount);
         Ok(())
     }
 
-    /// Award a bounty to a security researcher. Gated strictly by the
-    /// governance/timelock address; a plain admin key has no authority here.
-    /// The `report_hash` commitment is stored on-chain as an immutable,
-    /// timestamped record of the rewarded disclosure.
-    pub fn award(
+    fn award(
         env: Env,
         caller: Address,
         researcher: Address,
-        amount: i128,
+        amount: Amount,
         report_hash: BytesN<32>,
-    ) -> Result<(), BountyError> {
-        caller.require_auth();
-        let governance = Self::governance(&env)?;
-        if caller != governance {
-            return Err(BountyError::Unauthorized);
-        }
+    ) -> Result<(), RefractError> {
+        access::require_role(&env, Role::Approver, &caller)?;
+        access::require_not_paused(&env)?;
         if amount <= 0 {
-            return Err(BountyError::InvalidAmount);
+            return Err(RefractError::InvalidAmount);
         }
-        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
-            return Err(BountyError::DuplicateReport);
+        let key = DataKey::Award(report_hash.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(RefractError::AlreadyExists);
         }
-        let balance = Self::balance(&env)?;
+        let balance = balance_of(&env)?;
         if amount > balance {
-            return Err(BountyError::InsufficientBalance);
+            return Err(RefractError::InsufficientFunds);
         }
 
-        let token = Self::token(&env)?;
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
-        env.storage().instance().set(&DataKey::Balance, &(balance - amount));
-
+        let token = token_of(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &(balance - amount));
         let record = AwardRecord {
-            researcher,
+            researcher: researcher.clone(),
             amount,
             report_hash: report_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&DataKey::Award(report_hash), &record);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(
+            &key,
+            access::ROLE_TTL_THRESHOLD,
+            access::ROLE_TTL_EXTEND_TO,
+        );
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &researcher,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "bounty_awarded"), researcher),
+            (caller, amount, report_hash),
+        );
         Ok(())
     }
 
-    /// Current funds held in escrow.
-    pub fn balance(env: Env) -> Result<i128, BountyError> {
-        Self::balance(&env)
+    fn balance(env: Env) -> Result<Amount, RefractError> {
+        balance_of(&env)
     }
 
-    /// The governance/timelock address authorized to award payouts.
-    pub fn governance(env: Env) -> Result<Address, BountyError> {
-        Self::governance(&env)
-    }
-
-    /// Immutable record of a rewarded disclosure, if any.
-    pub fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
+    fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
         env.storage().persistent().get(&DataKey::Award(report_hash))
     }
+}
 
-    fn governance(env: &Env) -> Result<Address, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Governance)
-            .ok_or(BountyError::NotInitialized)
-    }
+fn token_of(env: &Env) -> Result<Address, RefractError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Token)
+        .ok_or(RefractError::NotInitialized)
+}
 
-    fn token(env: &Env) -> Result<Address, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Token)
-            .ok_or(BountyError::NotInitialized)
-    }
-
-    fn balance(env: &Env) -> Result<i128, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .ok_or(BountyError::NotInitialized)
-    }
+fn balance_of(env: &Env) -> Result<Amount, RefractError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Balance)
+        .ok_or(RefractError::NotInitialized)
 }
 
 #[cfg(test)]

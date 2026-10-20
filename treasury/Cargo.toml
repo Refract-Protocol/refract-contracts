@@ -2,12 +2,15 @@
 name = "refract-treasury"
 version = "0.1.0"
 edition = "2021"
+description = "Refract treasury: token custody with role-gated withdrawals"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "20.0.0"
+soroban-sdk = { workspace = true }
+refract-interfaces = { path = "../interfaces" }
 
 [dev-dependencies]
-soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }

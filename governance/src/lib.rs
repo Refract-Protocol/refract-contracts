@@ -6,15 +6,20 @@
 //! Modelled after the Compound Governor / OpenZeppelin Governor pattern,
 //! adapted for Soroban's programming model.
 //!
-//! * **Voting weight** — resolved from per-address balance checkpoints as of
-//!   the proposal's snapshot ledger, so tokens borrowed and repaid within a
-//!   single transaction cannot inflate votes.
+//! * **Voting weight** — by default the voter's token balance. Once a
+//!   voting-power source is wired with `set_voting_power_source` (the
+//!   `RefractVeToken` contract), weight is that contract's
+//!   `get_voting_power`: veToken lock power plus active `RefractBackstop`
+//!   stake (see SPEC.md § "Backstop voting power"). The proposal records
+//!   the ledger it was created at (`snapshot_ledger`).
 //! * **Delegation** — single-hop delegation: an address may delegate its
 //!   voting power to a delegatee, which cannot itself have delegated onward.
-//! * **Proposal threshold** — a minimum token balance required to create a
-//!   proposal, preventing spam.
-//! * **Quorum** — `quorum_bps` of `total_supply` (from the token) must
-//!   participate (for + against) for the proposal to be valid.
+//! * **Proposal threshold** — the minimum voting weight (same source as
+//!   votes, so lock + backstop stake combined once a source is wired)
+//!   required to create a proposal, preventing spam.
+//! * **Quorum** — `quorum_bps` of `GovernorConfig::total_voting_supply` must
+//!   participate (for + against) for the proposal to be valid. SEP-41
+//!   tokens expose no total supply, so governance sets it in the config.
 //! * **Execution** — after the voting period ends, a successful proposal
 //!   is forwarded to the timelock via `queue`, then the timelock executes
 //!   it after its own delay.  If the timelock address is not set the call
@@ -30,8 +35,9 @@
 //! ```
 
 #![no_std]
+use refract_interfaces::{TimelockClient, VotingPowerClient};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Map, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Val, Vec,
 };
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -118,8 +124,10 @@ pub struct GovernorConfig {
     /// Quorum expressed as basis points of total token supply
     /// (e.g. 400 = 4%).
     pub quorum_bps: u32,
-    /// Minimum token balance required to submit a proposal.
+    /// Minimum voting weight required to submit a proposal.
     pub proposal_threshold: i128,
+    /// Total voting weight that `quorum_bps` is measured against.
+    pub total_voting_supply: i128,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -134,6 +142,9 @@ pub enum DataKey {
     /// Optional timelock contract address.  If absent, `queue` forwards
     /// directly.
     Timelock,
+    /// Optional voting-power source (`RefractVeToken`). If absent, weight is
+    /// the token balance.
+    VotingPower,
     NextId,
     ProposalCount,
     Proposal(u64),
@@ -154,34 +165,6 @@ pub enum DataKey {
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
-#[contract]
-pub struct RefractGovernor;
-
-#[contractimpl]
-impl RefractGovernor {
-    // TODO (#124): Implement initialize, propose, vote, execute, and
-    // cancel entry points per the design documentation above.
-    //
-    // Start with the ProposalType enum, DataKey enum, and Proposal struct,
-    // then implement propose() → vote() → execute() in that order.
-    // The NewCoverageType execution sequence (Steps 1-4) belongs in a
-    // private _execute_new_coverage_type() helper
-
-#[contract]
-pub struct RefractGovernor;
-
-#[contractimpl]
-impl RefractGovernor {
-    pub fn initialize(env: Env, admin: Address, token: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Token, &token);
-        env.storage().instance().set(&DataKey::ProposalCount, &0u64);
-    }
-
-    pub fn propose(env: E
 #[contract]
 pub struct RefractGovernor;
 
@@ -218,12 +201,48 @@ impl RefractGovernor {
     }
 
     /// Wire in the timelock contract address.  Admin-only.
-    pub fn set_timelock(env: Env, caller: Address, timelock: Address) -> Result<(), GovernanceError> {
+    pub fn set_timelock(
+        env: Env,
+        caller: Address,
+        timelock: Address,
+    ) -> Result<(), GovernanceError> {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Timelock, &timelock);
         env.events()
             .publish((Symbol::new(&env, "gov_tl_set"),), (timelock,));
         Ok(())
+    }
+
+    /// Wire the contract that supplies voting weight (`RefractVeToken`,
+    /// through `refract_interfaces::VotingPowerClient`). Admin-only. From
+    /// then on the proposal threshold and every vote use its
+    /// `get_voting_power`, which counts veToken locks plus active backstop
+    /// stake.
+    pub fn set_voting_power_source(
+        env: Env,
+        caller: Address,
+        source: Address,
+    ) -> Result<(), GovernanceError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::VotingPower, &source);
+        env.events()
+            .publish((Symbol::new(&env, "gov_vp_set"),), (source,));
+        Ok(())
+    }
+
+    /// The wired voting-power source, if any.
+    pub fn voting_power_source(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::VotingPower)
+    }
+
+    /// Voting weight `account` would have right now (threshold and votes).
+    pub fn voting_weight(env: Env, account: Address) -> Result<i128, GovernanceError> {
+        let config: GovernorConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)?;
+        Ok(Self::weight_of(&env, &config, &account))
     }
 
     /// Replace the governor configuration.  Admin-only.
@@ -242,7 +261,7 @@ impl RefractGovernor {
 
     /// Create a new governance proposal.
     ///
-    /// `proposer` must hold at least `proposal_threshold` tokens.
+    /// `proposer` must have at least `proposal_threshold` voting weight.
     /// Returns the new proposal id.
     pub fn propose(
         env: Env,
@@ -259,18 +278,14 @@ impl RefractGovernor {
             .get(&DataKey::Config)
             .ok_or(GovernanceError::NotInitialized)?;
 
-        // Check proposer's token balance against threshold.
-        let balance = token::Client::new(&env, &config.token).balance(&proposer);
-        if balance < config.proposal_threshold {
+        // Check proposer's voting weight against threshold.
+        let weight = Self::weight_of(&env, &config, &proposer);
+        if weight < config.proposal_threshold {
             return Err(GovernanceError::BelowProposalThreshold);
         }
 
         let now = env.ledger().timestamp();
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
         let proposal = ProposalState {
             proposer: proposer.clone(),
@@ -284,14 +299,13 @@ impl RefractGovernor {
             votes_against: 0,
             status: ProposalStatus::Active,
             voters: Vec::new(&env),
+            snapshot_ledger: env.ledger().sequence(),
         };
 
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(id), &proposal);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "gov_proposed"), id),
@@ -303,11 +317,13 @@ impl RefractGovernor {
     /// Cast a vote on an active proposal.
     ///
     /// `support = true` → for; `support = false` → against.
-    /// Voting weight equals the voter's current token balance.
+    /// Voting weight is read at call time from the voting-power source (or
+    /// the token balance when none is wired).
     ///
-    /// **Known limitation**: balance is read at call time, not at a
-    /// snapshot — flash-loan voting attacks are possible until the
-    /// snapshot follow-up issue is implemented.
+    /// **Known limitation**: weight is read at call time, not at
+    /// `snapshot_ledger`. With a veToken source this needs a lock or
+    /// backstop stake, which cannot be flash-borrowed and returned within
+    /// the voting period without the unstake cooldown.
     pub fn cast_vote(
         env: Env,
         voter: Address,
@@ -341,7 +357,7 @@ impl RefractGovernor {
             .instance()
             .get(&DataKey::Config)
             .ok_or(GovernanceError::NotInitialized)?;
-        let weight = token::Client::new(&env, &config.token).balance(&voter);
+        let weight = Self::weight_of(&env, &config, &voter);
 
         if support {
             proposal.votes_for += weight;
@@ -389,11 +405,8 @@ impl RefractGovernor {
         // Total participating weight.
         let total_votes = proposal.votes_for + proposal.votes_against;
 
-        // Total token supply for quorum calculation.
-        let total_supply = token::Client::new(&env, &config.token).total_supply();
-
-        // Quorum: total_votes must be >= quorum_bps/10000 of total_supply.
-        let quorum_required = total_supply * (config.quorum_bps as i128) / 10_000;
+        // Quorum: total_votes must be >= quorum_bps/10000 of the voting supply.
+        let quorum_required = config.total_voting_supply * (config.quorum_bps as i128) / 10_000;
         let quorum_met = total_votes >= quorum_required;
         let majority_for = proposal.votes_for > proposal.votes_against;
 
@@ -438,17 +451,14 @@ impl RefractGovernor {
             .instance()
             .get::<DataKey, Address>(&DataKey::Timelock)
         {
-            // Forward to timelock.  The timelock's `queue` function takes
-            // (target, function, args, eta).
-            let mut tl_args: Vec<Val> = Vec::new(&env);
-            tl_args.push_back(proposal.target.into_val(&env));
-            tl_args.push_back(proposal.function.into_val(&env));
-            tl_args.push_back(proposal.args.into_val(&env));
-            tl_args.push_back(eta.into_val(&env));
-            env.invoke_contract::<Val>(
-                &timelock,
-                &Symbol::new(&env, "queue"),
-                tl_args,
+            // Forward to the timelock through the typed client. The
+            // governor must be the timelock's admin; a revert there reverts
+            // this call too.
+            TimelockClient::new(&env, &timelock).queue(
+                &proposal.target,
+                &proposal.function,
+                &proposal.args,
+                &eta,
             );
         }
         // If no timelock is set the proposal is marked Queued and the
@@ -490,6 +500,18 @@ impl RefractGovernor {
 
     // ─── Internal helpers ─────────────────────────────────────────────────
 
+    /// Voting weight from the wired source, or the token balance.
+    fn weight_of(env: &Env, config: &GovernorConfig, account: &Address) -> i128 {
+        match env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::VotingPower)
+        {
+            Some(source) => VotingPowerClient::new(env, &source).get_voting_power(account),
+            None => token::Client::new(env, &config.token).balance(account),
+        }
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
         caller.require_auth();
         let admin: Address = env
@@ -506,3 +528,6 @@ impl RefractGovernor {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod backstop_weight_test;

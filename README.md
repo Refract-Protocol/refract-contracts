@@ -17,6 +17,12 @@ This repository holds the three on-chain contracts that make up Refract's settle
 | `pool/` | `RefractPool` | Holds USDC risk capital, prices & sells policies, settles claims against oracle data |
 | `policy/` | `RefractPolicyRegistry` | Queryable on-chain index of policies per holder (sidecar to the pool) |
 | `oracle/` | `RefractOracle` | Permissioned price/event feed with staleness enforcement and trigger evaluation |
+| `backstop/` | `RefractBackstop` | Second-loss staked capital; pays the pool's exact shortfall on a claim, losses shared pro rata |
+| `bounty/` | `RefractBounty` | Bug-bounty escrow; approver-gated payouts recorded by report hash |
+| `grants/` | `RefractGrants` | Milestone-based grants; funds released per confirmed milestone |
+| `treasury/` | `RefractTreasury` | Token custody with approver-gated withdrawals |
+| `vetoken/` | `RefractVeToken` | Vote-escrowed weight plus backstop-stake weight (SPEC.md §8) and fee sharing |
+| `interfaces/` | — (library) | Typed cross-contract clients, shared types, `RefractError`, and shared role-based access control |
 
 All amounts use **1e7 fixed-point** (the Stellar USDC convention). The contracts are `#![no_std]` and never touch floating point.
 
@@ -119,6 +125,7 @@ Then `initialize` each contract (admin, USDC token address, and pool↔registry 
 - **RefractPool guardian (fast-path pause)** — the pool stores a `Guardian` address, distinct from the admin/timelock. The guardian's *only* power is to trigger the emergency pause instantly: `set_paused(true)` accepts either the admin/timelock **or** the guardian, with no timelock delay. Unpausing (`set_paused(false)`) is **admin/timelock-only** — a guardian can freeze the protocol fast but cannot unilaterally resume it, so a compromised guardian key is never worse than having none. The guardian role itself is settable/removable **only** through the full governance/timelock (admin) path; a guardian can never grant itself the role or extend its own term. Guardian powers do not extend to any other admin action (e.g. the oracle circuit-breaker clear stays admin/timelock-gated).
 - **RefractOracle** — only registered relayers (or the admin) may `submit`; readings older than 30 minutes are rejected. Consecutive submissions from the same (relayer, feed) pair within 60 seconds are rejected with `SubmittedTooSoon`. `set_feed_metadata` and `update_reputation` are admin-only.
 - **RefractPolicyRegistry** — only the registered pool contract or the admin may `register_policy` / `deactivate_policy`.
+- **RefractBackstop, RefractBounty, RefractGrants, RefractTreasury** — share one access model from `refract-interfaces` (`access` module + `impl_access_control!`): a single admin (meant to be the timelock) handed over with `propose_admin` / `accept_admin`, plus `Operator`, `Approver`, `Pauser` and `Upgrader` roles granted with `grant_role` / `revoke_role`. Each contract's crate docs list the role every entrypoint requires. Failures return the shared `RefractError` codes. Only the pool may call `RefractBackstop::draw_down`.
 
 ## Oracle API
 

@@ -1,5 +1,8 @@
 #![cfg(test)]
 
+extern crate std;
+use std::{eprintln, format};
+
 use super::*;
 use refract_oracle::RefractOracleClient;
 use refract_policy::RefractPolicyRegistryClient;
@@ -33,6 +36,7 @@ fn find_wasm(name: &str) -> Option<std::vec::Vec<u8>> {
     None
 }
 
+#[allow(dead_code)] // registry and usdc are kept for future assertions
 struct WasmFixture<'a> {
     env: Env,
     pool: RefractPoolClient<'a>,
@@ -73,8 +77,12 @@ fn setup_wasm<'a>(env: &'a Env) -> Option<WasmFixture<'a>> {
     pool.initialize(&admin, &sac.address(), &registry_id);
     pool.set_oracle(&admin, &oracle_id);
 
+    oracle.initialize(&admin);
     let relayer = Address::generate(env);
-    oracle.add_relayer(&admin, &relayer);
+    oracle.add_relayer(&relayer);
+    // Relayers go through a 48h notice period before they can submit.
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
+    oracle.activate_relayer(&relayer);
 
     Some(WasmFixture {
         env: env.clone(),
@@ -159,9 +167,7 @@ fn test_wasm_release_profile_behavioral_differences() {
     let f = match setup_wasm(&env) {
         Some(f) => f,
         None => {
-            eprintln!(
-                "Notice: Release wasm artifacts not found locally. Skipping wasm execution."
-            );
+            eprintln!("Notice: Release wasm artifacts not found locally. Skipping wasm execution.");
             return;
         }
     };

@@ -117,23 +117,25 @@ impl RefractIncidentResponse {
         }
 
         // 1. Rotate Pool admin
-        let _ = env.invoke_contract::<()>(
+        env.invoke_contract::<()>(
             &pool,
             &Symbol::new(&env, "set_admin"),
             Vec::from_array(&env, [caller.into_val(&env), new_admin.into_val(&env)]),
         );
 
-        // 2. Rotate Registry admin
-        let _ = env.invoke_contract::<()>(
+        // 2. Registry and oracle use a two-step handover: propose here, and
+        //    `new_admin` must call `accept_admin` on each to finish. Until
+        //    then the old key can still act there, so accept promptly.
+        env.invoke_contract::<()>(
             &registry,
-            &Symbol::new(&env, "set_admin"),
+            &Symbol::new(&env, "propose_admin"),
             Vec::from_array(&env, [caller.into_val(&env), new_admin.into_val(&env)]),
         );
 
-        // 3. Rotate Oracle admin
-        let _ = env.invoke_contract::<()>(
+        // 3. Oracle (its admin check reads the stored admin, so no caller arg).
+        env.invoke_contract::<()>(
             &oracle,
-            &Symbol::new(&env, "set_admin"),
+            &Symbol::new(&env, "propose_admin"),
             Vec::from_array(&env, [new_admin.into_val(&env)]),
         );
 
@@ -168,10 +170,12 @@ impl RefractIncidentResponse {
             return Err(IncidentError::Unauthorized);
         }
 
-        // Repoint registry
-        let _ = env.invoke_contract::<()>(
+        // Propose the new pool on the registry. The registry swaps it in only
+        // when its admin calls `confirm_pool_contract` after the registry's
+        // configured delay.
+        env.invoke_contract::<()>(
             &registry,
-            &Symbol::new(&env, "set_pool_contract"),
+            &Symbol::new(&env, "propose_pool_contract"),
             Vec::from_array(&env, [caller.into_val(&env), new_pool.into_val(&env)]),
         );
 

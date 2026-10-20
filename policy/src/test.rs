@@ -2,8 +2,8 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
-    Address, Env,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Env, Symbol, TryFromVal,
 };
 
 const TEN_USDC: i128 = 100_000_000;
@@ -236,12 +236,29 @@ fn deactivate_rejects_unknown_id() {
     assert_eq!(res, Err(Ok(RegistryError::PolicyNotFound)));
 }
 
+/// Repoint the registry's pool: propose, then confirm (the delay is 0).
+fn repoint_pool(f: &Fixture, caller: &Address, new_pool: &Address) {
+    f.registry.propose_pool_contract(caller, new_pool);
+    f.registry.confirm_pool_contract(caller);
+}
+
+/// Rotate the registry admin: propose, then the new admin accepts.
+fn rotate_admin(f: &Fixture, caller: &Address, new_admin: &Address) {
+    f.registry.propose_admin(caller, new_admin);
+    f.registry.accept_admin(new_admin);
+}
+
+fn last_topic0(f: &Fixture) -> Symbol {
+    let (_, topics, _) = f.env.events().all().last().unwrap();
+    Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap()
+}
+
 #[test]
-fn set_pool_contract_repoints_who_may_register_and_deactivate() {
+fn pool_repoint_changes_who_may_register_and_deactivate() {
     let f = setup();
     let new_pool = Address::generate(&f.env);
 
-    f.registry.set_pool_contract(&f.admin, &new_pool);
+    repoint_pool(&f, &f.admin, &new_pool);
 
     // The old pool address has lost access...
     let holder = Address::generate(&f.env);
@@ -260,63 +277,93 @@ fn set_pool_contract_repoints_who_may_register_and_deactivate() {
 }
 
 #[test]
-fn set_pool_contract_rejects_non_admin() {
+fn pool_repoint_rejects_non_admin() {
     let f = setup();
     let new_pool = Address::generate(&f.env);
     // mock_all_auths satisfies require_auth, but the principal check still
     // rejects — and unlike register_policy/deactivate_policy, the current
     // pool address itself isn't privileged here either.
-    let res = f.registry.try_set_pool_contract(&f.pool, &new_pool);
+    let res = f.registry.try_propose_pool_contract(&f.pool, &new_pool);
     assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
 }
 
 #[test]
-fn set_pool_contract_emits_an_event() {
+fn pool_repoint_waits_for_the_delay() {
     let f = setup();
     let new_pool = Address::generate(&f.env);
-
-    let before = f.env.events().all().len();
-    f.registry.set_pool_contract(&f.admin, &new_pool);
-    let after = f.env.events().all().len();
-
-    assert_eq!(after, before + 1);
+    f.registry.set_pool_contract_change_delay(&f.admin, &3_600);
+    f.registry.propose_pool_contract(&f.admin, &new_pool);
+    assert_eq!(
+        f.registry.try_confirm_pool_contract(&f.admin),
+        Err(Ok(RegistryError::PoolContractChangeNotReady))
+    );
+    f.env.ledger().with_mut(|l| l.timestamp += 3_600);
+    f.registry.confirm_pool_contract(&f.admin);
+    assert_eq!(f.registry.pool_contract(), Some(new_pool));
 }
 
 #[test]
-fn set_admin_rotates_who_can_call_admin_gated_functions() {
+fn pool_repoint_emits_proposed_and_confirmed_events() {
+    let f = setup();
+    let new_pool = Address::generate(&f.env);
+
+    f.registry.propose_pool_contract(&f.admin, &new_pool);
+    assert_eq!(
+        last_topic0(&f),
+        Symbol::new(&f.env, "pool_contract_proposed")
+    );
+    f.registry.confirm_pool_contract(&f.admin);
+    assert_eq!(
+        last_topic0(&f),
+        Symbol::new(&f.env, "pool_contract_confirmed")
+    );
+}
+
+#[test]
+fn admin_rotation_moves_who_can_call_admin_gated_functions() {
     let f = setup();
     let new_admin = Address::generate(&f.env);
 
-    f.registry.set_admin(&f.admin, &new_admin);
+    rotate_admin(&f, &f.admin, &new_admin);
 
     // The old admin has lost access...
     let new_pool = Address::generate(&f.env);
-    let res = f.registry.try_set_pool_contract(&f.admin, &new_pool);
+    let res = f.registry.try_propose_pool_contract(&f.admin, &new_pool);
     assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
 
     // ...and the new admin has it.
-    f.registry.set_pool_contract(&new_admin, &new_pool);
+    repoint_pool(&f, &new_admin, &new_pool);
 }
 
 #[test]
-fn set_admin_rejects_non_admin() {
+fn admin_rotation_rejects_non_admin_and_wrong_acceptor() {
     let f = setup();
     let new_admin = Address::generate(&f.env);
     // The pool contract isn't privileged for admin rotation either.
-    let res = f.registry.try_set_admin(&f.pool, &new_admin);
+    let res = f.registry.try_propose_admin(&f.pool, &new_admin);
     assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
+
+    assert_eq!(
+        f.registry.try_accept_admin(&new_admin),
+        Err(Ok(RegistryError::NoPendingAdmin))
+    );
+    f.registry.propose_admin(&f.admin, &new_admin);
+    assert_eq!(
+        f.registry.try_accept_admin(&f.pool),
+        Err(Ok(RegistryError::Unauthorized))
+    );
+    assert_eq!(f.registry.admin(), Some(f.admin.clone()));
 }
 
 #[test]
-fn set_admin_emits_an_event() {
+fn admin_rotation_emits_proposed_and_accepted_events() {
     let f = setup();
     let new_admin = Address::generate(&f.env);
 
-    let before = f.env.events().all().len();
-    f.registry.set_admin(&f.admin, &new_admin);
-    let after = f.env.events().all().len();
-
-    assert_eq!(after, before + 1);
+    f.registry.propose_admin(&f.admin, &new_admin);
+    assert_eq!(last_topic0(&f), Symbol::new(&f.env, "admin_proposed"));
+    f.registry.accept_admin(&new_admin);
+    assert_eq!(last_topic0(&f), Symbol::new(&f.env, "admin_accepted"));
 }
 
 #[test]
@@ -325,7 +372,7 @@ fn admin_reflects_the_initialized_admin_and_tracks_rotation() {
     assert_eq!(f.registry.admin(), Some(f.admin.clone()));
 
     let new_admin = Address::generate(&f.env);
-    f.registry.set_admin(&f.admin, &new_admin);
+    rotate_admin(&f, &f.admin, &new_admin);
     assert_eq!(f.registry.admin(), Some(new_admin));
 }
 
@@ -344,55 +391,31 @@ fn pool_contract_reflects_initialize_and_tracks_repointing() {
     assert_eq!(f.registry.pool_contract(), Some(f.pool.clone()));
 
     let new_pool = Address::generate(&f.env);
-    f.registry.set_pool_contract(&f.admin, &new_pool);
+    repoint_pool(&f, &f.admin, &new_pool);
     assert_eq!(f.registry.pool_contract(), Some(new_pool));
 }
-
 
 #[test]
 fn test_adversarial_direct_registry_access_bypassing_pool() {
     let f = setup();
     let stranger = Address::generate(&f.env);
     let policy_id = 8888u64;
+    let reg = registration(policy_id, &stranger, CoverageType::StablecoinDepeg);
 
     // Stranger cannot register a policy directly
-    let res = f.registry.try_register(
-        &stranger,
-        &policy_id,
-        &stranger,
-        &CoverageType::StablecoinDepeg,
-        &10_000_000,
-        &500_000,
-        &2_000_000_000,
-    );
+    let res = f.registry.try_register_policy(&stranger, &reg);
     assert_eq!(res, Err(Ok(RegistryError::Unauthorized)));
 
     // Stranger cannot deactivate a policy directly
-    let res_deact = f.registry.try_deactivate(&stranger, &policy_id);
+    let res_deact = f.registry.try_deactivate_policy(&stranger, &policy_id);
     assert_eq!(res_deact, Err(Ok(RegistryError::Unauthorized)));
 
     // Admin can register directly without pool involvement
-    f.registry.register(
-        &f.admin,
-        &policy_id,
-        &stranger,
-        &CoverageType::StablecoinDepeg,
-        &10_000_000,
-        &500_000,
-        &2_000_000_000,
-    );
-    assert!(f.registry.is_active(&policy_id));
+    f.registry.register_policy(&f.admin, &reg);
+    assert!(f.registry.get_policy(&policy_id).is_active);
 
     // Duplicate registration under same policy_id by admin is strictly rejected
-    let res_dup = f.registry.try_register(
-        &f.admin,
-        &policy_id,
-        &stranger,
-        &CoverageType::StablecoinDepeg,
-        &10_000_000,
-        &500_000,
-        &2_000_000_000,
-    );
+    let res_dup = f.registry.try_register_policy(&f.admin, &reg);
     assert_eq!(res_dup, Err(Ok(RegistryError::PolicyAlreadyExists)));
 }
 
@@ -401,68 +424,52 @@ fn test_systematic_policy_event_topics_and_payloads() {
     let f = setup();
     let contract_id = f.registry.address.clone();
 
-    // 1. register event assertion: topics: (symbol_short!("POL_REG"), policy_id), data: (holder, coverage_type, coverage_amount, premium, end_time)
+    // 1. register: topics (policy_registered, policy_id), data (coverage_type, coverage_amount)
     let holder = Address::generate(&f.env);
     let policy_id = 999u64;
-    let coverage_type = CoverageType::StablecoinDepeg;
-    let coverage_amount = 10_000_000i128;
-    let premium = 500_000i128;
-    let end_time = 1_800_000_000u64;
+    let reg = registration(policy_id, &holder, CoverageType::MarketCrash);
 
     let before_count = f.env.events().all().len();
-    f.registry.register(&f.pool, &policy_id, &holder, &coverage_type, &coverage_amount, &premium, &end_time);
+    f.registry.register_policy(&f.pool, &reg);
     let events = f.env.events().all();
     assert_eq!(events.len(), before_count + 1);
     let (addr, topics, data) = events.last().unwrap();
     assert_eq!(addr, contract_id);
-    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
-    let topic_1: u64 = u64::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
-    assert_eq!(topic_0, symbol_short!("POL_REG"));
+    let topic_0 = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_1 = u64::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, Symbol::new(&f.env, "policy_registered"));
     assert_eq!(topic_1, policy_id);
-    let (h, ct, ca, pr, et): (Address, CoverageType, i128, i128, u64) = 
-        <(Address, CoverageType, i128, i128, u64)>::try_from_val(&f.env, &data).unwrap();
-    assert_eq!(h, holder);
-    assert_eq!(ct, coverage_type);
-    assert_eq!(ca, coverage_amount);
-    assert_eq!(pr, premium);
-    assert_eq!(et, end_time);
+    let (ct, ca) = <(u32, i128)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(ct, CoverageType::MarketCrash as u32);
+    assert_eq!(ca, reg.coverage_amount);
 
-    // 2. deactivate event assertion: topics: (symbol_short!("POL_DEACT"), policy_id), data: ()
+    // 2. deactivate: topics (policy_deactivated, policy_id), data ()
     let before_count = f.env.events().all().len();
-    f.registry.deactivate(&f.pool, &policy_id);
+    f.registry.deactivate_policy(&f.pool, &policy_id);
     let events = f.env.events().all();
     assert_eq!(events.len(), before_count + 1);
     let (addr, topics, _data) = events.last().unwrap();
     assert_eq!(addr, contract_id);
-    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
-    let topic_1: u64 = u64::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
-    assert_eq!(topic_0, symbol_short!("POL_DEACT"));
+    let topic_0 = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
+    let topic_1 = u64::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_0, Symbol::new(&f.env, "policy_deactivated"));
     assert_eq!(topic_1, policy_id);
 
-    // 3. set_admin event assertion: topics: (symbol_short!("ADM_SET"),), data: (new_admin,)
+    // 3. admin_proposed: data (new_admin,)
     let new_admin = Address::generate(&f.env);
-    let before_count = f.env.events().all().len();
-    f.registry.set_admin(&f.admin, &new_admin);
-    let events = f.env.events().all();
-    assert_eq!(events.len(), before_count + 1);
-    let (addr, topics, data) = events.last().unwrap();
+    f.registry.propose_admin(&f.admin, &new_admin);
+    let (addr, _topics, data) = f.env.events().all().last().unwrap();
     assert_eq!(addr, contract_id);
-    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
-    assert_eq!(topic_0, symbol_short!("ADM_SET"));
-    let payload_admin: Address = Address::try_from_val(&f.env, &data).unwrap();
+    let (payload_admin,) = <(Address,)>::try_from_val(&f.env, &data).unwrap();
     assert_eq!(payload_admin, new_admin);
 
-    // 4. set_pool_contract event assertion: topics: (symbol_short!("POOL_SET"),), data: (new_pool,)
+    // 4. pool_contract_confirmed: data new_pool
+    f.registry.accept_admin(&new_admin);
     let new_pool = Address::generate(&f.env);
-    let before_count = f.env.events().all().len();
-    f.registry.set_pool_contract(&new_admin, &new_pool);
-    let events = f.env.events().all();
-    assert_eq!(events.len(), before_count + 1);
-    let (addr, topics, data) = events.last().unwrap();
+    repoint_pool(&f, &new_admin, &new_pool);
+    let (addr, _topics, data) = f.env.events().all().last().unwrap();
     assert_eq!(addr, contract_id);
-    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
-    assert_eq!(topic_0, symbol_short!("POOL_SET"));
-    let payload_pool: Address = Address::try_from_val(&f.env, &data).unwrap();
+    let payload_pool = Address::try_from_val(&f.env, &data).unwrap();
     assert_eq!(payload_pool, new_pool);
 }
 
@@ -519,14 +526,13 @@ fn test_spec_policy_registry_interface_and_error_snapshot() {
         holder: holder.clone(),
         coverage_type: CoverageType::StablecoinDepeg,
         coverage_amount: 100_000_000,
-        premium_paid: 1_000_000,
-        start_time: 1_700_000_000,
-        end_time: 1_800_000_000,
+        premium: 1_000_000,
+        expires_at: 1_800_000_000,
         is_active: true,
+        created_at: 1_700_000_000,
     };
     assert_eq!(record.policy_id, 1);
     assert!(record.is_active);
-}
 }
 
 // ─── Issue #25: Per-holder indexing growth tests ──────────────────────────────
