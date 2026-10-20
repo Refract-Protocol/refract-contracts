@@ -124,8 +124,8 @@
 //!
 //!   1. Policy ID counter increment: next_id = current_id + 1
 //!      • next_id is u64 (not i128). At 1 policy per second it would take
-//!        ~585 billion years to overflow u64. Safe — no harness needed, but
-//!        document explicitly per the issue's requirement to enumerate ALL ops.
+//!      ~585 billion years to overflow u64. Safe — no harness needed, but
+//!      document explicitly per the issue's requirement to enumerate ALL ops.
 //!      • ✓ SAFE (no harness required; document argument is sufficient)
 //!
 //!   2. Holder policy index: vec.push_back(policy_id)
@@ -175,10 +175,10 @@
 //!   2. Oracle:  bind feed ID + set trigger threshold for the new type
 //!   3. Pool:    set risk multiplier for the new type
 //!   4. Policy:  (this contract) — no configuration setter needed here today.
-//!              The registry is a generic index; it stores PolicyRecord structs
-//!              for ANY coverage type without type-specific configuration.
-//!              The registry does NOT need to be updated as part of the
-//!              NewCoverageType onboarding sequence.
+//!      The registry is a generic index; it stores PolicyRecord structs
+//!      for ANY coverage type without type-specific configuration.
+//!      The registry does NOT need to be updated as part of the
+//!      NewCoverageType onboarding sequence.
 //!
 //! This means the governance contract's execution sequence for
 //! ProposalType::NewCoverageType does NOT need to call this contract.
@@ -205,6 +205,12 @@
 //!
 
 #![no_std]
+// clippy.toml bans unwrap/expect, but soroban's #[contract]/#[contractimpl]
+// macros emit unwrap() in the test client they generate whenever
+// soroban-sdk/testutils is enabled anywhere in the workspace build, so the
+// lint cannot pass `cargo clippy --all-targets`. The no-unwrap rule for
+// contract code is enforced by scripts/check_soroban_footguns.py instead.
+#![allow(clippy::disallowed_methods)]
 // `missing_docs` is not enabled: #[contracttype]/#[contractimpl] generate
 // undocumented public spec items that would fail it under `-D warnings`.
 

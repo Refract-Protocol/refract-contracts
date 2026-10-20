@@ -73,6 +73,12 @@
 //! toward the floor (1) but never to zero.
 
 #![no_std]
+// clippy.toml bans unwrap/expect, but soroban's #[contract]/#[contractimpl]
+// macros emit unwrap() in the test client they generate whenever
+// soroban-sdk/testutils is enabled anywhere in the workspace build, so the
+// lint cannot pass `cargo clippy --all-targets`. The no-unwrap rule for
+// contract code is enforced by scripts/check_soroban_footguns.py instead.
+#![allow(clippy::disallowed_methods)]
 // `missing_docs` is not enabled: #[contracttype]/#[contractimpl] generate
 // undocumented public spec items that would fail it under `-D warnings`.
 
@@ -652,7 +658,7 @@ impl RefractOracle {
             .persistent()
             .get(&DataKey::RelayerReputation(relayer.clone()))
             .unwrap_or(REPUTATION_INITIAL);
-        let updated = (current + delta).max(REPUTATION_FLOOR).min(REPUTATION_CEILING);
+        let updated = (current + delta).clamp(REPUTATION_FLOOR, REPUTATION_CEILING);
         env.storage()
             .persistent()
             .set(&DataKey::RelayerReputation(relayer.clone()), &updated);

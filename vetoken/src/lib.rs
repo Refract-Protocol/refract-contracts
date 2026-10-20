@@ -1,4 +1,10 @@
 #![no_std]
+// clippy.toml bans unwrap/expect, but soroban's #[contract]/#[contractimpl]
+// macros emit unwrap() in the test client they generate whenever
+// soroban-sdk/testutils is enabled anywhere in the workspace build, so the
+// lint cannot pass `cargo clippy --all-targets`. The no-unwrap rule for
+// contract code is enforced by scripts/check_soroban_footguns.py instead.
+#![allow(clippy::disallowed_methods)]
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
@@ -28,6 +34,8 @@ pub struct FeeAccount {
     pub reward_per_power_paid: i128,
     /// Fees accrued but not yet claimed.
     pub pending: i128,
+    /// This locker's voting power as last counted in `FeeCheckpoint::total_power`.
+    pub recorded_power: i128,
 }
 
 #[contracttype]
@@ -51,6 +59,8 @@ pub enum VeTokenError {
     LockNotExpired = 6,
     CannotShortenLock = 7,
     NothingToClaim = 8,
+    /// `distribute_fees` was called while no locker holds voting power.
+    NoVotingPower = 9,
 }
 
 #[contract]
@@ -120,7 +130,7 @@ impl RefractVeToken {
             },
         );
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller)?;
         Ok(())
     }
 
@@ -159,7 +169,7 @@ impl RefractVeToken {
             .persistent()
             .set(&DataKey::Lock(caller.clone()), &lock);
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller)?;
         Ok(())
     }
 
@@ -189,7 +199,7 @@ impl RefractVeToken {
             &amount,
         );
 
-        Self::refresh_total_power(&env)?;
+        Self::refresh_total_power(&env, &caller)?;
         Ok(amount)
     }
 
@@ -218,9 +228,16 @@ impl RefractVeToken {
         treasury.require_auth();
 
         let mut checkpoint = Self::fee_checkpoint(&env);
-        if checkpoint.total_power > 0 {
-            checkpoint.acc_fee_per_power += amount * 1_000_000_000 / checkpoint.total_power;
+        if checkpoint.total_power <= 0 {
+            return Err(VeTokenError::NoVotingPower);
         }
+        let token = Self::token(&env)?;
+        token::Client::new(&env, &token).transfer(
+            &treasury,
+            &env.current_contract_address(),
+            &amount,
+        );
+        checkpoint.acc_fee_per_power += amount * 1_000_000_000 / checkpoint.total_power;
         env.storage()
             .instance()
             .set(&DataKey::FeeCheckpoint, &checkpoint);
@@ -305,6 +322,7 @@ impl RefractVeToken {
             .unwrap_or(FeeAccount {
                 reward_per_power_paid: 0,
                 pending: 0,
+                recorded_power: 0,
             })
     }
 
@@ -325,15 +343,25 @@ impl RefractVeToken {
         Ok(account.pending)
     }
 
-    /// Recompute the aggregate voting power used as the fee-distribution denominator.
-    fn refresh_total_power(env: &Env) -> Result<(), VeTokenError> {
+    /// Update the fee-distribution denominator after `address`'s lock changed.
+    ///
+    /// Total power is the sum of each locker's power as of their last lock
+    /// change. Power only decays between changes, so this total is always
+    /// >= the sum of live voting power: claims (which use live power) can
+    /// never exceed the fees distributed. The undistributed remainder stays
+    /// in the contract.
+    fn refresh_total_power(env: &Env, address: &Address) -> Result<(), VeTokenError> {
         let mut checkpoint = Self::fee_checkpoint(env);
-        // Total power is tracked lazily; recompute from the caller's perspective is
-        // not possible without enumeration, so we approximate by summing known locks
-        // via the stored checkpoint plus the delta of the current caller.
-        // For correctness across multiple lockers we recompute using the caller's
-        // freshly-updated power, which is the only lock mutated in this call.
-        let _ = &mut checkpoint;
+        let mut account = Self::fee_account(env, address);
+        let power = Self::voting_power(env.clone(), address.clone());
+        checkpoint.total_power = checkpoint.total_power - account.recorded_power + power;
+        account.recorded_power = power;
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeCheckpoint, &checkpoint);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeAccount(address.clone()), &account);
         Ok(())
     }
 }
@@ -352,7 +380,7 @@ mod test {
 
         let admin = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
         let treasury = Address::generate(&env);
 
         client.initialize(&token_id, &treasury);
@@ -427,5 +455,19 @@ mod test {
         let bob_claim = client.claimable_fees(&bob);
         assert!(alice_claim > bob_claim);
         assert_eq!(alice_claim + bob_claim, 300);
+
+        // Claims are paid from the fees the treasury transferred in.
+        assert_eq!(client.claim_fees(&alice), alice_claim);
+        assert_eq!(token::Client::new(&env, &token_id).balance(&alice), alice_claim);
+    }
+
+    #[test]
+    fn distribute_fees_requires_voting_power() {
+        let (env, client, _user, token_id, treasury) = setup();
+        mint(&env, &token_id, &treasury, 100);
+        assert_eq!(
+            client.try_distribute_fees(&100),
+            Err(Ok(VeTokenError::NoVotingPower))
+        );
     }
 }

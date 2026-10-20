@@ -1,4 +1,10 @@
 #![no_std]
+// clippy.toml bans unwrap/expect, but soroban's #[contract]/#[contractimpl]
+// macros emit unwrap() in the test client they generate whenever
+// soroban-sdk/testutils is enabled anywhere in the workspace build, so the
+// lint cannot pass `cargo clippy --all-targets`. The no-unwrap rule for
+// contract code is enforced by scripts/check_soroban_footguns.py instead.
+#![allow(clippy::disallowed_methods)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
@@ -282,7 +288,11 @@ impl RefractPool {
 
         let state = PoolState::load(&env);
 
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UsdcToken)
+            .ok_or(PoolError::NotInitialized)?;
         token::Client::new(&env, &usdc).transfer(
             &provider,
             &env.current_contract_address(),
@@ -363,8 +373,8 @@ impl RefractPool {
             .persistent()
             .get(&DataKey::LastDeposit(provider.clone()));
         if let Some(last_deposit) = last_deposit {
-            let lockup_secs = (state.config.lockup_days as u64).checked_mul(86_400).unwrap_or(u64::MAX);
-            let unlocks_at = last_deposit.checked_add(lockup_secs).unwrap_or(u64::MAX);
+            let lockup_secs = (state.config.lockup_days as u64).saturating_mul(86_400);
+            let unlocks_at = last_deposit.saturating_add(lockup_secs);
             if env.ledger().timestamp() < unlocks_at {
                 return Err(PoolError::LockupActive);
             }
@@ -380,7 +390,11 @@ impl RefractPool {
             .persistent()
             .set(&DataKey::Shares(provider.clone()), &(user_shares - shares));
 
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UsdcToken)
+            .ok_or(PoolError::NotInitialized)?;
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),
             &provider,
@@ -417,12 +431,16 @@ impl RefractPool {
 
         let premium = Self::_calc_premium(&state.config, &params);
         let now = env.ledger().timestamp();
-        let duration_secs = (params.duration_days as u64).checked_mul(86_400).unwrap_or(u64::MAX);
-        let end_time = now.checked_add(duration_secs).unwrap_or(u64::MAX);
+        let duration_secs = (params.duration_days as u64).saturating_mul(86_400);
+        let end_time = now.saturating_add(duration_secs);
         let registry_coverage_type = Self::_to_registry_coverage_type(&params.coverage_type);
 
         // Transfer premium from holder
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UsdcToken)
+            .ok_or(PoolError::NotInitialized)?;
         token::Client::new(&env, &usdc).transfer(
             &holder,
             &env.current_contract_address(),
@@ -572,7 +590,11 @@ impl RefractPool {
         Self::_save_accounting(&env, &acc);
 
         // Transfer USDC to holder
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        let usdc: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UsdcToken)
+            .ok_or(PoolError::NotInitialized)?;
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),
             &policy.holder,
@@ -795,9 +817,9 @@ impl RefractPool {
             .storage()
             .persistent()
             .get(&DataKey::LastDeposit(provider))?;
-        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
-        let lockup_secs = (config.lockup_days as u64).checked_mul(86_400).unwrap_or(u64::MAX);
-        Some(last_deposit.checked_add(lockup_secs).unwrap_or(u64::MAX))
+        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig)?;
+        let lockup_secs = (config.lockup_days as u64).saturating_mul(86_400);
+        Some(last_deposit.saturating_add(lockup_secs))
     }
 
     /// The RefractPolicyRegistry address this pool currently indexes
@@ -937,8 +959,8 @@ impl RefractPool {
         let numerator = params.coverage_amount
             * (config.base_premium_rate_bps as i128)
             * (params.duration_days as i128)
-            * (risk_multiplier as i128);
-        let denominator = (BPS as i128) * 365 * 100;
+            * risk_multiplier;
+        let denominator = BPS * 365 * 100;
         numerator / denominator
     }
 

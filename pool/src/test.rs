@@ -1160,8 +1160,7 @@ fn griefing_stranger_cannot_prematurely_expire_active_policy() {
     });
 
     // Now expire_policy succeeds
-    let res_after = f.pool.expire_policy(&id);
-    assert_eq!(res_after, ());
+    f.pool.expire_policy(&id);
     assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Expired);
 }
 
@@ -1219,7 +1218,7 @@ fn test_differential_calc_premium_against_reference_model() {
     };
 
     let actual = RefractPool::_calc_premium(&config, &params);
-    let expected = (10_000 * ONE_USDC as i128 * 300 * 30 * 100) / (10_000 * 365 * 100);
+    let expected = (10_000 * ONE_USDC * 300 * 30 * 100) / (10_000 * 365 * 100);
     assert_eq!(actual, expected);
     assert!(actual > 0);
 }

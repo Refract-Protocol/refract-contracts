@@ -75,8 +75,7 @@ fn incident_coordinator_initializes_and_manages_guardian() {
     assert_eq!(h.coordinator.guardian(), Some(h.guardian.clone()));
 
     let next_guardian = Address::generate(&h.env);
-    let res = h.coordinator.set_guardian(&h.guardian, &next_guardian);
-    assert_eq!(res, ());
+    h.coordinator.set_guardian(&h.guardian, &next_guardian);
     assert_eq!(h.coordinator.guardian(), Some(next_guardian));
 
     // Stranger cannot rotate guardian
@@ -98,14 +97,13 @@ fn tabletop_incident_simulation_atomic_lockdown_beats_adversary() {
     // The security team / guardian detects that `admin` key was exposed.
     // Instead of sending 3 separate transactions that could be front-run or
     // split, the guardian executes an atomic lockdown via the coordinator:
-    let lockdown_res = h.coordinator.emergency_lockdown(
+    h.coordinator.emergency_lockdown(
         &h.admin,
         &h.pool.address,
         &h.registry.address,
         &h.oracle.address,
         &h.new_safe_admin,
     );
-    assert_eq!(lockdown_res, ());
 
     // Registry and oracle use two-step admin transfer: the safe admin
     // accepts right away to complete the handover.
@@ -145,8 +143,7 @@ fn tabletop_incident_simulation_atomic_lockdown_beats_adversary() {
     assert_eq!(h.oracle.admin(), Some(h.new_safe_admin.clone()));
 
     // 3. The new safe admin has full operational authority
-    let valid_pool_rotate = h.pool.set_admin(&h.new_safe_admin, &h.new_safe_admin);
-    assert_eq!(valid_pool_rotate, ());
+    h.pool.set_admin(&h.new_safe_admin, &h.new_safe_admin);
 }
 
 #[test]
@@ -155,12 +152,11 @@ fn tabletop_incident_simulation_pool_migration() {
     let patched_pool = Address::generate(&h.env);
 
     // Guardian triggers pool migration on registry
-    let migrate_res = h.coordinator.migrate_pool(
+    h.coordinator.migrate_pool(
         &h.admin,
         &h.registry.address,
         &patched_pool,
     );
-    assert_eq!(migrate_res, ());
 
     // The repoint is pending until the registry admin confirms it (the
     // registry's change delay defaults to zero).

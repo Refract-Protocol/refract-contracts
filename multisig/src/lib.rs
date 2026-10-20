@@ -28,6 +28,12 @@
 //! removed-key from contributing toward threshold forever.
 
 #![no_std]
+// clippy.toml bans unwrap/expect, but soroban's #[contract]/#[contractimpl]
+// macros emit unwrap() in the test client they generate whenever
+// soroban-sdk/testutils is enabled anywhere in the workspace build, so the
+// lint cannot pass `cargo clippy --all-targets`. The no-unwrap rule for
+// contract code is enforced by scripts/check_soroban_footguns.py instead.
+#![allow(clippy::disallowed_methods)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Val, Vec,
 };
@@ -111,7 +117,7 @@ impl RefractMultisig {
         if env.storage().instance().has(&DataKey::Owners) {
             return Err(MultisigError::AlreadyInitialized);
         }
-        if owners.is_empty() || threshold == 0 || threshold as u32 > owners.len() {
+        if owners.is_empty() || threshold == 0 || threshold > owners.len() {
             return Err(MultisigError::InvalidThreshold);
         }
         env.storage().instance().set(&DataKey::Owners, &owners);

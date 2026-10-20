@@ -92,7 +92,7 @@ def main():
         sys.exit(1)
 
     # 2. Scan core contracts
-    crates = ["pool", "policy", "oracle"]
+    crates = ["pool", "policy", "oracle", "backstop", "bounty", "grants", "treasury"]
     total_violations = 0
 
     for crate in crates:
