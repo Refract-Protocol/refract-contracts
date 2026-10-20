@@ -9,9 +9,9 @@ use soroban_sdk::{
     token::StellarAssetClient,
     Address, Bytes, Env,
 };
-use std::fs;
-use std::format;
 use std::eprintln;
+use std::format;
+use std::fs;
 use std::path::Path;
 
 const ONE_USDC: i128 = 10_000_000;
@@ -140,9 +140,7 @@ fn test_wasm_release_profile_behavioral_differences() {
     let f = match setup_wasm(&env) {
         Some(f) => f,
         None => {
-            eprintln!(
-                "Notice: Release wasm artifacts not found locally. Skipping wasm execution."
-            );
+            eprintln!("Notice: Release wasm artifacts not found locally. Skipping wasm execution.");
             return;
         }
     };

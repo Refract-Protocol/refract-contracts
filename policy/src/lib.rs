@@ -256,7 +256,7 @@ pub enum RegistryError {
     PolicyAlreadyExists = 5,
     NoPendingPoolContract = 6,
     PoolContractChangeNotReady = 7,
-    NoPendingAdmin = 8,  // Issue #88: no pending admin to accept
+    NoPendingAdmin = 8, // Issue #88: no pending admin to accept
 }
 
 /// Parameters for indexing a policy that the Pool contract already created.
@@ -516,10 +516,8 @@ impl RefractPolicyRegistry {
         env.storage()
             .instance()
             .set(&DataKey::PoolContractChangeDelay, &delay);
-        env.events().publish(
-            (Symbol::new(&env, "pool_contract_delay_set"),),
-            delay,
-        );
+        env.events()
+            .publish((Symbol::new(&env, "pool_contract_delay_set"),), delay);
         Ok(())
     }
 
@@ -563,10 +561,7 @@ impl RefractPolicyRegistry {
     /// Confirm a previously-proposed pool contract once the delay has
     /// elapsed. Rejects if there is no pending proposal or if the delay has
     /// not yet passed. The active pool address is only swapped here.
-    pub fn confirm_pool_contract(
-        env: Env,
-        caller: Address,
-    ) -> Result<(), RegistryError> {
+    pub fn confirm_pool_contract(env: Env, caller: Address) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
         let pending: PendingPoolContract = env
             .storage()
@@ -590,9 +585,15 @@ impl RefractPolicyRegistry {
     }
 
     /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
-    pub fn propose_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), RegistryError> {
+    pub fn propose_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
 
         env.events()
             .publish((Symbol::new(&env, "admin_proposed"),), (new_admin,));
@@ -619,7 +620,11 @@ impl RefractPolicyRegistry {
     }
 
     /// #70: Admin-gated contract upgrade.
-    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), RegistryError> {
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
 
         env.deployer()
@@ -727,16 +732,9 @@ impl RefractPolicyRegistry {
 
     /// Cancel a pending pool-contract repoint before it is confirmed. The
     /// active pool address is untouched.
-    pub fn cancel_pool_contract(
-        env: Env,
-        caller: Address,
-    ) -> Result<(), RegistryError> {
+    pub fn cancel_pool_contract(env: Env, caller: Address) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::PendingPoolContract)
-        {
+        if !env.storage().instance().has(&DataKey::PendingPoolContract) {
             return Err(RegistryError::NoPendingPoolContract);
         }
         env.storage()
@@ -749,9 +747,7 @@ impl RefractPolicyRegistry {
 
     /// Read the currently-pending pool-contract proposal, if any.
     pub fn get_pending_pool_contract(env: Env) -> Option<PendingPoolContract> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PendingPoolContract)
+        env.storage().instance().get(&DataKey::PendingPoolContract)
     }
 
     /// Read the currently-active trusted pool contract.

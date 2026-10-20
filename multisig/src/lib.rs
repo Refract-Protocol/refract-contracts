@@ -109,11 +109,7 @@ impl RefractMultisig {
     ///
     /// * `owners`    — initial owner list (must be non-empty).
     /// * `threshold` — minimum approvals required (1 ≤ threshold ≤ owners.len()).
-    pub fn initialize(
-        env: Env,
-        owners: Vec<Address>,
-        threshold: u32,
-    ) -> Result<(), MultisigError> {
+    pub fn initialize(env: Env, owners: Vec<Address>, threshold: u32) -> Result<(), MultisigError> {
         if env.storage().instance().has(&DataKey::Owners) {
             return Err(MultisigError::AlreadyInitialized);
         }
@@ -165,11 +161,7 @@ impl RefractMultisig {
         proposer.require_auth();
         Self::require_owner(&env, &proposer)?;
 
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
         let mut approvals: Vec<Address> = Vec::new(&env);
         approvals.push_back(proposer.clone());
@@ -184,9 +176,7 @@ impl RefractMultisig {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(id), &proposal);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "ms_proposed"), id),
@@ -314,9 +304,7 @@ impl RefractMultisig {
             .unwrap_or(1);
         let clamped = threshold.min(new_owners.len());
         env.storage().instance().set(&DataKey::Owners, &new_owners);
-        env.storage()
-            .instance()
-            .set(&DataKey::Threshold, &clamped);
+        env.storage().instance().set(&DataKey::Threshold, &clamped);
 
         env.events()
             .publish((Symbol::new(&env, "ms_owner_removed"),), (owner.clone(),));

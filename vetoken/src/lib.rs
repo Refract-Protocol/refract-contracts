@@ -190,7 +190,9 @@ impl RefractVeToken {
         Self::settle_fee_account(&env, &caller)?;
 
         let amount = lock.amount;
-        env.storage().persistent().remove(&DataKey::Lock(caller.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Lock(caller.clone()));
 
         let token = Self::token(&env)?;
         token::Client::new(&env, &token).transfer(
@@ -372,7 +374,13 @@ mod test {
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{token, Env};
 
-    fn setup() -> (Env, RefractVeTokenClient<'static>, Address, Address, Address) {
+    fn setup() -> (
+        Env,
+        RefractVeTokenClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, RefractVeToken);
@@ -380,7 +388,9 @@ mod test {
 
         let admin = Address::generate(&env);
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
         let treasury = Address::generate(&env);
 
         client.initialize(&token_id, &treasury);
@@ -458,7 +468,10 @@ mod test {
 
         // Claims are paid from the fees the treasury transferred in.
         assert_eq!(client.claim_fees(&alice), alice_claim);
-        assert_eq!(token::Client::new(&env, &token_id).balance(&alice), alice_claim);
+        assert_eq!(
+            token::Client::new(&env, &token_id).balance(&alice),
+            alice_claim
+        );
     }
 
     #[test]

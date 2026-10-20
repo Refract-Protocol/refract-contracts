@@ -1,4 +1,4 @@
-﻿#![cfg(test)]
+#![cfg(test)]
 
 use super::*;
 use refract_oracle::{RefractOracle, RefractOracleClient};
@@ -134,7 +134,10 @@ fn tabletop_incident_simulation_atomic_lockdown_beats_adversary() {
 
     // C: Try to rotate registry admin back to adversary
     let reg_admin_attack = h.registry.try_propose_admin(&h.admin, &h.adversary);
-    assert_eq!(reg_admin_attack, Err(Ok(refract_policy::RegistryError::Unauthorized)));
+    assert_eq!(
+        reg_admin_attack,
+        Err(Ok(refract_policy::RegistryError::Unauthorized))
+    );
 
     // D: Try to manipulate oracle
     // mock_all_auths would satisfy the oracle's admin auth, so just check a
@@ -152,11 +155,8 @@ fn tabletop_incident_simulation_pool_migration() {
     let patched_pool = Address::generate(&h.env);
 
     // Guardian triggers pool migration on registry
-    h.coordinator.migrate_pool(
-        &h.admin,
-        &h.registry.address,
-        &patched_pool,
-    );
+    h.coordinator
+        .migrate_pool(&h.admin, &h.registry.address, &patched_pool);
 
     // The repoint is pending until the registry admin confirms it (the
     // registry's change delay defaults to zero).

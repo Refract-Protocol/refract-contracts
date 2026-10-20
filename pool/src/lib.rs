@@ -84,10 +84,10 @@ pub enum DataKey {
     TotalCoverage,  // Legacy key for migration
     TotalPremiums,  // Legacy key for migration
     Shares(Address),
-    TotalShares,    // Legacy key for migration
+    TotalShares, // Legacy key for migration
     Policy(u64),
     UserPolicies(Address),
-    NextPolicyId,   // Legacy key for migration
+    NextPolicyId, // Legacy key for migration
     PoolConfig,
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
@@ -977,7 +977,10 @@ impl RefractPool {
     /// against config.min_coverage/max_coverage and the pool's remaining
     /// underwriting capacity, returning the resulting total_coverage (which
     /// buy_policy() needs afterward to update storage) on success.
-    fn _check_coverage_capacity(state: &PoolState, coverage_amount: i128) -> Result<i128, PoolError> {
+    fn _check_coverage_capacity(
+        state: &PoolState,
+        coverage_amount: i128,
+    ) -> Result<i128, PoolError> {
         let config = &state.config;
         if coverage_amount < config.min_coverage {
             return Err(PoolError::InsufficientCapacity);
@@ -1064,11 +1067,31 @@ impl RefractPool {
             acc
         } else {
             PoolAccounting {
-                total_capital: env.storage().instance().get(&DataKey::TotalCapital).unwrap_or(0i128),
-                total_coverage: env.storage().instance().get(&DataKey::TotalCoverage).unwrap_or(0i128),
-                total_premiums: env.storage().instance().get(&DataKey::TotalPremiums).unwrap_or(0i128),
-                total_shares: env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0i128),
-                next_policy_id: env.storage().instance().get(&DataKey::NextPolicyId).unwrap_or(0u64),
+                total_capital: env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalCapital)
+                    .unwrap_or(0i128),
+                total_coverage: env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalCoverage)
+                    .unwrap_or(0i128),
+                total_premiums: env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalPremiums)
+                    .unwrap_or(0i128),
+                total_shares: env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalShares)
+                    .unwrap_or(0i128),
+                next_policy_id: env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::NextPolicyId)
+                    .unwrap_or(0u64),
             }
         }
     }
@@ -1094,11 +1117,31 @@ impl RefractPool {
         }
 
         let acc = PoolAccounting {
-            total_capital: env.storage().instance().get(&DataKey::TotalCapital).unwrap_or(0i128),
-            total_coverage: env.storage().instance().get(&DataKey::TotalCoverage).unwrap_or(0i128),
-            total_premiums: env.storage().instance().get(&DataKey::TotalPremiums).unwrap_or(0i128),
-            total_shares: env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0i128),
-            next_policy_id: env.storage().instance().get(&DataKey::NextPolicyId).unwrap_or(0u64),
+            total_capital: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalCapital)
+                .unwrap_or(0i128),
+            total_coverage: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalCoverage)
+                .unwrap_or(0i128),
+            total_premiums: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalPremiums)
+                .unwrap_or(0i128),
+            total_shares: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalShares)
+                .unwrap_or(0i128),
+            next_policy_id: env
+                .storage()
+                .instance()
+                .get(&DataKey::NextPolicyId)
+                .unwrap_or(0u64),
         };
         Self::_save_accounting(&env, &acc);
 

@@ -122,8 +122,14 @@ fn claim_releases_all_approved_milestones_at_once() {
     c.approve_milestone(&s.approver, &id, &1);
     assert_eq!(c.claim(&s.recipient, &id), 300 * UNIT);
     let g = c.get_grant(&id);
-    assert_eq!(g.milestones.get(1).unwrap().status, MilestoneStatus::Claimed);
-    assert_eq!(g.milestones.get(2).unwrap().status, MilestoneStatus::Pending);
+    assert_eq!(
+        g.milestones.get(1).unwrap().status,
+        MilestoneStatus::Claimed
+    );
+    assert_eq!(
+        g.milestones.get(2).unwrap().status,
+        MilestoneStatus::Pending
+    );
 }
 
 #[test]
@@ -474,13 +480,25 @@ fn events_on_create_fund_approve_and_disburse() {
     let c = s.client();
     let grant = Symbol::new(&s.env, "grant");
     let id = s.grant(&[UNIT]);
-    assert_eq!(last_event_topics(&s), (grant.clone(), Symbol::new(&s.env, "created")));
+    assert_eq!(
+        last_event_topics(&s),
+        (grant.clone(), Symbol::new(&s.env, "created"))
+    );
     c.fund_grant(&s.admin, &id, &UNIT);
-    assert_eq!(last_event_topics(&s), (grant.clone(), Symbol::new(&s.env, "funded")));
+    assert_eq!(
+        last_event_topics(&s),
+        (grant.clone(), Symbol::new(&s.env, "funded"))
+    );
     c.approve_milestone(&s.approver, &id, &0);
-    assert_eq!(last_event_topics(&s), (grant.clone(), Symbol::new(&s.env, "approved")));
+    assert_eq!(
+        last_event_topics(&s),
+        (grant.clone(), Symbol::new(&s.env, "approved"))
+    );
     c.claim(&s.recipient, &id);
-    assert_eq!(last_event_topics(&s), (grant, Symbol::new(&s.env, "disbursed")));
+    assert_eq!(
+        last_event_topics(&s),
+        (grant, Symbol::new(&s.env, "disbursed"))
+    );
     let (_, _, data) = s.env.events().all().last().unwrap();
     let (gid, to, amount) = <(u32, Address, i128)>::try_from_val(&s.env, &data).unwrap();
     assert_eq!((gid, to, amount), (id, s.recipient.clone(), UNIT));
@@ -494,7 +512,10 @@ fn writes_extend_instance_and_grant_ttl() {
     s.env.as_contract(&s.contract, || {
         assert_eq!(s.env.storage().instance().get_ttl(), LEDGER_BUMP);
         assert_eq!(
-            s.env.storage().persistent().get_ttl(&crate::DataKey::Grant(id)),
+            s.env
+                .storage()
+                .persistent()
+                .get_ttl(&crate::DataKey::Grant(id)),
             LEDGER_BUMP
         );
     });

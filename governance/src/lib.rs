@@ -201,7 +201,11 @@ impl RefractGovernor {
     }
 
     /// Wire in the timelock contract address.  Admin-only.
-    pub fn set_timelock(env: Env, caller: Address, timelock: Address) -> Result<(), GovernanceError> {
+    pub fn set_timelock(
+        env: Env,
+        caller: Address,
+        timelock: Address,
+    ) -> Result<(), GovernanceError> {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::Timelock, &timelock);
         env.events()
@@ -249,11 +253,7 @@ impl RefractGovernor {
         }
 
         let now = env.ledger().timestamp();
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
         let proposal = ProposalState {
             proposer: proposer.clone(),
@@ -273,9 +273,7 @@ impl RefractGovernor {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(id), &proposal);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextId, &(id + 1));
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "gov_proposed"), id),
@@ -427,11 +425,7 @@ impl RefractGovernor {
             tl_args.push_back(proposal.function.into_val(&env));
             tl_args.push_back(proposal.args.into_val(&env));
             tl_args.push_back(eta.into_val(&env));
-            env.invoke_contract::<Val>(
-                &timelock,
-                &Symbol::new(&env, "queue"),
-                tl_args,
-            );
+            env.invoke_contract::<Val>(&timelock, &Symbol::new(&env, "queue"), tl_args);
         }
         // If no timelock is set the proposal is marked Queued and the
         // caller should call `execute` directly.

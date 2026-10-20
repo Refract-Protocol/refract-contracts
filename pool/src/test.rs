@@ -1123,7 +1123,10 @@ fn griefing_stranger_process_claim_payout_strictly_credited_to_holder() {
     // 3. Stranger received 0 USDC (cannot divert funds)
     assert_eq!(stranger_after, stranger_before);
     // 4. Policy status is Claimed
-    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Claimed);
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Claimed
+    );
 }
 
 #[test]
@@ -1161,7 +1164,10 @@ fn griefing_stranger_cannot_prematurely_expire_active_policy() {
 
     // Now expire_policy succeeds
     f.pool.expire_policy(&id);
-    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Expired);
+    assert_eq!(
+        f.pool.get_policy(&id).unwrap().status,
+        PolicyStatus::Expired
+    );
 }
 
 #[test]
@@ -1196,7 +1202,6 @@ fn griefing_stranger_untriggered_claim_fails_cleanly() {
     assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Active);
     assert_eq!(f.usdc.balance(&holder), holder_before);
 }
-
 
 // ─── Issues #20, #21: Differential Premium & Precision Loss Tests ─────────────
 
@@ -1289,8 +1294,14 @@ fn economic_conservation_inflows_equal_outflows_and_pool_balance() {
     let mut expected_inflows = deposit_amount;
     let mut expected_outflows = 0i128;
 
-    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
-    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+    assert_eq!(
+        f.usdc.balance(&pool_addr),
+        expected_inflows - expected_outflows
+    );
+    assert_eq!(
+        f.pool.pool_stats().total_capital,
+        f.usdc.balance(&pool_addr)
+    );
 
     // 3. Buy policy with premium
     let holder = funded(&f, 10_000 * ONE_USDC);
@@ -1304,8 +1315,14 @@ fn economic_conservation_inflows_equal_outflows_and_pool_balance() {
     let _id = f.pool.buy_policy(&holder, &params);
 
     expected_inflows += premium;
-    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
-    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+    assert_eq!(
+        f.usdc.balance(&pool_addr),
+        expected_inflows - expected_outflows
+    );
+    assert_eq!(
+        f.pool.pool_stats().total_capital,
+        f.usdc.balance(&pool_addr)
+    );
 
     // 4. Past lockup, withdraw capital
     past_lockup(&f);
@@ -1313,8 +1330,14 @@ fn economic_conservation_inflows_equal_outflows_and_pool_balance() {
     let usdc_out = f.pool.withdraw_capital(&lp, &shares_to_withdraw);
 
     expected_outflows += usdc_out;
-    assert_eq!(f.usdc.balance(&pool_addr), expected_inflows - expected_outflows);
-    assert_eq!(f.pool.pool_stats().total_capital, f.usdc.balance(&pool_addr));
+    assert_eq!(
+        f.usdc.balance(&pool_addr),
+        expected_inflows - expected_outflows
+    );
+    assert_eq!(
+        f.pool.pool_stats().total_capital,
+        f.usdc.balance(&pool_addr)
+    );
 }
 
 #[test]
@@ -1370,7 +1393,10 @@ fn share_price_monotonicity_under_premium_accrual() {
     f.pool.buy_policy(&holder, &params);
 
     let price_1 = f.pool.pool_stats().share_price;
-    assert!(price_1 >= price_0, "Share price must never decrease upon premium accrual");
+    assert!(
+        price_1 >= price_0,
+        "Share price must never decrease upon premium accrual"
+    );
 }
 
 #[test]
@@ -1436,11 +1462,26 @@ fn test_spec_pool_interface_and_error_snapshot() {
 
 #[test]
 fn test_spec_mirrored_registry_types_match() {
-    assert_eq!(RegistryCoverageType::StablecoinDepeg as u32, refract_policy::CoverageType::StablecoinDepeg as u32);
-    assert_eq!(RegistryCoverageType::MarketCrash as u32, refract_policy::CoverageType::MarketCrash as u32);
-    assert_eq!(RegistryCoverageType::LiquidationShield as u32, refract_policy::CoverageType::LiquidationShield as u32);
-    assert_eq!(RegistryCoverageType::SmartContractRisk as u32, refract_policy::CoverageType::SmartContractRisk as u32);
-    assert_eq!(RegistryCoverageType::FlightDelay as u32, refract_policy::CoverageType::FlightDelay as u32);
+    assert_eq!(
+        RegistryCoverageType::StablecoinDepeg as u32,
+        refract_policy::CoverageType::StablecoinDepeg as u32
+    );
+    assert_eq!(
+        RegistryCoverageType::MarketCrash as u32,
+        refract_policy::CoverageType::MarketCrash as u32
+    );
+    assert_eq!(
+        RegistryCoverageType::LiquidationShield as u32,
+        refract_policy::CoverageType::LiquidationShield as u32
+    );
+    assert_eq!(
+        RegistryCoverageType::SmartContractRisk as u32,
+        refract_policy::CoverageType::SmartContractRisk as u32
+    );
+    assert_eq!(
+        RegistryCoverageType::FlightDelay as u32,
+        refract_policy::CoverageType::FlightDelay as u32
+    );
 
     let env = Env::default();
     let holder = Address::generate(&env);
@@ -1612,9 +1653,10 @@ fn test_precision_loss_bounds_in_deferred_division() {
         };
         let premium = RefractPool::_calc_premium(&config, &params);
         let naive = (params.coverage_amount * (config.base_premium_rate_bps as i128) / 10_000)
-            * (days as i128) / 365
-            * 150 / 100;
+            * (days as i128)
+            / 365
+            * 150
+            / 100;
         assert!(premium >= naive);
     }
 }
-

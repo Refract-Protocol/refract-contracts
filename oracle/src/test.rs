@@ -519,13 +519,25 @@ fn admin_submitting_is_subject_to_the_same_rate_limit() {
     let feed = Symbol::new(&env, "USDC_PRICE");
     let t0 = env.ledger().timestamp();
 
-    let res = oracle.try_submit(&admin, &feed, &9_990_000, &t0, &Symbol::new(&env, "test_source"));
+    let res = oracle.try_submit(
+        &admin,
+        &feed,
+        &9_990_000,
+        &t0,
+        &Symbol::new(&env, "test_source"),
+    );
     assert!(res.is_ok());
 
     // Advance by only 59 s — still within the 60 s cooldown.
     env.ledger().with_mut(|li| li.timestamp = t0 + 59);
 
-    let res = oracle.try_submit(&admin, &feed, &9_980_000, &t0, &Symbol::new(&env, "test_source"));
+    let res = oracle.try_submit(
+        &admin,
+        &feed,
+        &9_980_000,
+        &t0,
+        &Symbol::new(&env, "test_source"),
+    );
     assert_eq!(res, Err(Ok(OracleError::SubmittedTooSoon)));
 }
 
@@ -555,14 +567,19 @@ fn test_systematic_oracle_event_topics_and_payloads() {
     let now = f.env.ledger().timestamp();
     let feed_sym = Symbol::new(&f.env, "BTC_PRICE");
     let reading_val: i128 = 65_000 * SCALE;
-    f.oracle.submit(&f.relayer, &feed_sym, &reading_val, &now, &Symbol::new(&f.env, "test_source"));
+    f.oracle.submit(
+        &f.relayer,
+        &feed_sym,
+        &reading_val,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
     let events = f.env.events().all();
     assert_eq!(events.len(), before_count + 1);
     let (addr, topics, data) = events.last().unwrap();
     assert_eq!(addr, contract_id);
     assert_eq!(topic0(&topics), Symbol::new(&f.env, "reading_submitted"));
-    let (who, feed, val, ts) =
-        <(Address, Symbol, i128, u64)>::try_from_val(&f.env, &data).unwrap();
+    let (who, feed, val, ts) = <(Address, Symbol, i128, u64)>::try_from_val(&f.env, &data).unwrap();
     assert_eq!(who, f.relayer);
     assert_eq!(feed, feed_sym);
     assert_eq!(val, reading_val);
@@ -700,7 +717,13 @@ fn metadata_is_settable_before_any_reading_is_submitted() {
         &now,
         &Symbol::new(&f.env, "refract"),
     );
-    assert_eq!(f.oracle.get_feed_metadata(&feed).unwrap().expected_cadence_secs, 120);
+    assert_eq!(
+        f.oracle
+            .get_feed_metadata(&feed)
+            .unwrap()
+            .expected_cadence_secs,
+        120
+    );
 }
 
 #[test]
@@ -820,7 +843,10 @@ fn adding_duplicate_relayer_does_not_reset_reputation() {
     f.oracle.add_relayer(&f.relayer);
 
     let rep_after = f.oracle.relayer_reputation(&f.relayer).unwrap();
-    assert_eq!(rep_before, rep_after, "duplicate add must not reset reputation");
+    assert_eq!(
+        rep_before, rep_after,
+        "duplicate add must not reset reputation"
+    );
 }
 
 #[test]
@@ -835,7 +861,13 @@ fn admin_cannot_submit_without_being_an_active_relayer() {
 
     let feed = Symbol::new(&env, "USDC_PRICE");
     let t0 = env.ledger().timestamp();
-    let res = oracle.try_submit(&admin, &feed, &9_990_000, &t0, &Symbol::new(&env, "test_source"));
+    let res = oracle.try_submit(
+        &admin,
+        &feed,
+        &9_990_000,
+        &t0,
+        &Symbol::new(&env, "test_source"),
+    );
     assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
 }
 
@@ -855,4 +887,3 @@ fn first_submission_from_a_relayer_is_always_accepted() {
     );
     assert!(res.is_ok());
 }
-

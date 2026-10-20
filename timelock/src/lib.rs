@@ -311,11 +311,7 @@ impl RefractTimelock {
             return Err(TimelockError::EtaTooSoon);
         }
 
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
         let op = TimelockOperation {
             target: target.clone(),
             function: function.clone(),
@@ -323,12 +319,8 @@ impl RefractTimelock {
             eta,
             status: OperationStatus::Pending,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextId, &(id + 1));
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "tl_queued"), id),
@@ -362,9 +354,7 @@ impl RefractTimelock {
         // re-entrant execute on the same id is rejected even if the
         // target call somehow loops back.
         op.status = OperationStatus::Executed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
 
         // Forward the call.  `try_invoke_contract` is used so that a
         // failing callee does not silently swallow the error — we catch it,
@@ -385,9 +375,7 @@ impl RefractTimelock {
             Err(_) => {
                 // Reset so the op can be retried.
                 op.status = OperationStatus::Pending;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Operation(id), &op);
+                env.storage().persistent().set(&DataKey::Operation(id), &op);
                 Err(TimelockError::NotFound) // surface as a generic failure
             }
         }
@@ -409,9 +397,7 @@ impl RefractTimelock {
         }
 
         op.status = OperationStatus::Cancelled;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
 
         env.events()
             .publish((Symbol::new(&env, "tl_cancelled"), id), ());

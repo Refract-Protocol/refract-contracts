@@ -1,5 +1,4 @@
 #![cfg(test)]
-
 // =============================================================================
 // Issue #135 — [High] Formally verify _calc_shares/_quote_withdrawal
 // share-price monotonicity and no-value-creation properties

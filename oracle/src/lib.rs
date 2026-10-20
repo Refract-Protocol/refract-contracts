@@ -257,10 +257,10 @@ pub enum OracleError {
     FutureTimestamp = 7,
     /// Submitted reading timestamp is older than the reading already stored for this feed.
     StaleSubmission = 8,
-    NoPendingAdmin = 9,  // Issue #88: no pending admin to accept
+    NoPendingAdmin = 9,          // Issue #88: no pending admin to accept
     SubmittedTooSoon = 10, // rate-limit: same (relayer, feed_id) within MIN_SUBMISSION_INTERVAL_SECS
-    InsufficientBond = 11,    // Issue #94: relayer bond too low
-    RelayerNotBonded = 12,   // Issue #94: relayer has no stake
+    InsufficientBond = 11, // Issue #94: relayer bond too low
+    RelayerNotBonded = 12, // Issue #94: relayer has no stake
     InvalidSlashAmount = 13, // Issue #94: slash exceeds bond
     RelayerNotPending = 14, // activate_relayer called for a relayer that was never queued
     NoticePeriodNotElapsed = 15, // activate_relayer called before min_addition_notice_period
@@ -423,10 +423,8 @@ impl RefractOracle {
         env.storage()
             .instance()
             .set(&DataKey::PendingRelayer(relayer.clone()), &queued_at);
-        env.events().publish(
-            (Symbol::new(&env, "relayer_queued"),),
-            (relayer, queued_at),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "relayer_queued"),), (relayer, queued_at));
         Ok(())
     }
 
@@ -522,7 +520,9 @@ impl RefractOracle {
     /// Issue #88: Propose a new admin. Current admin only; does not take effect until accept_admin.
     pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
-        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
         env.events()
             .publish((Symbol::new(&env, "admin_proposed"),), (new_admin,));
         Ok(())
@@ -559,9 +559,7 @@ impl RefractOracle {
 
     /// Issue #92: Get the configured threshold for a feed, or None if using default.
     pub fn get_threshold(env: Env, feed_id: Symbol) -> Option<i128> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Threshold(feed_id))
+        env.storage().instance().get(&DataKey::Threshold(feed_id))
     }
 
     /// #70: Admin-gated contract upgrade. Caller supplies the new WASM hash.
@@ -603,10 +601,8 @@ impl RefractOracle {
         env.storage()
             .persistent()
             .set(&DataKey::FeedMetadata(feed_id.clone()), &metadata);
-        env.events().publish(
-            (Symbol::new(&env, "feed_metadata_set"), feed_id),
-            (),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "feed_metadata_set"), feed_id), ());
         Ok(())
     }
 
@@ -647,11 +643,7 @@ impl RefractOracle {
     /// off-chain monitoring job that detects outlier submissions and calls
     /// this function).  Fully-automated, trustless reputation updates are
     /// left as a follow-up once on-chain aggregation lands.
-    pub fn update_reputation(
-        env: Env,
-        relayer: Address,
-        delta: i128,
-    ) -> Result<(), OracleError> {
+    pub fn update_reputation(env: Env, relayer: Address, delta: i128) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
         let current: i128 = env
             .storage()
@@ -726,11 +718,7 @@ impl RefractOracle {
         // The admin is intentionally subject to the same check — uniformity
         // means the guarantee is easier to audit and reason about.
         let rate_key = DataKey::LastSubmissionAt(relayer.clone(), feed_id.clone());
-        if let Some(last_at) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u64>(&rate_key)
-        {
+        if let Some(last_at) = env.storage().persistent().get::<DataKey, u64>(&rate_key) {
             let elapsed = ledger_time.saturating_sub(last_at);
             if elapsed < MIN_SUBMISSION_INTERVAL_SECS {
                 return Err(OracleError::SubmittedTooSoon);

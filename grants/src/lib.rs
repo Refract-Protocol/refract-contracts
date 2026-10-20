@@ -43,8 +43,8 @@
 #![allow(clippy::disallowed_methods)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN,
-    Env, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Vec,
 };
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -293,7 +293,11 @@ impl RefractGrants {
         }
 
         let token = Self::load_token(&env)?;
-        token::Client::new(&env, &token).transfer(&caller, &env.current_contract_address(), &amount);
+        token::Client::new(&env, &token).transfer(
+            &caller,
+            &env.current_contract_address(),
+            &amount,
+        );
 
         grant.escrowed = new_escrow;
         Self::save_grant(&env, &grant);
@@ -404,7 +408,11 @@ impl RefractGrants {
         Self::bump_instance(&env);
 
         let token = Self::load_token(&env)?;
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &recipient, &amount);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
 
         env.events().publish(
             (symbol_short!("grant"), symbol_short!("disbursed")),

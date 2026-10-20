@@ -18,7 +18,9 @@ mod stub {
     #[contractimpl]
     impl Stub {
         pub fn set_value(env: Env, value: i128) -> i128 {
-            env.storage().instance().set(&Symbol::new(&env, "v"), &value);
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "v"), &value);
             value
         }
 
@@ -68,7 +70,7 @@ fn default_config(token: &Address) -> GovernorConfig {
     GovernorConfig {
         token: token.clone(),
         voting_period: 3_600,
-        quorum_bps: 200,              // 2% of total supply
+        quorum_bps: 200, // 2% of total supply
         proposal_threshold: 100_000_000i128,
         total_supply: TOTAL_SUPPLY,
     }
