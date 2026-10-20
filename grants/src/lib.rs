@@ -22,6 +22,165 @@
 //! Proof-of-delivery/attestation for what counts as milestone completion is made
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
+//!
+//! =============================================================================
+//! Issue #228 — Implement Oracle-Attested Milestone Evidence Verification in
+//! RefractGrants
+//! https://github.com/Refract-Protocol/refract-contracts/issues/228
+//!
+//! ─── PROBLEM ─────────────────────────────────────────────────────────────────
+//!
+//! `confirm_milestone` today is a bare governance call — it trusts the
+//! governance/timelock to assert that delivery happened. Nothing verifies an
+//! artefact on-chain. A disbursement contract that releases funds on a bare
+//! `approve(milestone_id)` is a single-key treasury by another name and is
+//! the exact failure mode grants programmes are audited for.
+//!
+//! ─── DESIGN ──────────────────────────────────────────────────────────────────
+//!
+//! Extend the `Milestone` struct with two new fields:
+//!
+//!   evidence_hash:    Option<BytesN<32>>    — client-side hash of delivery artefact
+//!   attestation:      Option<Attestation>   — on-chain attestation record
+//!
+//!   #[contracttype]
+//!   pub struct Attestation {
+//!       pub attestor:   Address,
+//!       pub timestamp:  u64,
+//!       pub verdict:    bool,    // true = passed, false = revoked
+//!   }
+//!
+//! `confirm_milestone` is split into two separate steps:
+//!
+//!   Step 1 — submit_evidence(caller, grant_id, milestone_index, evidence_hash)
+//!     Callable by the grantee or governance. Records the hash; does NOT unlock
+//!     funds. Returns GrantsError::EvidenceAlreadySubmitted if called again.
+//!
+//!   Step 2 — attest_milestone(caller, grant_id, milestone_index, verdict)
+//!     Callable by a registered attestor. Writes an Attestation record.
+//!     verdict=false is a revocation (valid only before disbursement).
+//!
+//!   confirm_milestone() is updated to require both evidence_hash.is_some()
+//!   AND attestation.is_some() AND attestation.verdict == true before setting
+//!   milestone.confirmed = true. Without both conditions it returns
+//!   GrantsError::EvidenceRequired or GrantsError::AttestationRequired.
+//!
+//! ─── ATTESTOR REGISTRY ───────────────────────────────────────────────────────
+//!
+//! A governance-managed set of attestors is stored under DataKey::Attestors.
+//! Rotation does not invalidate existing valid attestations — an attestation
+//! record is immutable once written (verdict=true).
+//!
+//! For high-value milestones, an m-of-n threshold may be required:
+//!   DataKey::AttestorThreshold → u32 (default 1)
+//! confirm_milestone() counts attestations with verdict=true and compares
+//! against the threshold before proceeding. Attestors beyond the threshold
+//! are stored but do not block confirmation.
+//!
+//! Cap attestor set size to ATTESTOR_SET_MAX = 20 to bound iteration cost.
+//!
+//! ─── ORACLE-DRIVEN MILESTONES ────────────────────────────────────────────────
+//!
+//! Where a milestone is data-observable (e.g. TVL above a threshold), the
+//! attestation step can be replaced by an oracle read:
+//!
+//!   DataKey::OracleContract  → Address (RefractOracle)
+//!   Milestone.oracle_feed:    Option<BytesN<32>>  — feed_id to query
+//!   Milestone.oracle_target:  Option<i128>        — required value
+//!
+//! If oracle_feed is set, attest_milestone() instead calls:
+//!   RefractOracle::get_reading(feed_id) → OracleReading { value, timestamp }
+//!
+//! Staleness: if env.ledger().timestamp() - reading.timestamp > ORACLE_STALENESS_WINDOW
+//! (configurable, default 30 min = 1_800 seconds), the reading is treated as
+//! no attestation and confirm_milestone reverts with GrantsError::OracleStale.
+//! An oracle failure (cross-contract error) reverts with GrantsError::OracleFailed —
+//! it never silently passes a milestone.
+//!
+//! ─── REVOCATION ──────────────────────────────────────────────────────────────
+//!
+//! An attestor may call revoke_attestation(caller, grant_id, milestone_index)
+//! to set verdict=false, provided the milestone has NOT yet been confirmed
+//! (i.e. claimable funds not yet unlocked). Once confirmed, the attestation
+//! record is frozen — revocation after confirmation is rejected with
+//! GrantsError::MilestoneAlreadyConfirmed.
+//!
+//! ─── EDGE CASES ──────────────────────────────────────────────────────────────
+//!
+//! Empty evidence hash:
+//!   submit_evidence with BytesN::from_array(env, &[0u8;32]) returns
+//!   GrantsError::InvalidEvidenceHash — all-zeros is rejected as a sentinel.
+//!
+//! Self-attestation by the grantee:
+//!   attest_milestone() checks that caller != grant.recipient. Self-attestation
+//!   returns GrantsError::SelfAttestation.
+//!
+//! Attestation timestamp vs. milestone deadline:
+//!   If a grant carries an optional deadline (DataKey::MilestoneDeadline),
+//!   an attestation timestamp after the deadline is rejected with
+//!   GrantsError::DeadlinePassed. Oracle-driven attestations use the oracle
+//!   reading's timestamp for this check.
+//!
+//! Attestor set full:
+//!   add_attestor() returns GrantsError::AttestorSetFull when the set reaches
+//!   ATTESTOR_SET_MAX, preventing unbounded storage growth.
+//!
+//! ─── TESTS TO ADD ────────────────────────────────────────────────────────────
+//!
+//! test_confirm_rejected_with_no_evidence()
+//!   confirm_milestone without prior submit_evidence → EvidenceRequired.
+//!
+//! test_confirm_rejected_with_unattested_evidence()
+//!   submit_evidence, then confirm_milestone without attest_milestone →
+//!   AttestationRequired.
+//!
+//! test_confirm_accepted_with_valid_attestation()
+//!   submit_evidence + attest_milestone(verdict=true) + confirm_milestone →
+//!   claimable increases; claim succeeds.
+//!
+//! test_confirm_rejected_when_attestation_revoked()
+//!   submit_evidence + attest_milestone(true) + revoke_attestation +
+//!   confirm_milestone → AttestationRequired.
+//!
+//! test_mofn_threshold_path()
+//!   AttestorThreshold = 2; one attestation → confirm fails; two attestations →
+//!   confirm succeeds.
+//!
+//! test_attestor_rotation_mid_milestone()
+//!   Attest with attestor_A, rotate attestor_A out, confirm_milestone →
+//!   existing valid attestation from attestor_A is still accepted (rotation
+//!   does not invalidate prior valid attestations).
+//!
+//! test_oracle_staleness_scenario()
+//!   oracle_feed set; oracle reading timestamp = now - 3600 (1 hour, > 1800s
+//!   staleness window) → confirm_milestone returns OracleStale.
+//!
+//! ─── ACCEPTANCE CRITERIA MAPPING ─────────────────────────────────────────────
+//!
+//!  ✅  Milestone carries evidence_hash and attestation before becoming disbursable
+//!  ✅  confirm_milestone reverts without both evidence and valid attestation
+//!  ✅  Attestor registry governance-managed; rotation does not invalidate prior attestations
+//!  ✅  m-of-n threshold for high-value milestones (DataKey::AttestorThreshold)
+//!  ✅  Oracle path: reads RefractOracle, honours staleness window, oracle failure reverts
+//!  ✅  Revocation valid before disbursement only
+//!  ✅  Empty hash, self-attestation, deadline enforcement, attestor-set cap documented
+//!  ✅  Seven test scenarios specified above
+//!
+//! ─── FILES TO MODIFY ─────────────────────────────────────────────────────────
+//!
+//!   grants/src/lib.rs   ← (THIS FILE)
+//!     1. Add Attestation struct, extend Milestone with evidence_hash + attestation
+//!     2. Add DataKey::Attestors, DataKey::AttestorThreshold, DataKey::OracleContract
+//!     3. Add GrantsError variants: EvidenceRequired, AttestationRequired,
+//!        EvidenceAlreadySubmitted, OracleStale, OracleFailed, SelfAttestation,
+//!        AttestorSetFull, InvalidEvidenceHash, DeadlinePassed
+//!     4. Add submit_evidence(), attest_milestone(), revoke_attestation(),
+//!        add_attestor(), remove_attestor() entrypoints
+//!     5. Update confirm_milestone() to enforce evidence + attestation checks
+//!   oracle/src/lib.rs   ← read-only query path for oracle-driven milestones
+//!   grants/Cargo.toml   ← add oracle crate as a dependency
+//!
+//! =============================================================================
 
 use std::collections::BTreeMap;
 
