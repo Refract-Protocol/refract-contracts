@@ -73,7 +73,8 @@
 //! toward the floor (1) but never to zero.
 
 #![no_std]
-#![warn(missing_docs)]
+// `missing_docs` is not enabled: #[contracttype]/#[contractimpl] generate
+// undocumented public spec items that would fail it under `-D warnings`.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
@@ -308,21 +309,6 @@ pub struct RelayerBondRecord {
     pub unstake_available_at: u64,
 }
 
-/// Oracle reading stored on-chain.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct OracleReading {
-    /// Signed integer value in 1e7 precision.
-    /// For prices: USD price * 1e7.
-    /// For percentages: percent * 1e7 (e.g. -30% = -3_000_000).
-    /// For durations: minutes.
-    pub value: i128,
-    /// Unix timestamp when the reading was captured.
-    pub timestamp: u64,
-    /// Source or provider identifier for the reading.
-    pub source: Symbol,
-}
-
 /// Structured metadata describing a feed's shape.
 ///
 /// Settable by the admin via [`RefractOracle::set_feed_metadata`].
@@ -359,17 +345,6 @@ pub enum DataKey {
     Relayers,
     /// Oracle reading mapped by feed symbol (persistent storage).
     Reading(Symbol),
-    /// Issue #95: Fallback oracle address for failover on primary staleness
-    FallbackOracle,
-    /// Issue #91: Per-relayer readings
-#[contracttype]
-pub enum DataKey {
-    /// Contract administrator address key (instance storage).
-    Admin,
-    /// List of authorized relayer addresses (instance storage).
-    Relayers,
-    /// Oracle reading mapped by feed symbol (persistent storage).
-    Reading(Symbol),                   // feed_id → OracleReading
     /// Issue #95: Fallback oracle address for failover on primary staleness
     FallbackOracle,
     /// Issue #91: Per-relayer readings for median aggregation
@@ -476,8 +451,6 @@ impl RefractOracle {
                 &DataKey::RelayerReputation(relayer.clone()),
                 &REPUTATION_INITIAL,
             );
-            env.events()
-                .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         }
         env.storage()
             .instance()
@@ -589,8 +562,8 @@ impl RefractOracle {
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
 
-        let old_wasm_hash = env.deployer().get_current_contract_wasm().unwrap_or_default();
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
 
         // Bump contract version for migration tracking
         let version: u32 = env
@@ -604,7 +577,7 @@ impl RefractOracle {
 
         env.events().publish(
             (Symbol::new(&env, "upgraded"),),
-            (old_wasm_hash, new_wasm_hash),
+            (new_wasm_hash, version + 1),
         );
         Ok(())
     }
@@ -689,7 +662,6 @@ impl RefractOracle {
         );
         Ok(())
     }
-    }
 
     // ─── Data submission ─────────────────────────────────────────────────
 
@@ -697,7 +669,8 @@ impl RefractOracle {
     /// feed_id examples: `USDC_PRICE`, `MARKET_24H_RETURN`, `XLM_TVL`, `FLIGHT_DL420`.
     ///
     /// Validates that:
-    /// 1. Caller is an authorized relayer or contract admin.
+    /// 1. Caller is an active relayer (the admin has no bypass; it must be
+    ///    queued and activated through the notice period like any relayer).
     /// 2. Timestamp is not in the future relative to the ledger time.
     /// 3. Reading is not older than [`MAX_STALENESS_SECS`].
     /// 4. Timestamp is greater than or equal to any currently stored reading for this feed.
@@ -863,7 +836,6 @@ impl RefractOracle {
         let recent_rejection_count: u32 = 0;
 
         FeedHealth {
-            feed_id,
             last_updated_at,
             active_relayer_count,
             recent_rejection_count,
@@ -909,3 +881,6 @@ impl RefractOracle {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod test;

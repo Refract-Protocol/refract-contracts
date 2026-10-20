@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::StellarAssetClient,
-    Address, Env, Symbol, Val, Vec,
+    Address, Env, IntoVal, Symbol, Val, Vec,
 };
 
 // ── Minimal stub target ───────────────────────────────────────────────────────
@@ -33,6 +33,9 @@ mod stub {
 
 use stub::StubClient;
 
+/// alice (1_000_000_000) + bob (500_000_000), minted in `make_env`.
+const TOTAL_SUPPLY: i128 = 1_500_000_000;
+
 // ── Setup helpers ─────────────────────────────────────────────────────────────
 
 fn stub_args(env: &Env, value: i128) -> Vec<Val> {
@@ -57,7 +60,8 @@ fn make_env() -> (Env, Address, Address, Address, Address, Address) {
     sac.mint(&alice, &1_000_000_000i128);
     sac.mint(&bob, &500_000_000i128);
 
-    (env, admin, token_sac.address(), alice, bob, Address::generate(&env))
+    let extra = Address::generate(&env);
+    (env, admin, token_sac.address(), alice, bob, extra)
 }
 
 fn default_config(token: &Address) -> GovernorConfig {
@@ -66,6 +70,7 @@ fn default_config(token: &Address) -> GovernorConfig {
         voting_period: 3_600,
         quorum_bps: 200,              // 2% of total supply
         proposal_threshold: 100_000_000i128,
+        total_supply: TOTAL_SUPPLY,
     }
 }
 
@@ -133,6 +138,7 @@ fn quorum_failure_is_defeated() {
         voting_period: 3_600,
         quorum_bps: 9_999,
         proposal_threshold: 100_000_000i128,
+        total_supply: TOTAL_SUPPLY,
     };
     gov.initialize(&admin, &high_quorum);
 

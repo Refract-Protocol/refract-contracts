@@ -73,45 +73,6 @@ pub enum DataKey {
     Admin,
     UsdcToken,
     PolicyRegistry, // RefractPolicyRegistry contract address
-    TotalCapital,
-    TotalCoverage, // sum of all active policy coverage amounts
-    TotalPremiums, // accumulated premiums (protocol revenue)
-    Shares(Address),
-    TotalShares,
-    Policy(u64),
-    UserPolicies(Address),
-    NextPolicyId,
-}
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    UsdcToken,
-    PolicyRegistry, // RefractPolicyRegistry contract address
-    TotalCapital,
-    TotalCoverage, // sum of all active policy coverage amounts
-    TotalPremiums, // accumulated premiums (protocol revenue)
-    Shares(Address),
-    TotalShares,
-    Policy(u64),
-    UserPolicies(Address),
-    NextPolicyId,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PoolAccounting {
-    pub total_capital: i128,
-    pub total_coverage: i128,
-    pub total_premiums: i128,
-    pub total_shares: i128,
-    pub next_policy_id: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    UsdcToken,
-    PolicyRegistry, // RefractPolicyRegistry contract address
     Accounting,     // Consolidated PoolAccounting struct
     TotalCapital,   // Legacy key for migration
     TotalCoverage,  // Legacy key for migration
@@ -121,22 +82,6 @@ pub enum DataKey {
     Policy(u64),
     UserPolicies(Address),
     NextPolicyId,   // Legacy key for migration
-    PoolConfig,
-    Initialized,
-    OracleData(CoverageType), // latest oracle reading per type
-    LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
-}
-
-// ── Errors ────────────────────────────────────────────────────────────────────
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum PoolError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    InsufficientCapacity = 4,
-    Pol
     PoolConfig,
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
@@ -346,10 +291,6 @@ impl RefractPool {
 
         let shares = Self::_calc_shares(&state, amount);
 
-        let mut acc = Self::_accounting(&env);
-        acc.total_capital += amount;
-        acc.total_shares += shares;
-        Self::_save_accounting(&env, &acc);
         let mut user_shares: i128 = env
             .storage()
             .persistent()
@@ -513,9 +454,6 @@ impl RefractPool {
         env.storage()
             .persistent()
             .set(&DataKey::Policy(id), &policy);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextPolicyId, &(id + 1));
 
         let mut user_policies: Vec<u64> = env
             .storage()
@@ -962,11 +900,9 @@ impl RefractPool {
     // to assert premium >= exact rational premium and shares/usdc_out <=
     // exact rational value.
     //
-    // Blocker: since #174, `_calc_shares`, `_quote_withdrawal` and
-    // `_check_coverage_capacity` are called with `&PoolState` but still take
-    // `&Env`, so this crate does not compile. Finish #174 first (read from
-    // the snapshot, not storage). oracle/ and policy/ do no value-bearing
-    // division; that gets confirmed in ROUNDING.md.
+    // `_calc_shares`, `_quote_withdrawal` and `_check_coverage_capacity`
+    // read from the `PoolState` snapshot (#174). oracle/ and policy/ do no
+    // value-bearing division; that gets confirmed in ROUNDING.md.
     //
     // ── Issue #129 — bound UserPolicies growth (plan) ────────────────────────
     //
@@ -985,13 +921,7 @@ impl RefractPool {
     //  5. RESOURCE_LIMITS.md documents the numbers and methodology, and links
     //     #59 (chunked per-holder index) as the long-term fix and #25.
 
-    pub fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
-        // Optimized deferred-division formulation:
-        // Premium = (coverage × base_rate × duration_days × risk_multiplier) / (BPS × 365 × 100)
-        // Grouping multiplications prior to a single final division eliminates compounding
-        // truncation loss from sequential divisions while provably remaining within i128 bounds
-        // (max theoretical numerator: 50,000 * 1e7 * 10,000 * 365 * 300 = 5.475e
-    pub fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
+    fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
         // Optimized deferred-division formulation:
         // Premium = (coverage × base_rate × duration_days × risk_multiplier) / (BPS × 365 × 100)
         // Grouping multiplications prior to a single final division eliminates compounding
@@ -1012,21 +942,11 @@ impl RefractPool {
         numerator / denominator
     }
 
-    fn _calc_shares(env: &Env, amount: i128) -> i128 {
-        let total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let total_shares: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalShares)
-            .unwrap_or(0);
-        if total_shares == 0 || total_capital == 0 {
+    fn _calc_shares(state: &PoolState, amount: i128) -> i128 {
+        if state.total_shares == 0 || state.total_capital == 0 {
             amount // 1:1 initial
         } else {
-            amount * total_shares / total_capital
+            amount * state.total_shares / state.total_capital
         }
     }
 
@@ -1035,11 +955,8 @@ impl RefractPool {
     /// against config.min_coverage/max_coverage and the pool's remaining
     /// underwriting capacity, returning the resulting total_coverage (which
     /// buy_policy() needs afterward to update storage) on success.
-    fn _check_coverage_capacity(
-        env: &Env,
-        config: &PoolConfig,
-        coverage_amount: i128,
-    ) -> Result<i128, PoolError> {
+    fn _check_coverage_capacity(state: &PoolState, coverage_amount: i128) -> Result<i128, PoolError> {
+        let config = &state.config;
         if coverage_amount < config.min_coverage {
             return Err(PoolError::InsufficientCapacity);
         }
@@ -1047,11 +964,9 @@ impl RefractPool {
             return Err(PoolError::InsufficientCapacity);
         }
 
-        let acc = Self::_accounting(env);
-        let total_capital = acc.total_capital;
-        let total_coverage = acc.total_coverage;
-        let new_coverage = total_coverage + coverage_amount;
-        let max_coverage_capacity = total_capital * (config.max_utilization_bps as i128) / BPS;
+        let new_coverage = state.total_coverage + coverage_amount;
+        let max_coverage_capacity =
+            state.total_capital * (config.max_utilization_bps as i128) / BPS;
 
         if new_coverage > max_coverage_capacity {
             return Err(PoolError::InsufficientCapacity);
@@ -1062,12 +977,11 @@ impl RefractPool {
 
     /// Shared by quote_withdrawal() and withdraw_capital() so the preview
     /// and the real withdrawal path can never silently diverge.
-    fn _quote_withdrawal(env: &Env, shares: i128) -> Result<i128, PoolError> {
-        let acc = Self::_accounting(env);
-        let total_capital = acc.total_capital;
-        let total_coverage = acc.total_coverage;
-        let total_shares = acc.total_shares;
-        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+    fn _quote_withdrawal(state: &PoolState, shares: i128) -> Result<i128, PoolError> {
+        let total_capital = state.total_capital;
+        let total_coverage = state.total_coverage;
+        let total_shares = state.total_shares;
+        let config = &state.config;
 
         // No caller can ever hold more than total_shares (provide_capital/
         // withdraw_capital maintain that invariant), so a quote for more
@@ -1123,7 +1037,7 @@ impl RefractPool {
         }
         Ok(())
     }
-    pub fn _accounting(env: &Env) -> PoolAccounting {
+    fn _accounting(env: &Env) -> PoolAccounting {
         if let Some(acc) = env.storage().instance().get(&DataKey::Accounting) {
             acc
         } else {
@@ -1137,7 +1051,7 @@ impl RefractPool {
         }
     }
 
-    pub fn _save_accounting(env: &Env, acc: &PoolAccounting) {
+    fn _save_accounting(env: &Env, acc: &PoolAccounting) {
         env.storage().instance().set(&DataKey::Accounting, acc);
     }
 
@@ -1172,27 +1086,6 @@ impl RefractPool {
         env.storage().instance().remove(&DataKey::TotalShares);
         env.storage().instance().remove(&DataKey::NextPolicyId);
 
-        env.events().publish((symbol_short!("MIGRATE"),), (admin,));
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod test;
-
-#[cfg(test)]
-mod pricing_proptest;
-
-#[cfg(test)]
-mod wasm_test;
-
-}
-
-#[cfg(test)]
-mod test;
-
-#[cfg(test)]
-mod pricing_proptest;
         env.events().publish((symbol_short!("MIGRATE"),), (admin,));
         Ok(())
     }

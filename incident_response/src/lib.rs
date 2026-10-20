@@ -91,7 +91,12 @@ impl RefractIncidentResponse {
 
     /// Execute an atomic emergency lockdown across pool, registry, and oracle.
     /// Callable only by the authorized guardian or admin.
-    /// Rotates the admin key of all specified contracts in a single atomic transaction.
+    ///
+    /// In one transaction this rotates the pool admin (one-step `set_admin`)
+    /// and proposes `new_admin` on the registry and oracle, which use a
+    /// two-step admin transfer. `new_admin` must then call `accept_admin` on
+    /// the registry and oracle to take control; until then the compromised
+    /// key is still their admin, so accept immediately.
     pub fn emergency_lockdown(
         env: Env,
         caller: Address,
@@ -117,23 +122,23 @@ impl RefractIncidentResponse {
         }
 
         // 1. Rotate Pool admin
-        let _ = env.invoke_contract::<()>(
+        env.invoke_contract::<()>(
             &pool,
             &Symbol::new(&env, "set_admin"),
             Vec::from_array(&env, [caller.into_val(&env), new_admin.into_val(&env)]),
         );
 
-        // 2. Rotate Registry admin
-        let _ = env.invoke_contract::<()>(
+        // 2. Propose the new Registry admin (two-step transfer)
+        env.invoke_contract::<()>(
             &registry,
-            &Symbol::new(&env, "set_admin"),
+            &Symbol::new(&env, "propose_admin"),
             Vec::from_array(&env, [caller.into_val(&env), new_admin.into_val(&env)]),
         );
 
-        // 3. Rotate Oracle admin
-        let _ = env.invoke_contract::<()>(
+        // 3. Propose the new Oracle admin (two-step transfer)
+        env.invoke_contract::<()>(
             &oracle,
-            &Symbol::new(&env, "set_admin"),
+            &Symbol::new(&env, "propose_admin"),
             Vec::from_array(&env, [new_admin.into_val(&env)]),
         );
 
@@ -145,7 +150,11 @@ impl RefractIncidentResponse {
         Ok(())
     }
 
-    /// Atomically migrate the active pool pointer in the policy registry to a clean patched pool.
+    /// Propose repointing the policy registry to a clean patched pool.
+    ///
+    /// The registry enforces its own change delay, so this only proposes:
+    /// the registry admin calls `confirm_pool_contract` once the delay has
+    /// elapsed (immediately when the delay is zero).
     pub fn migrate_pool(
         env: Env,
         caller: Address,
@@ -168,10 +177,10 @@ impl RefractIncidentResponse {
             return Err(IncidentError::Unauthorized);
         }
 
-        // Repoint registry
-        let _ = env.invoke_contract::<()>(
+        // Propose the registry repoint
+        env.invoke_contract::<()>(
             &registry,
-            &Symbol::new(&env, "set_pool_contract"),
+            &Symbol::new(&env, "propose_pool_contract"),
             Vec::from_array(&env, [caller.into_val(&env), new_pool.into_val(&env)]),
         );
 

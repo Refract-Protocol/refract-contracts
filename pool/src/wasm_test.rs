@@ -1,14 +1,17 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
-use refract_oracle::RefractOracleClient;
 use refract_policy::RefractPolicyRegistryClient;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    token::{Client as TokenClient, StellarAssetClient},
-    Address, Bytes, Env, Symbol,
+    token::StellarAssetClient,
+    Address, Bytes, Env,
 };
 use std::fs;
+use std::format;
+use std::eprintln;
 use std::path::Path;
 
 const ONE_USDC: i128 = 10_000_000;
@@ -36,29 +39,22 @@ fn find_wasm(name: &str) -> Option<std::vec::Vec<u8>> {
 struct WasmFixture<'a> {
     env: Env,
     pool: RefractPoolClient<'a>,
-    registry: RefractPolicyRegistryClient<'a>,
-    oracle: RefractOracleClient<'a>,
-    usdc: TokenClient<'a>,
     usdc_admin: StellarAssetClient<'a>,
     admin: Address,
-    relayer: Address,
 }
 
 fn setup_wasm<'a>(env: &'a Env) -> Option<WasmFixture<'a>> {
     let pool_wasm = find_wasm("refract_pool")?;
     let policy_wasm = find_wasm("refract_policy")?;
-    let oracle_wasm = find_wasm("refract_oracle")?;
 
     env.mock_all_auths();
 
     let admin = Address::generate(env);
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
-    let usdc = TokenClient::new(env, &sac.address());
     let usdc_admin = StellarAssetClient::new(env, &sac.address());
 
     let pool_wasm_bytes = Bytes::from_slice(env, &pool_wasm);
     let policy_wasm_bytes = Bytes::from_slice(env, &policy_wasm);
-    let oracle_wasm_bytes = Bytes::from_slice(env, &oracle_wasm);
 
     let pool_id = env.register_contract_wasm(None, pool_wasm_bytes);
     let pool = RefractPoolClient::new(env, &pool_id);
@@ -66,25 +62,13 @@ fn setup_wasm<'a>(env: &'a Env) -> Option<WasmFixture<'a>> {
     let registry_id = env.register_contract_wasm(None, policy_wasm_bytes);
     let registry = RefractPolicyRegistryClient::new(env, &registry_id);
 
-    let oracle_id = env.register_contract_wasm(None, oracle_wasm_bytes);
-    let oracle = RefractOracleClient::new(env, &oracle_id);
-
     registry.initialize(&admin, &pool_id);
     pool.initialize(&admin, &sac.address(), &registry_id);
-    pool.set_oracle(&admin, &oracle_id);
-
-    let relayer = Address::generate(env);
-    oracle.add_relayer(&admin, &relayer);
-
     Some(WasmFixture {
         env: env.clone(),
         pool,
-        registry,
-        oracle,
-        usdc,
         usdc_admin,
         admin,
-        relayer,
     })
 }
 
@@ -130,14 +114,11 @@ fn test_wasm_deployed_artifact_lifecycle() {
     assert_eq!(policy.status, PolicyStatus::Active);
 
     // 4. Update Oracle & Process Claim
-    let feed = Symbol::new(&f.env, "USDC_PRICE");
-    let now = f.env.ledger().timestamp();
-    f.oracle.submit(
-        &f.relayer,
-        &feed,
+    // The pool reads admin-pushed oracle data (update_oracle).
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
         &9_400_000, // Depegged below trigger threshold ($0.95)
-        &now,
-        &Symbol::new(&f.env, "chainlink"),
     );
 
     f.pool.process_claim(&policy_id);

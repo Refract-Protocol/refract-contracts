@@ -107,6 +107,11 @@ fn tabletop_incident_simulation_atomic_lockdown_beats_adversary() {
     );
     assert_eq!(lockdown_res, ());
 
+    // Registry and oracle use two-step admin transfer: the safe admin
+    // accepts right away to complete the handover.
+    h.registry.accept_admin(&h.new_safe_admin);
+    h.oracle.accept_admin(&h.new_safe_admin);
+
     // ── Phase 3: Tabletop Invariant Verification ───────────────────────────
     // 1. All 3 contracts immediately reflect the safe new admin
     assert_eq!(h.pool.admin(), Some(h.new_safe_admin.clone()));
@@ -130,12 +135,13 @@ fn tabletop_incident_simulation_atomic_lockdown_beats_adversary() {
     assert_eq!(pool_admin_attack, Err(Ok(PoolError::Unauthorized)));
 
     // C: Try to rotate registry admin back to adversary
-    let reg_admin_attack = h.registry.try_set_admin(&h.admin, &h.adversary);
+    let reg_admin_attack = h.registry.try_propose_admin(&h.admin, &h.adversary);
     assert_eq!(reg_admin_attack, Err(Ok(refract_policy::RegistryError::Unauthorized)));
 
     // D: Try to manipulate oracle
-    let oracle_admin_attack = h.oracle.try_set_admin(&h.adversary);
-    // Old admin can no longer set admin on oracle
+    // mock_all_auths would satisfy the oracle's admin auth, so just check a
+    // proposal never changes the active admin by itself.
+    let _ = h.oracle.try_propose_admin(&h.adversary);
     assert_eq!(h.oracle.admin(), Some(h.new_safe_admin.clone()));
 
     // 3. The new safe admin has full operational authority
@@ -155,6 +161,11 @@ fn tabletop_incident_simulation_pool_migration() {
         &patched_pool,
     );
     assert_eq!(migrate_res, ());
+
+    // The repoint is pending until the registry admin confirms it (the
+    // registry's change delay defaults to zero).
+    assert_eq!(h.registry.pool_contract(), Some(h.pool.address.clone()));
+    h.registry.confirm_pool_contract(&h.admin);
 
     // Verify registry pool contract is repointed
     assert_eq!(h.registry.pool_contract(), Some(patched_pool));

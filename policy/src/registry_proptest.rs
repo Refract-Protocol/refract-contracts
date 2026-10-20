@@ -7,34 +7,52 @@ use ::proptest::prelude::*;
 use ::proptest::test_runner::TestRunner;
 use soroban_sdk::testutils::Address as _;
 
+/// Fresh registry per proptest case so policy ids never collide across cases.
+fn fresh(env: &Env) -> (RefractPolicyRegistryClient<'_>, Address) {
+    env.mock_all_auths();
+    let admin = Address::generate(env);
+    let pool = Address::generate(env);
+    let id = env.register_contract(None, RefractPolicyRegistry);
+    let registry = RefractPolicyRegistryClient::new(env, &id);
+    registry.initialize(&admin, &pool);
+    (registry, pool)
+}
+
+fn stat(env: &Env, registry: &RefractPolicyRegistryClient, name: &str) -> i128 {
+    registry
+        .get_stats()
+        .get(Symbol::new(env, name))
+        .unwrap_or_default()
+}
+
+fn reg(policy_id: u64, holder: &Address, coverage_type: CoverageType) -> PolicyRegistration {
+    PolicyRegistration {
+        policy_id,
+        holder: holder.clone(),
+        coverage_type,
+        coverage_amount: 10_000_000,
+        premium: 100_000,
+        expires_at: 10_000_000,
+    }
+}
+
 #[test]
 fn total_and_active_policy_counters_invariants() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let pool = Address::generate(&env);
-    let id = env.register_contract(None, RefractPolicyRegistry);
-    let registry = RefractPolicyRegistryClient::new(&env, &id);
-    registry.initialize(&admin, &pool);
-
-    let cases = (1u32..20u32,);
     TestRunner::default()
-        .run(&cases, |(num_ops,)| {
+        .run(&(1u32..20u32,), |(num_ops,)| {
+            let env = Env::default();
+            let (registry, pool) = fresh(&env);
             let holder = Address::generate(&env);
             for i in 1..=num_ops {
                 let pid = 1000 + (i as u64);
-                let reg = PolicyRegistration {
-                    policy_id: pid,
-                    holder: holder.clone(),
-                    coverage_type: CoverageType::StablecoinDepeg,
-                    coverage_amount: 10_000_000,
-                    premium: 100_000,
-                    expires_at: 10_000_000,
-                };
-                registry.register_policy(&pool, &reg);
-                let stats = registry.get_stats();
-                prop_assert!(stats.total_policies >= stats.active_policies);
+                registry.register_policy(&pool, &reg(pid, &holder, CoverageType::StablecoinDepeg));
+                if i % 2 == 0 {
+                    registry.deactivate_policy(&pool, &pid);
+                }
+                let total = stat(&env, &registry, "total_policies");
+                let active = stat(&env, &registry, "active_policies");
+                prop_assert!(total >= active);
+                prop_assert_eq!(total, i as i128);
             }
             Ok(())
         })
@@ -43,32 +61,15 @@ fn total_and_active_policy_counters_invariants() {
 
 #[test]
 fn per_holder_indexing_invariants() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let pool = Address::generate(&env);
-    let id = env.register_contract(None, RefractPolicyRegistry);
-    let registry = RefractPolicyRegistryClient::new(&env, &id);
-    registry.initialize(&admin, &pool);
-
-    let holder_a = Address::generate(&env);
-    let holder_b = Address::generate(&env);
-
-    let cases = (1u32..10u32,);
     TestRunner::default()
-        .run(&cases, |(count,)| {
+        .run(&(1u32..10u32,), |(count,)| {
+            let env = Env::default();
+            let (registry, pool) = fresh(&env);
+            let holder_a = Address::generate(&env);
+            let holder_b = Address::generate(&env);
             for i in 1..=count {
                 let pid_a = 5000 + (i as u64);
-                let reg_a = PolicyRegistration {
-                    policy_id: pid_a,
-                    holder: holder_a.clone(),
-                    coverage_type: CoverageType::FlightDelay,
-                    coverage_amount: 10_000_000,
-                    premium: 100_000,
-                    expires_at: 10_000_000,
-                };
-                registry.register_policy(&pool, &reg_a);
+                registry.register_policy(&pool, &reg(pid_a, &holder_a, CoverageType::FlightDelay));
 
                 let active_b = registry.get_holder_active_policy_ids(&holder_b);
                 prop_assert!(!active_b.contains(pid_a));
@@ -77,6 +78,7 @@ fn per_holder_indexing_invariants() {
                 let active_a = registry.get_holder_active_policy_ids(&holder_a);
                 prop_assert!(!active_a.contains(pid_a));
             }
+            prop_assert_eq!(registry.get_holder_policy_ids(&holder_a).len(), count);
             Ok(())
         })
         .unwrap();
@@ -84,39 +86,24 @@ fn per_holder_indexing_invariants() {
 
 #[test]
 fn arbitrary_interleaving_deactivation_decrement_invariants() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let pool = Address::generate(&env);
-    let id = env.register_contract(None, RefractPolicyRegistry);
-    let registry = RefractPolicyRegistryClient::new(&env, &id);
-    registry.initialize(&admin, &pool);
-
-    let cases = (1u32..15u32,);
     TestRunner::default()
-        .run(&cases, |(batch_size,)| {
+        .run(&(1u32..15u32,), |(batch_size,)| {
+            let env = Env::default();
+            let (registry, pool) = fresh(&env);
             let holder = Address::generate(&env);
             for i in 1..=batch_size {
                 let pid = 20_000 + (i as u64);
-                let reg = PolicyRegistration {
-                    policy_id: pid,
-                    holder: holder.clone(),
-                    coverage_type: CoverageType::MarketCrash,
-                    coverage_amount: 50_000_000,
-                    premium: 500_000,
-                    expires_at: 20_000_000,
-                };
-                registry.register_policy(&pool, &reg);
+                registry.register_policy(&pool, &reg(pid, &holder, CoverageType::MarketCrash));
             }
-            let active_before = registry.get_stats().active_policies;
-            prop_assert_eq!(active_before, batch_size as u64);
+            prop_assert_eq!(stat(&env, &registry, "active_policies"), batch_size as i128);
 
             for i in 1..=batch_size {
                 let pid = 20_000 + (i as u64);
                 registry.deactivate_policy(&pool, &pid);
-                let active_now = registry.get_stats().active_policies;
-                prop_assert_eq!(active_now, (batch_size - i) as u64);
+                prop_assert_eq!(
+                    stat(&env, &registry, "active_policies"),
+                    (batch_size - i) as i128
+                );
             }
             Ok(())
         })
@@ -126,19 +113,12 @@ fn arbitrary_interleaving_deactivation_decrement_invariants() {
 #[test]
 fn non_existent_policy_lookup_invariants() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let pool = Address::generate(&env);
-    let id = env.register_contract(None, RefractPolicyRegistry);
-    let registry = RefractPolicyRegistryClient::new(&env, &id);
-    registry.initialize(&admin, &pool);
-
-    let cases = (100_000u64..100_050u64,);
+    let (registry, _pool) = fresh(&env);
+    env.budget().reset_unlimited();
     TestRunner::default()
-        .run(&cases, |(non_existent_id,)| {
-            let record = registry.get_policy(&non_existent_id);
-            prop_assert!(record.is_none());
+        .run(&(100_000u64..100_050u64,), |(non_existent_id,)| {
+            let record = registry.try_get_policy(&non_existent_id);
+            prop_assert_eq!(record, Err(Ok(RegistryError::PolicyNotFound)));
             Ok(())
         })
         .unwrap();

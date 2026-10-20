@@ -52,6 +52,7 @@
 //! -----------------------------------------------
 //! Add the following entry point to #[contractimpl]:
 //!
+//! ```text
 //!   /// Veto a queued action before it is executed.
 //!   ///
 //!   /// Only callable by the registered SecurityCouncil address.
@@ -102,6 +103,7 @@
 //!       );
 //!       Ok(())
 //!   }
+//! ```
 //!
 //! Step 3 — Security council blast-radius constraints
 //! ---------------------------------------------------
@@ -134,12 +136,14 @@
 //!   can only cancel; it cannot queue a "repoint council" action.
 //!
 //! Optional reason parameter:
+//! ```text
 //!   The issue notes an optional `reason: Symbol` parameter is "reasonable,
 //!   low-cost... but not required." Include it as Option<Symbol> for
 //!   auditability without making it mandatory:
 //!
 //!     pub fn veto(env: Env, caller: Address, proposal_id: u64,
 //!                 reason: Option<Symbol>) -> Result<(), TimelockError>
+//! ```
 //!
 //! ─── TESTS TO ADD ────────────────────────────────────────────────────────────
 //!

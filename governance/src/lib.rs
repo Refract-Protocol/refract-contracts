@@ -13,7 +13,7 @@
 //!   voting power to a delegatee, which cannot itself have delegated onward.
 //! * **Proposal threshold** — a minimum token balance required to create a
 //!   proposal, preventing spam.
-//! * **Quorum** — `quorum_bps` of `total_supply` (from the token) must
+//! * **Quorum** — `quorum_bps` of the configured `total_supply` must
 //!   participate (for + against) for the proposal to be valid.
 //! * **Execution** — after the voting period ends, a successful proposal
 //!   is forwarded to the timelock via `queue`, then the timelock executes
@@ -31,7 +31,8 @@
 
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Map, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol, Val,
+    Vec,
 };
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -120,6 +121,10 @@ pub struct GovernorConfig {
     pub quorum_bps: u32,
     /// Minimum token balance required to submit a proposal.
     pub proposal_threshold: i128,
+    /// Total voting supply used as the quorum base. SEP-41 tokens do not
+    /// expose a total supply, so it is configured here and kept current via
+    /// `set_config`.
+    pub total_supply: i128,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -154,34 +159,6 @@ pub enum DataKey {
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
-#[contract]
-pub struct RefractGovernor;
-
-#[contractimpl]
-impl RefractGovernor {
-    // TODO (#124): Implement initialize, propose, vote, execute, and
-    // cancel entry points per the design documentation above.
-    //
-    // Start with the ProposalType enum, DataKey enum, and Proposal struct,
-    // then implement propose() → vote() → execute() in that order.
-    // The NewCoverageType execution sequence (Steps 1-4) belongs in a
-    // private _execute_new_coverage_type() helper
-
-#[contract]
-pub struct RefractGovernor;
-
-#[contractimpl]
-impl RefractGovernor {
-    pub fn initialize(env: Env, admin: Address, token: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Token, &token);
-        env.storage().instance().set(&DataKey::ProposalCount, &0u64);
-    }
-
-    pub fn propose(env: E
 #[contract]
 pub struct RefractGovernor;
 
@@ -284,6 +261,7 @@ impl RefractGovernor {
             votes_against: 0,
             status: ProposalStatus::Active,
             voters: Vec::new(&env),
+            snapshot_ledger: env.ledger().sequence(),
         };
 
         env.storage()
@@ -389,11 +367,9 @@ impl RefractGovernor {
         // Total participating weight.
         let total_votes = proposal.votes_for + proposal.votes_against;
 
-        // Total token supply for quorum calculation.
-        let total_supply = token::Client::new(&env, &config.token).total_supply();
-
-        // Quorum: total_votes must be >= quorum_bps/10000 of total_supply.
-        let quorum_required = total_supply * (config.quorum_bps as i128) / 10_000;
+        // Quorum: total_votes must be >= quorum_bps/10000 of the configured
+        // total voting supply.
+        let quorum_required = config.total_supply * (config.quorum_bps as i128) / 10_000;
         let quorum_met = total_votes >= quorum_required;
         let majority_for = proposal.votes_for > proposal.votes_against;
 
