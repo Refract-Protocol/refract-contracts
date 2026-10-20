@@ -71,7 +71,7 @@ impl RefractBountyEscrow {
         }
         let token = Self::token(&env)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
-        let balance = Self::balance(&env)?;
+        let balance = Self::get_balance(&env)?;
         env.storage().instance().set(&DataKey::Balance, &(balance + amount));
         Ok(())
     }
@@ -88,7 +88,7 @@ impl RefractBountyEscrow {
         report_hash: BytesN<32>,
     ) -> Result<(), BountyError> {
         caller.require_auth();
-        let governance = Self::governance(&env)?;
+        let governance = Self::get_governance(&env)?;
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
@@ -98,7 +98,7 @@ impl RefractBountyEscrow {
         if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
             return Err(BountyError::DuplicateReport);
         }
-        let balance = Self::balance(&env)?;
+        let balance = Self::get_balance(&env)?;
         if amount > balance {
             return Err(BountyError::InsufficientBalance);
         }
@@ -119,12 +119,18 @@ impl RefractBountyEscrow {
 
     /// Current funds held in escrow.
     pub fn balance(env: Env) -> Result<i128, BountyError> {
-        Self::balance(&env)
+        env.storage()
+            .instance()
+            .get(&DataKey::Balance)
+            .ok_or(BountyError::NotInitialized)
     }
 
     /// The governance/timelock address authorized to award payouts.
     pub fn governance(env: Env) -> Result<Address, BountyError> {
-        Self::governance(&env)
+        env.storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(BountyError::NotInitialized)
     }
 
     /// Immutable record of a rewarded disclosure, if any.
@@ -132,7 +138,7 @@ impl RefractBountyEscrow {
         env.storage().persistent().get(&DataKey::Award(report_hash))
     }
 
-    fn governance(env: &Env) -> Result<Address, BountyError> {
+    fn get_governance(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Governance)
@@ -146,7 +152,7 @@ impl RefractBountyEscrow {
             .ok_or(BountyError::NotInitialized)
     }
 
-    fn balance(env: &Env) -> Result<i128, BountyError> {
+    fn get_balance(env: &Env) -> Result<i128, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Balance)

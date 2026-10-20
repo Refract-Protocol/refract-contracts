@@ -307,22 +307,6 @@ pub struct RelayerBondRecord {
     /// Timestamp after which relayer can unstake
     pub unstake_available_at: u64,
 }
-
-/// Oracle reading stored on-chain.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct OracleReading {
-    /// Signed integer value in 1e7 precision.
-    /// For prices: USD price * 1e7.
-    /// For percentages: percent * 1e7 (e.g. -30% = -3_000_000).
-    /// For durations: minutes.
-    pub value: i128,
-    /// Unix timestamp when the reading was captured.
-    pub timestamp: u64,
-    /// Source or provider identifier for the reading.
-    pub source: Symbol,
-}
-
 /// Structured metadata describing a feed's shape.
 ///
 /// Settable by the admin via [`RefractOracle::set_feed_metadata`].
@@ -351,18 +335,6 @@ pub struct FeedMetadata {
     pub expected_cadence_secs: u64,
 }
 
-#[contracttype]
-pub enum DataKey {
-    /// Contract administrator address key (instance storage).
-    Admin,
-    /// List of authorized relayer addresses (instance storage).
-    Relayers,
-    /// Oracle reading mapped by feed symbol (persistent storage).
-    Reading(Symbol),
-    /// Issue #95: Fallback oracle address for failover on primary staleness
-    FallbackOracle,
-    /// Issue #91: Per-relayer readings
-#[contracttype]
 pub enum DataKey {
     /// Contract administrator address key (instance storage).
     Admin,
@@ -688,7 +660,6 @@ impl RefractOracle {
             (delta, updated),
         );
         Ok(())
-    }
     }
 
     // ─── Data submission ─────────────────────────────────────────────────
