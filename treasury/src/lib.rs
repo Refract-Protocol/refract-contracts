@@ -2,6 +2,8 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
+pub mod reserve;
+
 /// Storage keys for the treasury contract.
 #[contracttype]
 #[derive(Clone)]
