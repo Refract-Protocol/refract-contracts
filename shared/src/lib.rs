@@ -4,6 +4,7 @@
 //! directly. Contracts map their own address type onto the `u64` handles used
 //! here.
 
+pub mod facility;
 pub mod guardians;
 pub mod loss_event;
 pub mod withdrawal_queue;
