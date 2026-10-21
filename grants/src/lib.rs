@@ -24,6 +24,7 @@
 //! mechanics once a milestone is confirmed on-chain.
 
 pub mod amounts;
+pub mod programs;
 
 use std::collections::BTreeMap;
 
