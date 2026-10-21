@@ -197,6 +197,20 @@ pub enum TimelockError {
     NotReady = 6,
     /// The operation has already been executed or cancelled.
     AlreadyDone = 7,
+    InvalidKeeperConfig = 8,
+    KeeperRewardExceeded = 9,
+    Overflow = 10,
+}
+
+/// Capped keeper incentive for permissionless `execute_due`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KeeperConfig {
+    pub reward_per_call: i128,
+    pub cap_per_epoch: i128,
+    pub epoch_len_secs: u64,
+    pub epoch_start: u64,
+    pub epoch_spent: i128,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -233,6 +247,7 @@ pub enum DataKey {
     MinDelay,
     NextId,
     Operation(u64),
+    Keeper,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -411,6 +426,150 @@ impl RefractTimelock {
     /// Fetch a queued operation by id.
     pub fn get_operation(env: Env, id: u64) -> Option<TimelockOperation> {
         env.storage().persistent().get(&DataKey::Operation(id))
+    }
+
+    /// Count of due (pending, `eta <= now`) operations. View for keepers.
+    pub fn due_count(env: Env) -> u64 {
+        let next: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let mut count: u64 = 0;
+        let mut id: u64 = 0;
+        while id < next {
+            if let Some(op) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Operation(id))
+            {
+                let op: TimelockOperation = op;
+                if op.status == OperationStatus::Pending && now >= op.eta {
+                    count += 1;
+                }
+            }
+            id += 1;
+        }
+        count
+    }
+
+    /// Configure the capped keeper reward. Admin-only. Rewards are
+    /// accounting-only here; the treasury keeper budget is the funding
+    /// source — this cap bounds how much a single `execute_due` sweep may
+    /// claim per epoch.
+    pub fn set_keeper_config(
+        env: Env,
+        reward_per_call: i128,
+        cap_per_epoch: i128,
+        epoch_len_secs: u64,
+    ) -> Result<(), TimelockError> {
+        Self::require_admin(&env)?;
+        if reward_per_call < 0 || cap_per_epoch < 0 || epoch_len_secs == 0 {
+            return Err(TimelockError::InvalidKeeperConfig);
+        }
+        env.storage().instance().set(
+            &DataKey::Keeper,
+            &KeeperConfig {
+                reward_per_call,
+                cap_per_epoch,
+                epoch_len_secs,
+                epoch_start: env.ledger().timestamp(),
+                epoch_spent: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Permissionless keeper sweep: executes every due operation in id order
+    /// and returns `(executed, failed, keeper_reward)`. A failing target is
+    /// left `Pending` for retry (mirroring `execute`) and counted as failed
+    /// without aborting the sweep. The reward is epoch-capped and never
+    /// reverts the sweep when exhausted (keeper simply earns 0).
+    pub fn execute_due(env: Env, keeper: Address) -> (u64, u64, i128) {
+        keeper.require_auth();
+        let next: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let mut executed: u64 = 0;
+        let mut failed: u64 = 0;
+        let mut id: u64 = 0;
+        while id < next {
+            if let Some(mut op) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Operation(id))
+            {
+                let mut op: TimelockOperation = op;
+                if op.status == OperationStatus::Pending && now >= op.eta {
+                    op.status = OperationStatus::Executed;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Operation(id), &op);
+                    let result = env.try_invoke_contract::<Val, soroban_sdk::InvokeError>(
+                        &op.target,
+                        &op.function,
+                        op.args.clone(),
+                    );
+                    match result {
+                        Ok(_) => {
+                            executed += 1;
+                            env.events().publish(
+                                (Symbol::new(&env, "tl_executed"), id),
+                                (),
+                            );
+                        }
+                        Err(_) => {
+                            op.status = OperationStatus::Pending;
+                            env.storage()
+                                .persistent()
+                                .set(&DataKey::Operation(id), &op);
+                            failed += 1;
+                        }
+                    }
+                }
+            }
+            id += 1;
+        }
+        let reward = Self::settle_keeper_epoch(&env, executed);
+        env.events().publish(
+            (Symbol::new(&env, "keeper"),),
+            (keeper, executed, failed, reward),
+        );
+        (executed, failed, reward)
+    }
+
+    fn settle_keeper_epoch(env: &Env, executed: u64) -> i128 {
+        let mut cfg: KeeperConfig = env.storage().instance().get(&DataKey::Keeper).unwrap_or(
+            KeeperConfig {
+                reward_per_call: 0,
+                cap_per_epoch: 0,
+                epoch_len_secs: 86_400,
+                epoch_start: env.ledger().timestamp(),
+                epoch_spent: 0,
+            },
+        );
+        let now = env.ledger().timestamp();
+        if now >= cfg.epoch_start + cfg.epoch_len_secs {
+            cfg.epoch_start = now;
+            cfg.epoch_spent = 0;
+        }
+        if executed == 0 || cfg.reward_per_call <= 0 {
+            env.storage().instance().set(&DataKey::Keeper, &cfg);
+            return 0;
+        }
+        let due = (executed as i128)
+            .checked_mul(cfg.reward_per_call)
+            .unwrap_or(i128::MAX);
+        let room = cfg.cap_per_epoch - cfg.epoch_spent;
+        let reward = if due < room { due } else { room };
+        let reward = if reward < 0 { 0 } else { reward };
+        cfg.epoch_spent += reward;
+        env.storage().instance().set(&DataKey::Keeper, &cfg);
+        reward
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────

@@ -84,6 +84,47 @@ pub struct Grant {
     pub claimable: i128,
 }
 
+/// A single balanced double-entry posting for every grant movement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalEntry {
+    pub seq: u64,
+    pub debit: &'static str,
+    pub credit: &'static str,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Risk-guardian breaker watching oracle staleness and depeg bands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardianConfig {
+    pub max_staleness_secs: u64,
+    pub depeg_bps: u32,
+    pub peg_price: i128,
+    pub last_price: i128,
+    pub last_update: u64,
+    pub payouts_paused: bool,
+}
+
+/// Capped keeper incentive for permissionless `execute_due`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeeperConfig {
+    pub reward_per_call: i128,
+    pub reward_cap_per_epoch: i128,
+    pub epoch_len_secs: u64,
+    pub epoch_start: u64,
+    pub epoch_spent: i128,
+}
+
+/// Committed-but-undrawn capital backing a grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantReservation {
+    pub id: u64,
+    pub amount: i128,
+    pub drawn: i128,
+    pub released: bool,
+    pub purpose: &'static str,
+}
+
 /// Milestone-based community grants disbursement contract.
 #[derive(Debug, Clone)]
 pub struct RefractGrants {
@@ -94,6 +135,18 @@ pub struct RefractGrants {
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Append-only balanced journal (never truncated).
+    journal: Vec<JournalEntry>,
+    /// Guardian breaker state (`None` until configured).
+    guardian: Option<GuardianConfig>,
+    /// Keeper reward state.
+    keeper: KeeperConfig,
+    /// Treasury reservations noted by this contract.
+    reservations: BTreeMap<u64, GrantReservation>,
+    /// Currently noted treasury reservation, if any.
+    active_reservation: Option<(u64, i128)>,
+    /// Logical clock used for journal timestamps in this off-ledger model.
+    clock: u64,
 }
 
 impl RefractGrants {
@@ -103,6 +156,18 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            journal: Vec::new(),
+            guardian: None,
+            keeper: KeeperConfig {
+                reward_per_call: 0,
+                reward_cap_per_epoch: 0,
+                epoch_len_secs: 86_400,
+                epoch_start: 0,
+                epoch_spent: 0,
+            },
+            reservations: BTreeMap::new(),
+            active_reservation: None,
+            clock: 0,
         }
     }
 
@@ -173,6 +238,7 @@ impl RefractGrants {
                 claimable: 0,
             },
         );
+        self.post_balanced("treasury", "grant_escrow", total_amount)?;
 
         Ok(grant_id)
     }
@@ -227,26 +293,28 @@ impl RefractGrants {
     /// Permissionless for the recipient: any caller may trigger the release as
     /// long as they are the grant recipient. Returns the amount released.
     pub fn claim(&mut self, recipient: Address, grant_id: GrantId) -> Result<i128, GrantsError> {
-        let grant = self
-            .grants
-            .get_mut(&grant_id)
-            .ok_or(GrantsError::GrantNotFound)?;
-
-        if grant.recipient != recipient {
-            return Err(GrantsError::NotRecipient);
-        }
-
-        let amount = grant.claimable;
-        if amount <= 0 {
-            return Err(GrantsError::NothingToClaim);
-        }
-
-        grant.claimable = 0;
-        for milestone in grant.milestones.iter_mut() {
-            if milestone.confirmed {
-                milestone.claimed = true;
+        let amount = {
+            let grant = self
+                .grants
+                .get_mut(&grant_id)
+                .ok_or(GrantsError::GrantNotFound)?;
+            if grant.recipient != recipient {
+                return Err(GrantsError::NotRecipient);
             }
-        }
+            let amount = grant.claimable;
+            if amount <= 0 {
+                return Err(GrantsError::NothingToClaim);
+            }
+            grant.claimable = 0;
+            for milestone in grant.milestones.iter_mut() {
+                if milestone.confirmed {
+                    milestone.claimed = true;
+                }
+            }
+            amount
+        };
+        self.check_guardians()?;
+        self.post_balanced("grant_escrow", "grantee", amount)?;
 
         Ok(amount)
     }
@@ -256,6 +324,231 @@ impl RefractGrants {
             return Err(GrantsError::Unauthorized);
         }
         Ok(())
+    }
+
+    // ─── #270 Double-entry journal ──────────────────────────────────
+
+    fn post_balanced(
+        &mut self,
+        debit: &'static str,
+        credit: &'static str,
+        amount: i128,
+    ) -> Result<u64, GrantsError> {
+        if amount <= 0 {
+            return Err(GrantsError::InvalidMilestoneAmount);
+        }
+        let seq = self.journal.len() as u64;
+        self.clock += 1;
+        self.journal.push(JournalEntry {
+            seq,
+            debit,
+            credit,
+            amount,
+            timestamp: self.clock,
+        });
+        Ok(seq)
+    }
+
+    pub fn journal_len(&self) -> usize {
+        self.journal.len()
+    }
+
+    pub fn journal_entry(&self, seq: usize) -> Option<&JournalEntry> {
+        self.journal.get(seq)
+    }
+
+    /// Accounting-identity check: every posting is a positive matched pair,
+    /// gross approvals equal gross journal inflow, and payouts never exceed
+    /// approvals. All arithmetic is checked.
+    pub fn check_invariants(&self) -> Result<(), GrantsError> {
+        let mut approved: i128 = 0;
+        let mut paid: i128 = 0;
+        for entry in &self.journal {
+            if entry.amount <= 0 {
+                return Err(GrantsError::MilestoneSumMismatch);
+            }
+            if entry.credit == "grant_escrow" {
+                approved = approved
+                    .checked_add(entry.amount)
+                    .ok_or(GrantsError::MilestoneSumMismatch)?;
+            } else if entry.debit == "grant_escrow" {
+                paid = paid
+                    .checked_add(entry.amount)
+                    .ok_or(GrantsError::MilestoneSumMismatch)?;
+            }
+        }
+        if paid > approved {
+            return Err(GrantsError::MilestoneSumMismatch);
+        }
+        let mut total_grants: i128 = 0;
+        for grant in self.grants.values() {
+            total_grants = total_grants
+                .checked_add(grant.total_amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
+            if grant.claimable < 0 {
+                return Err(GrantsError::MilestoneSumMismatch);
+            }
+        }
+        if total_grants != approved {
+            return Err(GrantsError::MilestoneSumMismatch);
+        }
+        Ok(())
+    }
+
+    // ─── #272 Guardian ──────────────────────────────────────────────
+
+    pub fn set_guardian_config(
+        &mut self,
+        caller: Address,
+        max_staleness_secs: u64,
+        depeg_bps: u32,
+        peg_price: i128,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if depeg_bps == 0 || depeg_bps > 10_000 || peg_price <= 0 {
+            return Err(GrantsError::Unauthorized);
+        }
+        let prev = self.guardian.clone();
+        self.guardian = Some(GuardianConfig {
+            max_staleness_secs,
+            depeg_bps,
+            peg_price,
+            last_price: prev.as_ref().map(|p| p.last_price).unwrap_or(peg_price),
+            last_update: prev.as_ref().map(|p| p.last_update).unwrap_or(self.clock),
+            payouts_paused: prev.as_ref().map(|p| p.payouts_paused).unwrap_or(false),
+        });
+        Ok(())
+    }
+
+    pub fn note_feed(&mut self, price: i128, timestamp: u64) -> Result<(), GrantsError> {
+        if price <= 0 {
+            return Err(GrantsError::InvalidTotalAmount);
+        }
+        let mut cfg = self.guardian.clone().unwrap_or(GuardianConfig {
+            max_staleness_secs: 1_800,
+            depeg_bps: 500,
+            peg_price: price,
+            last_price: price,
+            last_update: timestamp,
+            payouts_paused: false,
+        });
+        cfg.last_price = price;
+        cfg.last_update = timestamp;
+        self.guardian = Some(cfg);
+        let _ = self.check_guardians();
+        Ok(())
+    }
+
+    pub fn check_guardians(&mut self) -> Result<(), GrantsError> {
+        let mut cfg = match self.guardian.clone() {
+            None => return Ok(()),
+            Some(c) => c,
+        };
+        if cfg.payouts_paused {
+            return Err(GrantsError::Unauthorized);
+        }
+        let age = self.clock.saturating_sub(cfg.last_update);
+        if age > cfg.max_staleness_secs {
+            cfg.payouts_paused = true;
+            self.guardian = Some(cfg);
+            return Err(GrantsError::Unauthorized);
+        }
+        let diff = if cfg.last_price >= cfg.peg_price {
+            cfg.last_price - cfg.peg_price
+        } else {
+            cfg.peg_price - cfg.last_price
+        };
+        let band = diff
+            .checked_mul(10_000)
+            .ok_or(GrantsError::MilestoneSumMismatch)?
+            .checked_div(cfg.peg_price)
+            .ok_or(GrantsError::MilestoneSumMismatch)?;
+        if band > cfg.depeg_bps as i128 {
+            cfg.payouts_paused = true;
+            self.guardian = Some(cfg);
+            return Err(GrantsError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    pub fn clear_halt(&mut self, caller: Address) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if let Some(mut cfg) = self.guardian.clone() {
+            cfg.payouts_paused = false;
+            cfg.last_update = self.clock;
+            self.guardian = Some(cfg);
+        }
+        Ok(())
+    }
+
+    // ─── #271 Keeper + #269 reservations ────────────────────────────
+
+    pub fn set_keeper_config(
+        &mut self,
+        caller: Address,
+        reward_per_call: i128,
+        reward_cap_per_epoch: i128,
+        epoch_len_secs: u64,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if reward_per_call < 0 || reward_cap_per_epoch < 0 || epoch_len_secs == 0 {
+            return Err(GrantsError::Unauthorized);
+        }
+        self.keeper = KeeperConfig {
+            reward_per_call,
+            reward_cap_per_epoch,
+            epoch_len_secs,
+            epoch_start: self.clock,
+            epoch_spent: 0,
+        };
+        Ok(())
+    }
+
+    /// Permissionless sweep over matured bookkeeping. Pays a capped keeper
+    /// reward from the accounting surplus when the epoch budget allows.
+    pub fn execute_due(&mut self, _keeper: Address) -> Result<i128, GrantsError> {
+        if self.clock >= self.keeper.epoch_start + self.keeper.epoch_len_secs {
+            self.keeper.epoch_start = self.clock;
+            self.keeper.epoch_spent = 0;
+        }
+        let mut reward: i128 = 0;
+        if self.keeper.reward_per_call > 0
+            && self.keeper.epoch_spent + self.keeper.reward_per_call
+                <= self.keeper.reward_cap_per_epoch
+        {
+            self.keeper.epoch_spent += self.keeper.reward_per_call;
+            reward = self.keeper.reward_per_call;
+        }
+        self.clock += 1;
+        Ok(reward)
+    }
+
+    pub fn note_reservation(
+        &mut self,
+        caller: Address,
+        reservation_id: u64,
+        amount: i128,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if amount <= 0 {
+            return Err(GrantsError::InvalidTotalAmount);
+        }
+        self.reservations.insert(
+            reservation_id,
+            GrantReservation {
+                id: reservation_id,
+                amount,
+                drawn: 0,
+                released: false,
+                purpose: "grant_escrow",
+            },
+        );
+        self.active_reservation = Some((reservation_id, amount));
+        Ok(())
+    }
+
+    pub fn reserved(&self) -> Option<(u64, i128)> {
+        self.active_reservation
     }
 }
 
