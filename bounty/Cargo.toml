@@ -6,11 +6,10 @@ description = "Governance-controlled on-chain bug bounty escrow for Refract"
 license = "MIT"
 
 [lib]
-name = "refract_bounty"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
-soroban-sdk = { version = "21.0.0" }
+soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
