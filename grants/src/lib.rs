@@ -23,7 +23,24 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
+pub mod audit;
+
 use std::collections::BTreeMap;
+
+use audit::AuditLog;
+
+/// Audit action tag: a grant was created.
+pub const ACTION_CREATE_GRANT: u32 = 1;
+/// Audit action tag: a milestone was confirmed.
+pub const ACTION_CONFIRM_MILESTONE: u32 = 2;
+/// Audit action tag: a reviewer was registered or updated.
+pub const ACTION_REGISTER_REVIEWER: u32 = 3;
+/// Audit action tag: a reviewer was deactivated.
+pub const ACTION_DEACTIVATE_REVIEWER: u32 = 4;
+/// Audit action tag: a review slot was assigned.
+pub const ACTION_ASSIGN_REVIEW: u32 = 5;
+/// Audit action tag: a review slot was reassigned.
+pub const ACTION_REASSIGN_REVIEW: u32 = 6;
 
 /// Identifier for a grant.
 pub type GrantId = u64;
@@ -144,6 +161,11 @@ pub struct RefractGrants {
     assignments: BTreeMap<ReviewSlot, Assignment>,
     /// Audit log of registry and assignment changes, in order.
     events: Vec<GrantsEvent>,
+    /// Hash-chained log of every privileged action.
+    audit: AuditLog,
+    /// Ledger that privileged actions are recorded in. The integrating runtime
+    /// sets it with [`RefractGrants::set_ledger`] before each call.
+    ledger: u64,
 }
 
 impl RefractGrants {
@@ -156,7 +178,19 @@ impl RefractGrants {
             reviewers: BTreeMap::new(),
             assignments: BTreeMap::new(),
             events: Vec::new(),
+            audit: AuditLog::new(),
+            ledger: 0,
         }
+    }
+
+    /// Sets the ledger that subsequent audit records are stamped with.
+    pub fn set_ledger(&mut self, ledger: u64) {
+        self.ledger = ledger;
+    }
+
+    /// The audit log of privileged actions.
+    pub fn audit_log(&self) -> &AuditLog {
+        &self.audit
     }
 
     /// Returns the reviewer registered at `reviewer`, if any.
@@ -198,6 +232,13 @@ impl RefractGrants {
             },
         );
         self.events.push(GrantsEvent::ReviewerRegistered(reviewer));
+        let payload = [
+            reviewer.to_be_bytes().as_slice(),
+            max_concurrent.to_be_bytes().as_slice(),
+            tags.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        self.record(caller, ACTION_REGISTER_REVIEWER, &payload);
         Ok(())
     }
 
@@ -211,6 +252,7 @@ impl RefractGrants {
             .ok_or(GrantsError::ReviewerNotFound)?;
         entry.active = false;
         self.events.push(GrantsEvent::ReviewerDeactivated(reviewer));
+        self.record(caller, ACTION_DEACTIVATE_REVIEWER, &reviewer.to_be_bytes());
         Ok(())
     }
 
@@ -237,6 +279,13 @@ impl RefractGrants {
             },
         );
         self.events.push(GrantsEvent::Assigned { slot, reviewer });
+        let payload = [
+            slot_payload(slot).as_slice(),
+            required_tags.to_be_bytes().as_slice(),
+            reviewer.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        self.record(caller, ACTION_ASSIGN_REVIEW, &payload);
         Ok(reviewer)
     }
 
@@ -266,6 +315,13 @@ impl RefractGrants {
         assignment.reviewer = to;
         assignment.history.push(to);
         self.events.push(GrantsEvent::Reassigned { slot, from, to });
+        let payload = [
+            slot_payload(slot).as_slice(),
+            required_tags.to_be_bytes().as_slice(),
+            to.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        self.record(caller, ACTION_REASSIGN_REVIEW, &payload);
         Ok(to)
     }
 
@@ -359,6 +415,15 @@ impl RefractGrants {
         let grant_id = self.next_grant_id;
         self.next_grant_id += 1;
 
+        let mut payload = [
+            recipient.to_be_bytes().as_slice(),
+            total_amount.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        for amount in &milestones {
+            payload.extend_from_slice(&amount.to_be_bytes());
+        }
+
         let stored = milestones
             .into_iter()
             .map(|amount| Milestone {
@@ -378,6 +443,7 @@ impl RefractGrants {
             },
         );
 
+        self.record(caller, ACTION_CREATE_GRANT, &payload);
         Ok(grant_id)
     }
 
@@ -422,6 +488,12 @@ impl RefractGrants {
             .checked_add(milestone.amount)
             .ok_or(GrantsError::MilestoneSumMismatch)?;
 
+        let payload = [
+            grant_id.to_be_bytes().as_slice(),
+            (milestone_index as u64).to_be_bytes().as_slice(),
+        ]
+        .concat();
+        self.record(caller, ACTION_CONFIRM_MILESTONE, &payload);
         Ok(())
     }
 
@@ -461,6 +533,23 @@ impl RefractGrants {
         }
         Ok(())
     }
+
+    /// Appends one audit record. Called only after the action has succeeded,
+    /// so a rejected call leaves the log unchanged.
+    fn record(&mut self, caller: Address, action: u32, payload: &[u8]) {
+        let ledger = self.ledger;
+        self.audit.append(caller, action, payload, ledger);
+    }
+}
+
+/// Encodes a review slot as bytes. `u64::MAX` stands for "the application".
+fn slot_payload(slot: ReviewSlot) -> Vec<u8> {
+    let milestone = slot.1.map_or(u64::MAX, |index| index as u64);
+    [
+        slot.0.to_be_bytes().as_slice(),
+        milestone.to_be_bytes().as_slice(),
+    ]
+    .concat()
 }
 
 #[cfg(test)]
@@ -731,5 +820,58 @@ mod tests {
             grants.assign_review(GOVERNANCE, (id, None), 0),
             Err(GrantsError::AlreadyAssigned)
         );
+    }
+
+    #[test]
+    fn audit_chain_verifies_after_governed_actions() {
+        let mut grants = contract();
+        grants.set_ledger(42);
+        let id = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
+            .unwrap();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 5, 0).unwrap();
+        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+        grants.assign_review(GOVERNANCE, (id, None), 0).unwrap();
+
+        let log = grants.audit_log();
+        assert_eq!(log.records().len(), 4);
+        assert_eq!(log.records()[0].action, ACTION_CREATE_GRANT);
+        assert_eq!(log.records()[0].ledger, 42);
+        assert_eq!(audit::verify_chain(log.records()), Ok(()));
+        assert_eq!(log.head(), log.records()[3].digest);
+        assert_eq!(log.get(1).unwrap().caller, GOVERNANCE);
+    }
+
+    #[test]
+    fn rejected_call_writes_no_record() {
+        let mut grants = contract();
+        assert_eq!(
+            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
+            Err(GrantsError::Unauthorized)
+        );
+        assert!(grants.audit_log().records().is_empty());
+    }
+
+    #[test]
+    fn tampered_or_removed_record_is_detected() {
+        let mut grants = contract();
+        let id = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
+            .unwrap();
+        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 5, 0).unwrap();
+        let records = grants.audit_log().records().to_vec();
+
+        let mut edited = records.clone();
+        edited[1].caller = STRANGER;
+        assert_eq!(audit::verify_chain(&edited), Err(1));
+
+        let mut removed = records.clone();
+        removed.remove(1);
+        assert_eq!(audit::verify_chain(&removed), Err(1));
+
+        let mut reordered = records.clone();
+        reordered.swap(1, 2);
+        assert_eq!(audit::verify_chain(&reordered), Err(1));
     }
 }
