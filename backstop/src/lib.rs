@@ -2,6 +2,10 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
+pub mod curve;
+
+use curve::{utilization_bps, PremiumCurve, ONE};
+
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
 
@@ -16,6 +20,8 @@ pub enum BackstopError {
     InsufficientShares = 5,
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
+    InvalidCurve = 8,
+    Overflow = 9,
 }
 
 #[contracttype]
@@ -34,6 +40,9 @@ pub struct BackstopState {
     pub total_shares: i128,
     pub total_capital: i128,
     pub premium_income: i128,
+    /// Capital currently exposed to claims, as reported by the pool or admin.
+    /// Utilization is `exposure / total_capital`.
+    pub exposure: i128,
 }
 
 #[contract]
@@ -69,9 +78,62 @@ impl RefractBackstop {
                 total_shares: 0,
                 total_capital: 0,
                 premium_income: 0,
+                exposure: 0,
             },
         );
+        // The flat curve keeps the premium share exactly as configured until
+        // governance sets a real curve.
+        env.storage().instance().set(&"curve", &PremiumCurve::flat());
         Ok(())
+    }
+
+    /// Replace the premium curve. Only the admin may set it, so the admin key
+    /// should be the timelock in production.
+    pub fn set_curve(env: Env, caller: Address, curve: PremiumCurve) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let config = Self::config(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        if !curve.is_valid() {
+            return Err(BackstopError::InvalidCurve);
+        }
+        env.storage().instance().set(&"curve", &curve);
+        Ok(())
+    }
+
+    /// Report how much capital is currently exposed to claims. Callable by
+    /// the pool or the admin.
+    pub fn set_exposure(env: Env, caller: Address, exposure: i128) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let config = Self::config(&env)?;
+        if caller != config.pool && caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        if exposure < 0 {
+            return Err(BackstopError::InvalidAmount);
+        }
+        let mut state = Self::state(&env)?;
+        state.exposure = exposure;
+        env.storage().instance().set(&"state", &state);
+        Ok(())
+    }
+
+    /// Current utilization in basis points, from exposure and total capital.
+    pub fn utilization(env: Env) -> Result<i128, BackstopError> {
+        let state = Self::state(&env)?;
+        Ok(utilization_bps(state.exposure, state.total_capital))
+    }
+
+    /// Current premium multiplier, in 1e7 fixed point.
+    pub fn premium_multiplier(env: Env) -> Result<i128, BackstopError> {
+        let utilization = Self::utilization(env.clone())?;
+        Ok(Self::curve(&env)?.multiplier(utilization))
+    }
+
+    /// The configured premium curve.
+    pub fn get_curve(env: Env) -> Result<PremiumCurve, BackstopError> {
+        Self::curve(&env)
     }
 
     /// Deposit `amount` of the configured token and mint backstop shares to
@@ -189,7 +251,16 @@ impl RefractBackstop {
         let config = Self::config(&env)?;
         let mut state = Self::state(&env)?;
 
-        let cut = amount * config.premium_share_bps / BPS_DENOM;
+        // The premium share is scaled by the utilization curve. A multiplier of
+        // ONE leaves the configured share unchanged. The cut never exceeds the
+        // premium received.
+        let multiplier = Self::curve(&env)?.multiplier(utilization_bps(state.exposure, state.total_capital));
+        let cut = amount
+            .checked_mul(config.premium_share_bps)
+            .and_then(|scaled| scaled.checked_mul(multiplier))
+            .ok_or(BackstopError::Overflow)?
+            / (BPS_DENOM * ONE);
+        let cut = cut.min(amount);
         state.premium_income += cut;
         state.total_capital += cut;
         env.storage().instance().set(&"state", &state);
@@ -236,6 +307,13 @@ impl RefractBackstop {
         env.storage()
             .instance()
             .get(&"config")
+            .ok_or(BackstopError::NotInitialized)
+    }
+
+    fn curve(env: &Env) -> Result<PremiumCurve, BackstopError> {
+        env.storage()
+            .instance()
+            .get(&"curve")
             .ok_or(BackstopError::NotInitialized)
     }
 
