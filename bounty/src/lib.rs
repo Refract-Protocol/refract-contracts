@@ -2,6 +2,8 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
 
+pub mod wind_down;
+
 /// Storage keys for the bounty escrow.
 #[contracttype]
 #[derive(Clone)]
