@@ -23,6 +23,7 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
+pub mod budget;
 pub mod compensation;
 pub mod reviewer_stake;
 pub mod scoring;
