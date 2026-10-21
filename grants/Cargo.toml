@@ -6,9 +6,3 @@ edition = "2021"
 [lib]
 name = "refract_grants"
 path = "src/lib.rs"
-
-[dependencies]
-soroban-sdk = "21.0.0"
-
-[dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }

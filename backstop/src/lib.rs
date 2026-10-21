@@ -2,6 +2,9 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
+#[cfg(test)]
+mod stress_test;
+
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
 
