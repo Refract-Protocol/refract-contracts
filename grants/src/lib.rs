@@ -24,6 +24,7 @@
 //! mechanics once a milestone is confirmed on-chain.
 
 pub mod bond;
+pub mod delegation;
 
 use std::collections::BTreeMap;
 
