@@ -32,6 +32,7 @@ All amounts use **1e7 fixed-point** (the Stellar USDC convention). The contracts
 
 ```bash
 cargo test                                          # run the unit-test suite
+cargo test -p refract-integration-tests             # end-to-end governance/treasury/pool suite
 cargo fmt --all --check                             # formatting
 cargo clippy --all-targets -- -D warnings           # lints
 cargo build --target wasm32-unknown-unknown --release   # optimized wasm

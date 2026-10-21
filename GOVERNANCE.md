@@ -85,6 +85,48 @@ Because the bound is enforced inside `set_pool_config`, it constrains every
 caller — including a passed governance proposal — so a single proposal cannot
 set `max_utilization_bps` to a wildly destabilizing value in one step.
 
+## Treasury, Grants, Bounty and Backstop Wiring
+
+These contracts never get a single-key admin in production. Their
+admin/governance address is the **timelock contract** from the start:
+
+| Contract | Initialize with | Gated actions (timelock only) |
+|----------|-----------------|-------------------------------|
+| `RefractTreasury` | `admin = timelock`, `manager = ops multisig` | `approve_withdrawal`, `set_manager`, `propose_admin`, `set_epoch_limit`, `set_large_withdrawal_threshold` |
+| `RefractGrants` | `governance = timelock` | `create_grant`, `confirm_milestone`, `set_governance` |
+| `RefractBountyEscrow` | `governance = timelock` | `award` (pass the timelock address as `caller`) |
+| `RefractBackstop` | `pool = RefractPool`, `admin = timelock` | `cover_shortfall` (pool or admin) |
+
+The timelock calls the target contract directly from `execute`, so
+`timelock.require_auth()` inside the target succeeds only for operations that
+went through `queue` and waited out `min_delay`. Wiring order:
+
+1. Deploy the timelock with `admin = governor` and the governor with its
+   voting token, then call `governor.set_timelock(bootstrap_key, timelock)`.
+   This is a one-time bootstrap: afterwards only the timelock itself can
+   repoint the governor's timelock or change its config.
+2. Deploy treasury, grants, bounty and backstop pointing at the timelock.
+3. On the pool, as the bootstrap admin: `set_backstop(backstop)` and
+   `set_premium_share_bps(bps)`, then `set_admin(timelock)`.
+
+Operational notes:
+
+* An operation is executable only in `[eta, eta + grace_period]`
+  (default grace period 14 days). After that it is expired and needs a new
+  proposal.
+* The timelock's own delay, grace period and admin can only change through an
+  operation queued against the timelock itself (`set_min_delay`,
+  `set_grace_period`, `set_admin`), so the delay can never drop instantly.
+* Soroban does not allow re-entering a contract. A proposal that targets the
+  **governor itself** (e.g. `set_timelock`) must be executed with
+  `timelock.execute(op_id)`, not `governor.execute(proposal_id)`.
+* The bootstrap admin of the governor stays as a guardian: it (or the
+  proposer) can `cancel` a proposal, which also cancels its timelock
+  operation. It cannot queue or execute anything.
+
+The end-to-end suite in `tests/` (`cargo test -p refract-integration-tests`)
+exercises every one of these paths.
+
 ## Rollback
 
 If the governance stack must be replaced, the current `Admin` (the timelock)

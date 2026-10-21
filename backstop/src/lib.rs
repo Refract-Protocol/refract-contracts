@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+};
 
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
@@ -25,6 +27,7 @@ pub struct BackstopConfig {
     pub admin: Address,
     pub token: Address,
     /// Share of premium income (in basis points) routed to backstop stakers.
+    /// Informational: the pool performs the split (see `receive_premium`).
     pub premium_share_bps: i128,
 }
 
@@ -81,8 +84,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::load_config(&env)?;
+        let mut state = Self::load_state(&env)?;
 
         let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
         if shares <= 0 {
@@ -112,8 +115,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::load_config(&env)?;
+        let mut state = Self::load_state(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -149,7 +152,7 @@ impl RefractBackstop {
     /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::load_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -157,7 +160,7 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
 
-        let mut state = Self::state(&env)?;
+        let mut state = Self::load_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
         } else {
@@ -179,22 +182,37 @@ impl RefractBackstop {
         Ok(covered)
     }
 
-    /// Route a slice of premium income to backstop stakers. The premium share
-    /// is configured in basis points; the remainder is left for the caller
-    /// (e.g. the treasury fee-switch) to distribute.
-    pub fn receive_premium(env: Env, amount: i128) -> Result<i128, BackstopError> {
+    /// Record premium income routed in by `RefractPool` (issue #200).
+    ///
+    /// `from` must be the configured pool and must authorize the call (a
+    /// direct pool → backstop call satisfies this without a signature). The
+    /// pool has already applied its own `premium_share_bps` split and
+    /// transferred exactly `amount` tokens to this contract *before* calling,
+    /// so the full `amount` is credited to stakers: `total_capital` grows,
+    /// share count does not, and every staker's share price rises
+    /// proportionally. Stakers realise it through `withdraw`.
+    ///
+    /// The backstop's own `premium_share_bps` is informational only (it
+    /// mirrors the pool's setting) and is not applied a second time.
+    pub fn receive_premium(env: Env, from: Address, amount: i128) -> Result<i128, BackstopError> {
+        from.require_auth();
+        let config = Self::load_config(&env)?;
+        if from != config.pool {
+            return Err(BackstopError::Unauthorized);
+        }
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
-
-        let cut = amount * config.premium_share_bps / BPS_DENOM;
-        state.premium_income += cut;
-        state.total_capital += cut;
+        let mut state = Self::load_state(&env)?;
+        state.premium_income += amount;
+        state.total_capital += amount;
         env.storage().instance().set(&"state", &state);
 
-        Ok(cut)
+        env.events().publish(
+            (symbol_short!("PREM_RCV"), from),
+            (amount, state.total_capital),
+        );
+        Ok(amount)
     }
 
     pub fn shares_of(env: Env, staker: Address) -> i128 {
@@ -205,13 +223,15 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::load_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::load_config(&env)
     }
+}
 
+impl RefractBackstop {
     /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
     /// subsequent depositors get shares proportional to the current share price.
     fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
@@ -232,17 +252,20 @@ impl RefractBackstop {
         }
     }
 
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn load_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn load_state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
     }
 }
+
+#[cfg(test)]
+mod test;

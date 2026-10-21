@@ -527,7 +527,6 @@ fn test_spec_policy_registry_interface_and_error_snapshot() {
     assert_eq!(record.policy_id, 1);
     assert!(record.is_active);
 }
-}
 
 // ─── Issue #25: Per-holder indexing growth tests ──────────────────────────────
 

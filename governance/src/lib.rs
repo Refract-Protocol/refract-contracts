@@ -16,9 +16,18 @@
 //! * **Quorum** — `quorum_bps` of `total_supply` (from the token) must
 //!   participate (for + against) for the proposal to be valid.
 //! * **Execution** — after the voting period ends, a successful proposal
-//!   is forwarded to the timelock via `queue`, then the timelock executes
-//!   it after its own delay.  If the timelock address is not set the call
-//!   is forwarded directly (useful in tests).
+//!   is forwarded to the timelock via `queue` (eta = now + the timelock's
+//!   `min_delay`), then the timelock executes it after its delay. The
+//!   timelock calls the target directly, so the target sees the timelock as
+//!   the authorizing address. If no timelock is set the call is forwarded
+//!   directly by `execute` (bootstrap / tests only).
+//! * **No timelock bypass (issue #201)** — once a timelock is configured,
+//!   `set_timelock` and `set_config` can only be called by that timelock,
+//!   i.e. through a passed proposal that waited out the delay. The admin
+//!   key can wire the timelock once at bootstrap and can cancel queued
+//!   proposals (guardian role), nothing else.
+//! * **Quorum** reads `total_supply()` from the voting token, so the token
+//!   must expose it in addition to the SEP-41 `balance()`.
 //!
 //! ## Proposal lifecycle
 //! ```text
@@ -27,12 +36,31 @@
 //!           → Succeeded (quorum met + majority for)
 //! queue()   → Queued (forwarded to timelock)
 //! execute() → Executed (timelock or direct forward)
+//! cancel()  → Cancelled (admin/guardian or proposer, before execution)
 //! ```
 
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Map, Symbol, Val, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, Symbol, Val,
+    Vec,
 };
+
+/// The subset of the voting token's interface the governor needs: the
+/// SEP-41 `balance` plus `total_supply` for quorum.
+#[contractclient(name = "VotingTokenClient")]
+pub trait VotingToken {
+    fn balance(env: Env, id: Address) -> i128;
+    fn total_supply(env: Env) -> i128;
+}
+
+/// The subset of `RefractTimelock` the governor calls.
+#[contractclient(name = "TimelockClient")]
+pub trait Timelock {
+    fn min_delay(env: Env) -> u64;
+    fn queue(env: Env, target: Address, function: Symbol, args: Vec<Val>, eta: u64) -> u64;
+    fn execute(env: Env, id: u64);
+    fn cancel(env: Env, id: u64);
+}
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -60,6 +88,8 @@ pub enum GovernanceError {
     /// A delegation would create a chain (the delegatee has itself delegated
     /// elsewhere). This contract uses a single-hop-only delegation model.
     DelegationChain = 11,
+    /// A timelock is configured, so the proposal must go through it.
+    TimelockRequired = 12,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -80,6 +110,8 @@ pub enum ProposalStatus {
     Queued = 3,
     /// Call was executed.
     Executed = 4,
+    /// Cancelled before execution.
+    Cancelled = 5,
 }
 
 #[contracttype]
@@ -105,6 +137,8 @@ pub struct ProposalState {
     /// balances as of this ledger, not the voter's live balance, so tokens
     /// borrowed and repaid within a single transaction cannot inflate votes.
     pub snapshot_ledger: u32,
+    /// Timelock operation id once queued through a timelock.
+    pub timelock_op: Option<u64>,
 }
 
 /// Governor configuration.
@@ -154,34 +188,11 @@ pub enum DataKey {
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
-#[contract]
-pub struct RefractGovernor;
+const INSTANCE_TTL_THRESHOLD: u32 = 259_200;
+const INSTANCE_TTL_EXTEND: u32 = 518_400;
+const PROPOSAL_TTL_THRESHOLD: u32 = 518_400;
+const PROPOSAL_TTL_EXTEND: u32 = 1_036_800;
 
-#[contractimpl]
-impl RefractGovernor {
-    // TODO (#124): Implement initialize, propose, vote, execute, and
-    // cancel entry points per the design documentation above.
-    //
-    // Start with the ProposalType enum, DataKey enum, and Proposal struct,
-    // then implement propose() → vote() → execute() in that order.
-    // The NewCoverageType execution sequence (Steps 1-4) belongs in a
-    // private _execute_new_coverage_type() helper
-
-#[contract]
-pub struct RefractGovernor;
-
-#[contractimpl]
-impl RefractGovernor {
-    pub fn initialize(env: Env, admin: Address, token: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Token, &token);
-        env.storage().instance().set(&DataKey::ProposalCount, &0u64);
-    }
-
-    pub fn propose(env: E
 #[contract]
 pub struct RefractGovernor;
 
@@ -202,6 +213,7 @@ impl RefractGovernor {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::NextId, &0u64);
+        Self::bump_instance(&env);
         env.events()
             .publish((Symbol::new(&env, "gov_init"),), (admin,));
         Ok(())
@@ -217,23 +229,42 @@ impl RefractGovernor {
         env.storage().instance().get(&DataKey::Config)
     }
 
-    /// Wire in the timelock contract address.  Admin-only.
-    pub fn set_timelock(env: Env, caller: Address, timelock: Address) -> Result<(), GovernanceError> {
-        Self::require_admin(&env, &caller)?;
+    /// The timelock proposals are queued into, if configured.
+    pub fn timelock(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Timelock)
+    }
+
+    /// Wire in (or replace) the timelock contract address.
+    ///
+    /// The first time, `caller` must be the admin (bootstrap). After that,
+    /// `caller` must be the *current* timelock, so a replacement can only
+    /// come from a passed proposal that waited out the existing delay.
+    pub fn set_timelock(
+        env: Env,
+        caller: Address,
+        timelock: Address,
+    ) -> Result<(), GovernanceError> {
+        Self::require_authority(&env, &caller)?;
+        if timelock == env.current_contract_address() {
+            return Err(GovernanceError::Unauthorized);
+        }
         env.storage().instance().set(&DataKey::Timelock, &timelock);
+        Self::bump_instance(&env);
         env.events()
             .publish((Symbol::new(&env, "gov_tl_set"),), (timelock,));
         Ok(())
     }
 
-    /// Replace the governor configuration.  Admin-only.
+    /// Replace the governor configuration. Admin before a timelock is
+    /// wired; the timelock afterwards.
     pub fn set_config(
         env: Env,
         caller: Address,
         config: GovernorConfig,
     ) -> Result<(), GovernanceError> {
-        Self::require_admin(&env, &caller)?;
+        Self::require_authority(&env, &caller)?;
         env.storage().instance().set(&DataKey::Config, &config);
+        Self::bump_instance(&env);
         env.events().publish((Symbol::new(&env, "gov_cfg"),), ());
         Ok(())
     }
@@ -253,24 +284,16 @@ impl RefractGovernor {
         description: Symbol,
     ) -> Result<u64, GovernanceError> {
         proposer.require_auth();
-        let config: GovernorConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .ok_or(GovernanceError::NotInitialized)?;
+        let config = Self::load_config(&env)?;
 
         // Check proposer's token balance against threshold.
-        let balance = token::Client::new(&env, &config.token).balance(&proposer);
+        let balance = VotingTokenClient::new(&env, &config.token).balance(&proposer);
         if balance < config.proposal_threshold {
             return Err(GovernanceError::BelowProposalThreshold);
         }
 
         let now = env.ledger().timestamp();
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
         let proposal = ProposalState {
             proposer: proposer.clone(),
@@ -284,14 +307,13 @@ impl RefractGovernor {
             votes_against: 0,
             status: ProposalStatus::Active,
             voters: Vec::new(&env),
+            snapshot_ledger: env.ledger().sequence(),
+            timelock_op: None,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(id), &proposal);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextId, &(id + 1));
+        Self::save_proposal(&env, id, &proposal);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        Self::bump_instance(&env);
 
         env.events().publish(
             (Symbol::new(&env, "gov_proposed"), id),
@@ -316,11 +338,7 @@ impl RefractGovernor {
     ) -> Result<i128, GovernanceError> {
         voter.require_auth();
 
-        let mut proposal: ProposalState = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
         if proposal.status != ProposalStatus::Active {
             return Err(GovernanceError::WrongState);
@@ -336,12 +354,8 @@ impl RefractGovernor {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        let config: GovernorConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .ok_or(GovernanceError::NotInitialized)?;
-        let weight = token::Client::new(&env, &config.token).balance(&voter);
+        let config = Self::load_config(&env)?;
+        let weight = VotingTokenClient::new(&env, &config.token).balance(&voter);
 
         if support {
             proposal.votes_for += weight;
@@ -350,9 +364,7 @@ impl RefractGovernor {
         }
         proposal.voters.push_back(voter.clone());
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::save_proposal(&env, proposal_id, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "gov_voted"), proposal_id),
@@ -364,11 +376,7 @@ impl RefractGovernor {
     /// Tally the proposal after its voting period ends and transition it to
     /// `Succeeded` or `Defeated`.  Permissionless.
     pub fn finalize(env: Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
-        let mut proposal: ProposalState = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
         if proposal.status != ProposalStatus::Active {
             // Already finalized — just return current status.
@@ -380,17 +388,13 @@ impl RefractGovernor {
             return Err(GovernanceError::VotingOpen);
         }
 
-        let config: GovernorConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .ok_or(GovernanceError::NotInitialized)?;
+        let config = Self::load_config(&env)?;
 
         // Total participating weight.
         let total_votes = proposal.votes_for + proposal.votes_against;
 
         // Total token supply for quorum calculation.
-        let total_supply = token::Client::new(&env, &config.token).total_supply();
+        let total_supply = VotingTokenClient::new(&env, &config.token).total_supply();
 
         // Quorum: total_votes must be >= quorum_bps/10000 of total_supply.
         let quorum_required = total_supply * (config.quorum_bps as i128) / 10_000;
@@ -404,9 +408,7 @@ impl RefractGovernor {
         };
 
         proposal.status = new_status;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::save_proposal(&env, proposal_id, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "gov_finalized"), proposal_id),
@@ -415,71 +417,102 @@ impl RefractGovernor {
         Ok(new_status)
     }
 
-    /// Queue a succeeded proposal into the timelock (or execute directly if
-    /// no timelock is set).
-    pub fn queue(env: Env, proposal_id: u64, eta: u64) -> Result<(), GovernanceError> {
-        let mut proposal: ProposalState = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+    /// Queue a succeeded proposal. Permissionless.
+    ///
+    /// With a timelock configured, the proposal is enqueued there with
+    /// `eta = now + timelock.min_delay()` and the timelock operation id is
+    /// recorded on the proposal and returned. Without a timelock the
+    /// proposal is just marked `Queued` for `execute` (returns `None`).
+    pub fn queue(env: Env, proposal_id: u64) -> Result<Option<u64>, GovernanceError> {
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
         if proposal.status != ProposalStatus::Succeeded {
             return Err(GovernanceError::WrongState);
         }
 
         proposal.status = ProposalStatus::Queued;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
 
-        if let Some(timelock) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Timelock)
-        {
-            // Forward to timelock.  The timelock's `queue` function takes
-            // (target, function, args, eta).
-            let mut tl_args: Vec<Val> = Vec::new(&env);
-            tl_args.push_back(proposal.target.into_val(&env));
-            tl_args.push_back(proposal.function.into_val(&env));
-            tl_args.push_back(proposal.args.into_val(&env));
-            tl_args.push_back(eta.into_val(&env));
-            env.invoke_contract::<Val>(
-                &timelock,
-                &Symbol::new(&env, "queue"),
-                tl_args,
-            );
+        if let Some(timelock) = Self::timelock(env.clone()) {
+            let tl = TimelockClient::new(&env, &timelock);
+            let eta = env.ledger().timestamp().saturating_add(tl.min_delay());
+            let op_id = tl.queue(&proposal.target, &proposal.function, &proposal.args, &eta);
+            proposal.timelock_op = Some(op_id);
         }
-        // If no timelock is set the proposal is marked Queued and the
-        // caller should call `execute` directly.
+        Self::save_proposal(&env, proposal_id, &proposal);
 
-        env.events()
-            .publish((Symbol::new(&env, "gov_queued"), proposal_id), ());
-        Ok(())
+        env.events().publish(
+            (Symbol::new(&env, "gov_queued"), proposal_id),
+            (proposal.timelock_op,),
+        );
+        Ok(proposal.timelock_op)
     }
 
-    /// Execute a queued proposal directly (when no timelock is configured).
+    /// Execute a queued proposal. Permissionless.
+    ///
+    /// With a timelock configured this forwards to `timelock.execute`, which
+    /// enforces the delay and grace period and makes the call to the target
+    /// (so the target sees the timelock as its caller). Without a timelock
+    /// the call is made directly.
+    ///
+    /// Proposals that target the governor itself (e.g. `set_timelock`) must
+    /// be executed with `timelock.execute(op_id)` instead: Soroban does not
+    /// allow the governor to be re-entered from inside its own `execute`.
     pub fn execute(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
-        let mut proposal: ProposalState = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .ok_or(GovernanceError::ProposalNotFound)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
         if proposal.status != ProposalStatus::Queued {
             return Err(GovernanceError::WrongState);
         }
 
         proposal.status = ProposalStatus::Executed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::save_proposal(&env, proposal_id, &proposal);
 
-        env.invoke_contract::<Val>(&proposal.target, &proposal.function, proposal.args);
+        match (Self::timelock(env.clone()), proposal.timelock_op) {
+            (Some(timelock), Some(op_id)) => {
+                TimelockClient::new(&env, &timelock).execute(&op_id);
+            }
+            // A timelock was wired after this proposal was queued without
+            // one: it must be re-proposed so it goes through the delay.
+            (Some(_), None) => return Err(GovernanceError::TimelockRequired),
+            (None, _) => {
+                env.invoke_contract::<Val>(&proposal.target, &proposal.function, proposal.args);
+            }
+        }
 
         env.events()
             .publish((Symbol::new(&env, "gov_executed"), proposal_id), ());
+        Ok(())
+    }
+
+    /// Cancel a proposal that has not been executed. Callable by the admin
+    /// (guardian) or the proposer. A queued proposal is also cancelled in the
+    /// timelock, so it can never be executed there.
+    pub fn cancel(env: Env, caller: Address, proposal_id: u64) -> Result<(), GovernanceError> {
+        caller.require_auth();
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(GovernanceError::NotInitialized)?;
+        if caller != admin && caller != proposal.proposer {
+            return Err(GovernanceError::Unauthorized);
+        }
+        if matches!(
+            proposal.status,
+            ProposalStatus::Executed | ProposalStatus::Cancelled
+        ) {
+            return Err(GovernanceError::WrongState);
+        }
+
+        if let (Some(timelock), Some(op_id)) = (Self::timelock(env.clone()), proposal.timelock_op) {
+            TimelockClient::new(&env, &timelock).cancel(&op_id);
+        }
+        proposal.status = ProposalStatus::Cancelled;
+        Self::save_proposal(&env, proposal_id, &proposal);
+
+        env.events()
+            .publish((Symbol::new(&env, "gov_cancelled"), proposal_id), (caller,));
         Ok(())
     }
 
@@ -487,20 +520,59 @@ impl RefractGovernor {
     pub fn get_proposal(env: Env, id: u64) -> Option<ProposalState> {
         env.storage().persistent().get(&DataKey::Proposal(id))
     }
+}
 
-    // ─── Internal helpers ─────────────────────────────────────────────────
+// ─── Internal helpers ─────────────────────────────────────────────────────────
 
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
+impl RefractGovernor {
+    /// Before a timelock is wired the admin controls settings; afterwards
+    /// only the timelock does.
+    fn require_authority(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
         caller.require_auth();
-        let admin: Address = env
+        let authority: Address = match env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .ok_or(GovernanceError::NotInitialized)?;
-        if caller != &admin {
+            .get::<DataKey, Address>(&DataKey::Timelock)
+        {
+            Some(timelock) => timelock,
+            None => env
+                .storage()
+                .instance()
+                .get(&DataKey::Admin)
+                .ok_or(GovernanceError::NotInitialized)?,
+        };
+        if caller != &authority {
             return Err(GovernanceError::Unauthorized);
         }
         Ok(())
+    }
+
+    fn load_config(env: &Env) -> Result<GovernorConfig, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn load_proposal(env: &Env, id: u64) -> Result<ProposalState, GovernanceError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Proposal(id))
+            .ok_or(GovernanceError::ProposalNotFound)
+    }
+
+    fn save_proposal(env: &Env, id: u64, proposal: &ProposalState) {
+        let key = DataKey::Proposal(id);
+        env.storage().persistent().set(&key, proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PROPOSAL_TTL_THRESHOLD, PROPOSAL_TTL_EXTEND);
+    }
+
+    fn bump_instance(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
     }
 }
 

@@ -19,4 +19,5 @@ soroban-sdk = { workspace = true, features = ["testutils", "alloc"] }
 # dev-dependencies only.
 refract-policy = { path = "../policy" }
 refract-oracle = { path = "../oracle" }
+refract-backstop = { path = "../backstop" }
 proptest = { workspace = true }

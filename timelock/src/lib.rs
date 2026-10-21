@@ -16,6 +16,30 @@
 //! `min_delay` itself is changed through the timelock's own queue/execute
 //! flow (self-governing), preventing instant delay-reduction attacks.
 //!
+//! ## Governance wiring (issue #201)
+//!
+//! In production the timelock's `admin` is the `RefractGovernor` contract:
+//! a passed proposal is forwarded to `queue`, and once the delay elapses
+//! anyone may `execute` it. The timelock calls the target contract
+//! directly, so the target sees the timelock as the invoking contract and
+//! `timelock.require_auth()` inside the target succeeds without any
+//! signature. That is the whole authorization primitive: `RefractTreasury`
+//! and `RefractGrants` store the timelock address and call
+//! `require_auth()` on it for every privileged action.
+//!
+//! * **Grace period** — an operation can only be executed in
+//!   `[eta, eta + grace_period]`. After that it is expired and must be
+//!   re-proposed.
+//! * **No replay** — operation ids come from a monotonic counter and an
+//!   operation leaves `Pending` exactly once (executed or cancelled).
+//! * **Self-governed settings** — the delay, grace period and admin can only
+//!   change through an operation queued with `target` = the timelock itself
+//!   and `function` = `set_min_delay` / `set_grace_period` / `set_admin`.
+//!   Such an operation waits out the current delay like any other, so there
+//!   is no way to set the delay to zero instantly. (Soroban forbids a
+//!   contract calling itself, so `execute` applies these internally.)
+//!
+//! ```text
 //! =============================================================================
 //! Issue #121 — [High] Add a security-council veto path to cancel a queued
 //! governance-timelock action
@@ -174,11 +198,25 @@
 //!   timelock/src/tests/  ← add the three test scenarios above
 //!
 //! =============================================================================
+//! ```
 
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, TryFromVal, Val, Vec,
 };
+
+/// Default window after `eta` during which an operation stays executable
+/// (14 days). After it closes the operation is expired.
+pub const DEFAULT_GRACE_PERIOD: u64 = 14 * 24 * 60 * 60;
+
+// Instance-storage TTL management: bump to ~30 days whenever it drops
+// below ~15 days (at 5s ledgers).
+const INSTANCE_TTL_THRESHOLD: u32 = 259_200;
+const INSTANCE_TTL_EXTEND: u32 = 518_400;
+// Operations live in persistent storage and must survive at least
+// `min_delay + grace_period`; keep them for ~60 days.
+const OP_TTL_THRESHOLD: u32 = 518_400;
+const OP_TTL_EXTEND: u32 = 1_036_800;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -197,6 +235,12 @@ pub enum TimelockError {
     NotReady = 6,
     /// The operation has already been executed or cancelled.
     AlreadyDone = 7,
+    /// `execute` was called after `eta + grace_period`.
+    Expired = 8,
+    /// The forwarded call to the target contract failed.
+    CallFailed = 9,
+    /// A settings value was rejected (e.g. a zero grace period).
+    InvalidValue = 10,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -222,6 +266,9 @@ pub struct TimelockOperation {
     pub args: Vec<Val>,
     /// Earliest ledger timestamp at which `execute` may be called.
     pub eta: u64,
+    /// Last ledger timestamp at which `execute` may be called
+    /// (`eta + grace_period` at queue time).
+    pub expires_at: u64,
     pub status: OperationStatus,
 }
 
@@ -233,6 +280,7 @@ pub enum DataKey {
     MinDelay,
     NextId,
     Operation(u64),
+    GracePeriod,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -246,7 +294,8 @@ impl RefractTimelock {
 
     /// Deploy and configure the timelock.
     ///
-    /// * `admin`     — address authorized to queue and cancel operations.
+    /// * `admin`     — address authorized to queue and cancel operations
+    ///   (the governance contract in production).
     /// * `min_delay` — minimum seconds between `queue` and `execute` (e.g.
     ///   86_400 for a 24-hour delay).
     pub fn initialize(env: Env, admin: Address, min_delay: u64) -> Result<(), TimelockError> {
@@ -256,15 +305,19 @@ impl RefractTimelock {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MinDelay, &min_delay);
+        env.storage()
+            .instance()
+            .set(&DataKey::GracePeriod, &DEFAULT_GRACE_PERIOD);
         env.storage().instance().set(&DataKey::NextId, &0u64);
+        Self::bump_instance(&env);
         env.events()
             .publish((Symbol::new(&env, "tl_init"),), (admin, min_delay));
         Ok(())
     }
 
-    // ─── Admin ───────────────────────────────────────────────────────────
+    // ─── Views ───────────────────────────────────────────────────────────
 
-    /// Current admin address.
+    /// Current admin address (the address allowed to queue and cancel).
     pub fn admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
@@ -277,11 +330,24 @@ impl RefractTimelock {
             .unwrap_or(0)
     }
 
+    /// Current grace period in seconds.
+    pub fn grace_period(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GracePeriod)
+            .unwrap_or(DEFAULT_GRACE_PERIOD)
+    }
+
+    /// Fetch a queued operation by id.
+    pub fn get_operation(env: Env, id: u64) -> Option<TimelockOperation> {
+        env.storage().persistent().get(&DataKey::Operation(id))
+    }
+
     // ─── Core Operations ─────────────────────────────────────────────────
 
-    /// Queue a cross-contract call for delayed execution.
+    /// Queue a cross-contract call for delayed execution. Admin-only.
     ///
-    /// `eta` must be at least `now + min_delay`.  Returns the operation id.
+    /// `eta` must be at least `now + min_delay`. Returns the operation id.
     pub fn queue(
         env: Env,
         target: Address,
@@ -292,46 +358,38 @@ impl RefractTimelock {
         Self::require_admin(&env)?;
 
         let now = env.ledger().timestamp();
-        let min_delay: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinDelay)
-            .unwrap_or(0);
-        if eta < now + min_delay {
+        let min_delay = Self::min_delay(env.clone());
+        if eta < now.saturating_add(min_delay) {
             return Err(TimelockError::EtaTooSoon);
         }
+        let expires_at = eta.saturating_add(Self::grace_period(env.clone()));
 
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0);
+        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
         let op = TimelockOperation {
             target: target.clone(),
             function: function.clone(),
             args,
             eta,
+            expires_at,
             status: OperationStatus::Pending,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextId, &(id + 1));
+        Self::save_op(&env, id, &op);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        Self::bump_instance(&env);
 
         env.events().publish(
             (Symbol::new(&env, "tl_queued"), id),
-            (target, function, eta),
+            (target, function, eta, expires_at),
         );
         Ok(id)
     }
 
-    /// Execute a queued operation once its `eta` has passed.
+    /// Execute a queued operation once its `eta` has passed and before it
+    /// expires.
     ///
-    /// Permissionless — anyone can call this once the delay has elapsed.
-    /// If the target call reverts, `execute` returns an error and the
-    /// operation remains `Pending` so it can be re-attempted.
+    /// Permissionless — anyone can call this inside the execution window.
+    /// If the target call fails, the whole invocation fails and the
+    /// operation stays `Pending`, so it can be retried inside the window.
     pub fn execute(env: Env, id: u64) -> Result<(), TimelockError> {
         let mut op: TimelockOperation = env
             .storage()
@@ -347,44 +405,40 @@ impl RefractTimelock {
         if now < op.eta {
             return Err(TimelockError::NotReady);
         }
+        if now > op.expires_at {
+            return Err(TimelockError::Expired);
+        }
 
-        // Mark as executed *before* the cross-contract call so that a
-        // re-entrant execute on the same id is rejected even if the
-        // target call somehow loops back.
+        // Mark as executed *before* the cross-contract call so a re-entrant
+        // `execute` on the same id is rejected.
         op.status = OperationStatus::Executed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
+        Self::save_op(&env, id, &op);
 
-        // Forward the call.  `try_invoke_contract` is used so that a
-        // failing callee does not silently swallow the error — we catch it,
-        // reset the status to Pending (making the op re-attemptable), and
-        // bubble the error up.
-        let result = env.try_invoke_contract::<Val, soroban_sdk::InvokeError>(
-            &op.target,
-            &op.function,
-            op.args.clone(),
-        );
-
-        match result {
-            Ok(_) => {
-                env.events()
-                    .publish((Symbol::new(&env, "tl_executed"), id), ());
-                Ok(())
-            }
-            Err(_) => {
-                // Reset so the op can be retried.
-                op.status = OperationStatus::Pending;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Operation(id), &op);
-                Err(TimelockError::NotFound) // surface as a generic failure
+        // Soroban forbids a contract from calling itself, so operations
+        // that target the timelock (its own settings) are applied here.
+        if op.target == env.current_contract_address() {
+            Self::apply_self_call(&env, &op.function, &op.args)?;
+        } else {
+            match env.try_invoke_contract::<Val, soroban_sdk::Error>(
+                &op.target,
+                &op.function,
+                op.args.clone(),
+            ) {
+                Ok(Ok(_)) => {}
+                // Returning an error rolls back every write in this
+                // invocation, including the `Executed` mark above, so the
+                // op stays Pending and can be retried inside its window.
+                _ => return Err(TimelockError::CallFailed),
             }
         }
+
+        env.events()
+            .publish((Symbol::new(&env, "tl_executed"), id), (op.target,));
+        Ok(())
     }
 
-    /// Cancel a pending operation.  Admin-only.  Cannot cancel an operation
-    /// that has already been executed.
+    /// Cancel a pending operation. Admin-only. Cannot cancel an operation
+    /// that has already been executed or cancelled.
     pub fn cancel(env: Env, id: u64) -> Result<(), TimelockError> {
         Self::require_admin(&env)?;
 
@@ -399,18 +453,11 @@ impl RefractTimelock {
         }
 
         op.status = OperationStatus::Cancelled;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Operation(id), &op);
+        Self::save_op(&env, id, &op);
 
         env.events()
             .publish((Symbol::new(&env, "tl_cancelled"), id), ());
         Ok(())
-    }
-
-    /// Fetch a queued operation by id.
-    pub fn get_operation(env: Env, id: u64) -> Option<TimelockOperation> {
-        env.storage().persistent().get(&DataKey::Operation(id))
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────
@@ -423,6 +470,60 @@ impl RefractTimelock {
             .ok_or(TimelockError::NotInitialized)?;
         admin.require_auth();
         Ok(())
+    }
+
+    /// Apply a queued change to the timelock's own settings. Reachable only
+    /// from `execute`, so every change waits out the current delay.
+    ///
+    /// Supported functions (each takes one argument):
+    /// * `set_min_delay(u64)`
+    /// * `set_grace_period(u64)` — must be non-zero
+    /// * `set_admin(Address)` — must not be the timelock itself
+    fn apply_self_call(env: &Env, function: &Symbol, args: &Vec<Val>) -> Result<(), TimelockError> {
+        if args.len() != 1 {
+            return Err(TimelockError::InvalidValue);
+        }
+        let arg = args.get(0).ok_or(TimelockError::InvalidValue)?;
+        if *function == Symbol::new(env, "set_min_delay") {
+            let v = u64::try_from_val(env, &arg).map_err(|_| TimelockError::InvalidValue)?;
+            env.storage().instance().set(&DataKey::MinDelay, &v);
+            env.events()
+                .publish((Symbol::new(env, "tl_delay_set"),), (v,));
+        } else if *function == Symbol::new(env, "set_grace_period") {
+            let v = u64::try_from_val(env, &arg).map_err(|_| TimelockError::InvalidValue)?;
+            if v == 0 {
+                return Err(TimelockError::InvalidValue);
+            }
+            env.storage().instance().set(&DataKey::GracePeriod, &v);
+            env.events()
+                .publish((Symbol::new(env, "tl_grace_set"),), (v,));
+        } else if *function == Symbol::new(env, "set_admin") {
+            let v = Address::try_from_val(env, &arg).map_err(|_| TimelockError::InvalidValue)?;
+            if v == env.current_contract_address() {
+                return Err(TimelockError::InvalidValue);
+            }
+            env.storage().instance().set(&DataKey::Admin, &v);
+            env.events()
+                .publish((Symbol::new(env, "tl_admin_set"),), (v,));
+        } else {
+            return Err(TimelockError::InvalidValue);
+        }
+        Self::bump_instance(env);
+        Ok(())
+    }
+
+    fn save_op(env: &Env, id: u64, op: &TimelockOperation) {
+        let key = DataKey::Operation(id);
+        env.storage().persistent().set(&key, op);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, OP_TTL_THRESHOLD, OP_TTL_EXTEND);
+    }
+
+    fn bump_instance(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
     }
 }
 

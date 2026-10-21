@@ -217,23 +217,6 @@ pub enum CoverageType {
     /// Coverage against stablecoin peg deviation (e.g. USDC < $0.95).
     StablecoinDepeg = 0,
     /// Coverage against broad market drawdowns (e.g. 24h return < -30%).
-    M
-
-#![no_std]
-#![warn(missing_docs)]
-
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
-};
-
-/// Coverage types offered across the protocol (must match RefractPool enum).
-#[contracttype]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u32)]
-pub enum CoverageType {
-    /// Coverage against stablecoin peg deviation (e.g. USDC < $0.95).
-    StablecoinDepeg = 0,
-    /// Coverage against broad market drawdowns (e.g. 24h return < -30%).
     MarketCrash = 1,
     /// Protection against DeFi collateral liquidation events.
     LiquidationShield = 2,
@@ -340,16 +323,10 @@ pub enum DataKey {
     PendingAdmin,
     /// #70: Track contract version for migration purposes
     ContractVersion,
-}
-    TotalPolicies,
-    /// Cumulative volume of collected premiums in 1e7 USDC (instance storage).
-    TotalPremium,
-    /// Count of currently active policies (instance storage).
-    ActivePolicies,
-    /// Issue #88: Pending admin awaiting acceptance
-    PendingAdmin,
-    /// #70: Track contract version for migration purposes
-    ContractVersion,
+    /// Pending pool-contract repoint awaiting its delay (instance storage).
+    PendingPoolContract,
+    /// Delay in seconds before a pool-contract repoint can be confirmed.
+    PoolContractChangeDelay,
 }
 
 /// Refract Policy Registry smart contract.
@@ -658,25 +635,67 @@ impl RefractPolicyRegistry {
     pub fn get_holder_active_policy_ids(env: Env, holder: Address) -> Vec<u64> {
         let ids: Vec<u64> = env
             .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .ok_or(RegistryError::NoPendingAdmin)?;
-        if pending != caller {
-            return Err(RegistryError::Unauthorized);
-        }
-        env.storage().instance().set(&DataKey::Admin, &caller);
-        env.storage().instance().remove(&DataKey::PendingAdmin);
+            .persistent()
+            .get(&DataKey::HolderPolicies(holder))
+            .unwrap_or_else(|| Vec::new(&env));
 
-        env.events()
-            .publish((Symbol::new(&env, "admin_accepted"),), (caller,));
-        Ok(())
+        let mut active = Vec::new(&env);
+        for id in ids.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PolicyRecord>(&DataKey::Policy(id))
+            {
+                if record.is_active {
+                    active.push_back(id);
+                }
+            }
+        }
+        active
+    }
+
+    pub fn get_stats(env: Env) -> Map<Symbol, i128> {
+        let mut stats: Map<Symbol, i128> = Map::new(&env);
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalPolicies)
+            .unwrap_or(0);
+        let premium: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalPremium)
+            .unwrap_or(0);
+        let active: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActivePolicies)
+            .unwrap_or(0);
+        stats.set(Symbol::new(&env, "total_policies"), total as i128);
+        stats.set(Symbol::new(&env, "total_premium"), premium);
+        stats.set(Symbol::new(&env, "active_policies"), active as i128);
+        stats
+    }
+
+    /// The address currently authorized to call set_admin()/
+    /// set_pool_contract(). Without this, verifying who holds admin
+    /// control meant replaying event history instead of just reading
+    /// current state.
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// The RefractPool address this registry currently trusts to call
+    /// register_policy()/deactivate_policy(). Without this,
+    /// set_pool_contract() would be a write with no matching read.
+    pub fn pool_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PoolContract)
     }
 
     /// #70: Admin-gated contract upgrade.
     pub fn upgrade(env: Env, caller: Address, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), RegistryError> {
         Self::require_admin(&env, &caller)?;
 
-        let old_wasm_hash = env.deployer().get_current_contract_wasm().unwrap_or_default();
         env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
 
         // Bump contract version for migration tracking
@@ -691,25 +710,7 @@ impl RefractPolicyRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "upgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
-        Ok(())
-    }
-
-            .storage()
-            .instance()
-            .get(&DataKey::ContractVersion)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::ContractVersion, &(version + 1));
-
-        env.events().publish(
-            (Symbol::new(&env, "upgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
-        Ok(())
-    }
+            (new_wasm_hash,),
         );
         Ok(())
     }

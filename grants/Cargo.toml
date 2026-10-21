@@ -2,13 +2,17 @@
 name = "refract-grants"
 version = "0.1.0"
 edition = "2021"
+description = "Refract milestone-based grants disbursement, gated by governance/timelock"
+license = "MIT"
 
 [lib]
 name = "refract_grants"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "21.0.0"
+soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+refract-timelock = { path = "../timelock" }

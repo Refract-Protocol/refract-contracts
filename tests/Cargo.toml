@@ -1,0 +1,43 @@
+[package]
+name = "refract-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "End-to-end tests: governance → timelock → treasury/grants/bounty/pool, and pool → backstop premium routing"
+license = "MIT"
+
+# Test-only crate: no library, no binaries. Each scenario file below is its
+# own test target and pulls the shared fixture in with `mod common;`.
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[dependencies]
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+refract-governance = { path = "../governance" }
+refract-timelock = { path = "../timelock" }
+refract-treasury = { path = "../treasury" }
+refract-grants = { path = "../grants" }
+refract-backstop = { path = "../backstop" }
+refract-bounty = { path = "../bounty" }
+refract-pool = { path = "../pool" }
+refract-policy = { path = "../policy" }
+
+[[test]]
+name = "e2e_treasury"
+path = "e2e_treasury.rs"
+
+[[test]]
+name = "e2e_grants"
+path = "e2e_grants.rs"
+
+[[test]]
+name = "e2e_premium_routing"
+path = "e2e_premium_routing.rs"
+
+[[test]]
+name = "e2e_bounty"
+path = "e2e_bounty.rs"

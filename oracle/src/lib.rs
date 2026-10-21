@@ -308,21 +308,6 @@ pub struct RelayerBondRecord {
     pub unstake_available_at: u64,
 }
 
-/// Oracle reading stored on-chain.
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct OracleReading {
-    /// Signed integer value in 1e7 precision.
-    /// For prices: USD price * 1e7.
-    /// For percentages: percent * 1e7 (e.g. -30% = -3_000_000).
-    /// For durations: minutes.
-    pub value: i128,
-    /// Unix timestamp when the reading was captured.
-    pub timestamp: u64,
-    /// Source or provider identifier for the reading.
-    pub source: Symbol,
-}
-
 /// Structured metadata describing a feed's shape.
 ///
 /// Settable by the admin via [`RefractOracle::set_feed_metadata`].
@@ -351,17 +336,6 @@ pub struct FeedMetadata {
     pub expected_cadence_secs: u64,
 }
 
-#[contracttype]
-pub enum DataKey {
-    /// Contract administrator address key (instance storage).
-    Admin,
-    /// List of authorized relayer addresses (instance storage).
-    Relayers,
-    /// Oracle reading mapped by feed symbol (persistent storage).
-    Reading(Symbol),
-    /// Issue #95: Fallback oracle address for failover on primary staleness
-    FallbackOracle,
-    /// Issue #91: Per-relayer readings
 #[contracttype]
 pub enum DataKey {
     /// Contract administrator address key (instance storage).
@@ -476,8 +450,6 @@ impl RefractOracle {
                 &DataKey::RelayerReputation(relayer.clone()),
                 &REPUTATION_INITIAL,
             );
-            env.events()
-                .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         }
         env.storage()
             .instance()
@@ -589,7 +561,6 @@ impl RefractOracle {
     pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
 
-        let old_wasm_hash = env.deployer().get_current_contract_wasm().unwrap_or_default();
         env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
 
         // Bump contract version for migration tracking
@@ -604,7 +575,7 @@ impl RefractOracle {
 
         env.events().publish(
             (Symbol::new(&env, "upgraded"),),
-            (old_wasm_hash, new_wasm_hash),
+            (new_wasm_hash,),
         );
         Ok(())
     }
@@ -688,7 +659,6 @@ impl RefractOracle {
             (delta, updated),
         );
         Ok(())
-    }
     }
 
     // ─── Data submission ─────────────────────────────────────────────────
@@ -863,7 +833,6 @@ impl RefractOracle {
         let recent_rejection_count: u32 = 0;
 
         FeedHealth {
-            feed_id,
             last_updated_at,
             active_relayer_count,
             recent_rejection_count,

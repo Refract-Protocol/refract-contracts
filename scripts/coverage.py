@@ -44,7 +44,15 @@ import tomllib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATES = ("pool", "policy", "oracle")
-EXCLUDE_REGEX = r"(^|/)(pool|policy|oracle)/src/(test|pricing_proptest)\.rs$"
+# Test code is never part of the denominator: per-crate unit-test modules,
+# per-crate integration tests (`<crate>/tests/`), and the workspace-level
+# end-to-end suite (`tests/`, issue #202). The contract code those suites
+# exercise *is* measured and attributed to its own crate.
+EXCLUDE_REGEX = (
+    r"(^|/)[a-z_]+/src/(test|pricing_proptest)\.rs$"
+    r"|(^|/)[a-z_]+/tests/"
+    r"|(^|/)tests/(common/|e2e_[a-z_]+\.rs$)"
+)
 FLOOR_FILE = os.path.join(ROOT, "coverage-floor.toml")
 METRICS = ("lines", "branches")
 # Pinned so the proptest cases, and therefore coverage, are identical on every run.
@@ -256,7 +264,8 @@ def cmd_report(args):
         "### Test coverage",
         "",
         "Host-run unit tests only (`cargo llvm-cov --branch`). The wasm32 build is not "
-        "instrumented. Test modules (`src/test.rs`, `src/pricing_proptest.rs`) are excluded.",
+        "instrumented. Test code (`src/test.rs`, `src/pricing_proptest.rs`, `<crate>/tests/`, "
+        "the workspace `tests/` suite) is excluded; the contract code it exercises is counted.",
         "",
         render_table(summary, base, floors),
         "",
