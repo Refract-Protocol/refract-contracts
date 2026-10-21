@@ -23,6 +23,8 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
+pub mod bond;
+
 use std::collections::BTreeMap;
 
 /// Identifier for a grant.
