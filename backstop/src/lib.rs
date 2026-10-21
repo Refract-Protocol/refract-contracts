@@ -4,7 +4,7 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Ad
 
 pub mod curve;
 
-use curve::{utilization_bps, PremiumCurve, ONE};
+use curve::{premium_cut, utilization_bps, PremiumCurve};
 
 /// Basis-point denominator used for premium-share configuration.
 const BPS_DENOM: i128 = 10_000;
@@ -255,12 +255,7 @@ impl RefractBackstop {
         // ONE leaves the configured share unchanged. The cut never exceeds the
         // premium received.
         let multiplier = Self::curve(&env)?.multiplier(utilization_bps(state.exposure, state.total_capital));
-        let cut = amount
-            .checked_mul(config.premium_share_bps)
-            .and_then(|scaled| scaled.checked_mul(multiplier))
-            .ok_or(BackstopError::Overflow)?
-            / (BPS_DENOM * ONE);
-        let cut = cut.min(amount);
+        let cut = premium_cut(amount, config.premium_share_bps, multiplier).ok_or(BackstopError::Overflow)?;
         state.premium_income += cut;
         state.total_capital += cut;
         env.storage().instance().set(&"state", &state);

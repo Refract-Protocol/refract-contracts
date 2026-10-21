@@ -213,3 +213,63 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+# Governance-Adjacent Contract Specifications
+
+Normative clauses for `RefractBackstop` and `RefractGrants`. Bounty and treasury
+clauses will be added once their open pull requests merge, because the code they
+specify is not on this branch yet. Each clause has an id. Every clause must map to at least one
+test in `tests/conformance/clauses.toml`, and CI fails if a mapped test is missing
+(`scripts/check_clauses.py`). Wording: "MUST" means the behaviour is required and
+"MUST return error X" means the entrypoint returns that error and changes no state.
+
+Only the parts listed here are specified. Parts that are not implemented yet are
+listed under "Not specified" at the end of each contract.
+
+## Backstop
+
+### BACKSTOP-CURVE-1 Flat default
+Until governance sets a curve, the premium multiplier MUST be `ONE` (1.0), and
+`receive_premium` MUST route `amount * premium_share_bps / 10_000`.
+
+### BACKSTOP-CURVE-2 Monotone, bounded multiplier
+For any curve that passes validation, the multiplier MUST NOT decrease as
+utilization rises, and MUST stay within `[min_multiplier, max_multiplier]`.
+
+### BACKSTOP-CURVE-3 Validation
+`set_curve` MUST return `InvalidCurve` for any curve with a negative slope, a
+kink outside `[0, 10_000]`, `min_multiplier > max_multiplier`, or a bound above
+10.0x. Only the admin MUST be able to set a curve (`Unauthorized` otherwise).
+
+### BACKSTOP-CURVE-4 Premium never over-routed
+`receive_premium` MUST NOT route more than the amount received.
+
+Not specified: deposit and withdrawal accounting (see the pool invariants), per-feed
+exposure limits, and pool-side premium routing.
+
+## Grants
+
+### GRANTS-REVIEW-1 Deterministic assignment
+`assign_review` MUST pick the active, eligible reviewer with the fewest held slots,
+breaking ties by lowest address. It MUST return `NoEligibleReviewer` when none has
+capacity and the required tags.
+
+### GRANTS-REVIEW-2 No double assignment
+`assign_review` MUST return `AlreadyAssigned` for a slot that already has a reviewer.
+
+### GRANTS-REVIEW-3 Reassignment keeps history
+`reassign_review` MUST move the slot to a different eligible reviewer and MUST
+append the previous reviewer to the slot's history.
+
+### GRANTS-AUDIT-1 One record per privileged action
+Each successful governance-gated mutation MUST append exactly one audit record.
+A failed call MUST append none.
+
+### GRANTS-AUDIT-2 Chain verification
+`verify_chain` MUST return `Err(index)` for the first record whose sequence number,
+link to the previous record, or digest does not match.
+
+Not specified: conflict-of-interest and recusal, the stale-assignment timeout, and
+audit records in the other three contracts.

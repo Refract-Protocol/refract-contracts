@@ -75,6 +75,20 @@ impl PremiumCurve {
     }
 }
 
+/// Basis-point denominator for the premium share.
+const BPS_DENOM: i128 = 10_000;
+
+/// The part of `amount` routed to stakers: `amount * share_bps * multiplier`,
+/// with `share_bps` in basis points and `multiplier` in 1e7 fixed point. The
+/// result is never more than `amount`. Returns `None` on overflow.
+pub fn premium_cut(amount: i128, share_bps: i128, multiplier: i128) -> Option<i128> {
+    amount
+        .checked_mul(share_bps)?
+        .checked_mul(multiplier)?
+        .checked_div(BPS_DENOM * ONE)
+        .map(|cut| cut.min(amount))
+}
+
 /// Utilization in basis points: `exposure / total_capital`, capped at full.
 /// With no capital, any exposure counts as full utilization.
 pub fn utilization_bps(exposure: i128, total_capital: i128) -> i128 {
@@ -163,6 +177,18 @@ mod tests {
         let mut curve = sample();
         curve.max_multiplier = MAX_MULTIPLIER + 1;
         assert!(!curve.is_valid());
+    }
+
+    #[test]
+    fn premium_cut_never_exceeds_amount() {
+        // Flat curve at 100% share: the whole premium is routed.
+        assert_eq!(premium_cut(100, 10_000, ONE), Some(100));
+        // Flat curve at 25% share.
+        assert_eq!(premium_cut(100, 2_500, ONE), Some(25));
+        // A 10x multiplier on a 100% share would route 1000, so it is clamped.
+        assert_eq!(premium_cut(100, 10_000, MAX_MULTIPLIER), Some(100));
+        // Overflow is reported, not wrapped.
+        assert_eq!(premium_cut(i128::MAX, 10_000, ONE), None);
     }
 
     #[test]
