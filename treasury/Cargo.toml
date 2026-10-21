@@ -7,7 +7,10 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "20.0.0"
+soroban-sdk = { workspace = true }
+refract-common = { path = "../common" }
 
 [dev-dependencies]
-soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+refract-common = { path = "../common", features = ["testutils"] }
+refract-registry = { path = "../registry" }

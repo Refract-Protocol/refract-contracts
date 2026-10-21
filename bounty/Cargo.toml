@@ -10,7 +10,10 @@ name = "refract_bounty"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = { version = "21.0.0" }
+soroban-sdk = { workspace = true }
+refract-common = { path = "../common" }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+refract-common = { path = "../common", features = ["testutils"] }
+refract-registry = { path = "../registry" }

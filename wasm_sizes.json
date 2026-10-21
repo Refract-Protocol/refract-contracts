@@ -10,5 +10,25 @@
   "refract_oracle.wasm": {
     "budget_bytes": 40000,
     "status": "BUDGET_CODIFIED"
+  },
+  "refract_registry.wasm": {
+    "budget_bytes": 26000,
+    "status": "BUDGET_CODIFIED"
+  },
+  "refract_treasury.wasm": {
+    "budget_bytes": 36000,
+    "status": "BUDGET_CODIFIED"
+  },
+  "refract_bounty.wasm": {
+    "budget_bytes": 40000,
+    "status": "BUDGET_CODIFIED"
+  },
+  "refract_backstop.wasm": {
+    "budget_bytes": 42000,
+    "status": "BUDGET_CODIFIED"
+  },
+  "refract_grants.wasm": {
+    "budget_bytes": 72000,
+    "status": "BUDGET_CODIFIED"
   }
 }

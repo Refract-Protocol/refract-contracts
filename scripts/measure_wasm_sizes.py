@@ -13,6 +13,11 @@ BUDGETS = {
     "refract_pool.wasm": 65000,
     "refract_policy.wasm": 45000,
     "refract_oracle.wasm": 40000,
+    "refract_registry.wasm": 26000,
+    "refract_treasury.wasm": 36000,
+    "refract_bounty.wasm": 40000,
+    "refract_backstop.wasm": 42000,
+    "refract_grants.wasm": 72000,
 }
 
 def measure_sizes():

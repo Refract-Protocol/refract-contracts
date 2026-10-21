@@ -40,6 +40,9 @@ jobs:
       - name: Run wasm-level tests
         run: cargo test --all -- wasm_test
 
+      - name: Backstop stress scenarios (issue #283)
+        run: cargo test -p refract-backstop --test stress -- --nocapture --test-threads=1
+
       - name: Soroban static-analysis gate
         run: python3 scripts/check_soroban_footguns.py
 
