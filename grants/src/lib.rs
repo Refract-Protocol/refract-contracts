@@ -58,6 +58,50 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// The reviewer is not in the registry.
+    ReviewerNotFound,
+    /// A reviewer's concurrent capacity must be at least one.
+    InvalidCapacity,
+    /// No active reviewer has spare capacity and the required tags.
+    NoEligibleReviewer,
+    /// The review slot already has a reviewer assigned.
+    AlreadyAssigned,
+    /// The review slot has no assignment to reassign.
+    AssignmentNotFound,
+}
+
+/// A review slot: the application itself (`None`) or one milestone (`Some(index)`).
+pub type ReviewSlot = (GrantId, Option<usize>);
+
+/// A registered reviewer and their current workload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reviewer {
+    /// Inactive reviewers are never picked for new assignments.
+    pub active: bool,
+    /// Most review slots this reviewer may hold at once.
+    pub max_concurrent: u32,
+    /// Review slots currently held.
+    pub current: u32,
+    /// Specialization tags as a bitmask. A reviewer is eligible for a slot when
+    /// their tags include every bit the slot requires.
+    pub tags: u32,
+}
+
+/// Who is reviewing a slot now, and everyone who reviewed it before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    pub reviewer: Address,
+    /// Every reviewer this slot has had, oldest first, including the current one.
+    pub history: Vec<Address>,
+}
+
+/// Audit events for reviewer registry and assignment changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantsEvent {
+    ReviewerRegistered(Address),
+    ReviewerDeactivated(Address),
+    Assigned { slot: ReviewSlot, reviewer: Address },
+    Reassigned { slot: ReviewSlot, from: Address, to: Address },
 }
 
 /// A single milestone within a grant.
@@ -94,6 +138,12 @@ pub struct RefractGrants {
     next_grant_id: GrantId,
     /// Stored grants keyed by id.
     grants: BTreeMap<GrantId, Grant>,
+    /// Registered reviewers keyed by address.
+    reviewers: BTreeMap<Address, Reviewer>,
+    /// Current assignment for each review slot.
+    assignments: BTreeMap<ReviewSlot, Assignment>,
+    /// Audit log of registry and assignment changes, in order.
+    events: Vec<GrantsEvent>,
 }
 
 impl RefractGrants {
@@ -103,7 +153,161 @@ impl RefractGrants {
             governance,
             next_grant_id: 0,
             grants: BTreeMap::new(),
+            reviewers: BTreeMap::new(),
+            assignments: BTreeMap::new(),
+            events: Vec::new(),
         }
+    }
+
+    /// Returns the reviewer registered at `reviewer`, if any.
+    pub fn reviewer(&self, reviewer: Address) -> Option<&Reviewer> {
+        self.reviewers.get(&reviewer)
+    }
+
+    /// Returns the current assignment for `slot`, if any.
+    pub fn assignment(&self, slot: ReviewSlot) -> Option<&Assignment> {
+        self.assignments.get(&slot)
+    }
+
+    /// Returns the audit log of reviewer and assignment changes.
+    pub fn events(&self) -> &[GrantsEvent] {
+        &self.events
+    }
+
+    /// Registers `reviewer`, or updates an existing entry's capacity and tags.
+    /// Keeps the reviewer's current workload. Governance-gated.
+    pub fn register_reviewer(
+        &mut self,
+        caller: Address,
+        reviewer: Address,
+        max_concurrent: u32,
+        tags: u32,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        if max_concurrent == 0 {
+            return Err(GrantsError::InvalidCapacity);
+        }
+        let current = self.reviewers.get(&reviewer).map_or(0, |r| r.current);
+        self.reviewers.insert(
+            reviewer,
+            Reviewer {
+                active: true,
+                max_concurrent,
+                current,
+                tags,
+            },
+        );
+        self.events.push(GrantsEvent::ReviewerRegistered(reviewer));
+        Ok(())
+    }
+
+    /// Stops `reviewer` receiving new assignments. Existing assignments stay
+    /// until they are reassigned. Governance-gated.
+    pub fn deactivate_reviewer(&mut self, caller: Address, reviewer: Address) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        let entry = self
+            .reviewers
+            .get_mut(&reviewer)
+            .ok_or(GrantsError::ReviewerNotFound)?;
+        entry.active = false;
+        self.events.push(GrantsEvent::ReviewerDeactivated(reviewer));
+        Ok(())
+    }
+
+    /// Assigns an unassigned review slot to the least-loaded eligible reviewer.
+    /// Ties go to the lowest address. Governance-gated.
+    pub fn assign_review(
+        &mut self,
+        caller: Address,
+        slot: ReviewSlot,
+        required_tags: u32,
+    ) -> Result<Address, GrantsError> {
+        self.require_governance(caller)?;
+        self.require_grant_exists(slot.0)?;
+        if self.assignments.contains_key(&slot) {
+            return Err(GrantsError::AlreadyAssigned);
+        }
+        let reviewer = self.pick_reviewer(required_tags, None)?;
+        self.hold(reviewer);
+        self.assignments.insert(
+            slot,
+            Assignment {
+                reviewer,
+                history: vec![reviewer],
+            },
+        );
+        self.events.push(GrantsEvent::Assigned { slot, reviewer });
+        Ok(reviewer)
+    }
+
+    /// Moves a slot to a different eligible reviewer, for example after a
+    /// deactivation, a recusal or a stale-assignment timeout. The previous
+    /// reviewer stays in the slot's history. Governance-gated.
+    pub fn reassign_review(
+        &mut self,
+        caller: Address,
+        slot: ReviewSlot,
+        required_tags: u32,
+    ) -> Result<Address, GrantsError> {
+        self.require_governance(caller)?;
+        let from = self
+            .assignments
+            .get(&slot)
+            .ok_or(GrantsError::AssignmentNotFound)?
+            .reviewer;
+        let to = self.pick_reviewer(required_tags, Some(from))?;
+        self.release(from);
+        self.hold(to);
+
+        let assignment = self
+            .assignments
+            .get_mut(&slot)
+            .ok_or(GrantsError::AssignmentNotFound)?;
+        assignment.reviewer = to;
+        assignment.history.push(to);
+        self.events.push(GrantsEvent::Reassigned { slot, from, to });
+        Ok(to)
+    }
+
+    /// Chooses the active reviewer with spare capacity and the required tags
+    /// who holds the fewest slots, skipping `exclude`. Ties go to the lowest
+    /// address, since the registry is iterated in address order.
+    fn pick_reviewer(&self, required_tags: u32, exclude: Option<Address>) -> Result<Address, GrantsError> {
+        let mut best: Option<(u32, Address)> = None;
+        for (address, reviewer) in &self.reviewers {
+            if Some(*address) == exclude
+                || !reviewer.active
+                || reviewer.current >= reviewer.max_concurrent
+                || reviewer.tags & required_tags != required_tags
+            {
+                continue;
+            }
+            match best {
+                Some((load, _)) if load <= reviewer.current => {}
+                _ => best = Some((reviewer.current, *address)),
+            }
+        }
+        best.map(|(_, address)| address)
+            .ok_or(GrantsError::NoEligibleReviewer)
+    }
+
+    fn hold(&mut self, reviewer: Address) {
+        if let Some(entry) = self.reviewers.get_mut(&reviewer) {
+            entry.current += 1;
+        }
+    }
+
+    fn release(&mut self, reviewer: Address) {
+        if let Some(entry) = self.reviewers.get_mut(&reviewer) {
+            entry.current = entry.current.saturating_sub(1);
+        }
+    }
+
+    fn require_grant_exists(&self, grant_id: GrantId) -> Result<(), GrantsError> {
+        if !self.grants.contains_key(&grant_id) {
+            return Err(GrantsError::GrantNotFound);
+        }
+        Ok(())
     }
 
     /// Returns the configured governance/timelock authority.
@@ -410,6 +614,122 @@ mod tests {
         assert_eq!(
             grants.confirm_milestone(GOVERNANCE, id, 5),
             Err(GrantsError::InvalidMilestoneIndex)
+        );
+    }
+
+    const REVIEWER_A: Address = 10;
+    const REVIEWER_B: Address = 11;
+    const TAG_LEGAL: u32 = 0b01;
+
+    fn with_grant() -> (RefractGrants, GrantId) {
+        let mut grants = contract();
+        let id = grants
+            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
+            .unwrap();
+        (grants, id)
+    }
+
+    #[test]
+    fn assigns_to_least_loaded_then_lowest_address() {
+        let (mut grants, id) = with_grant();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_B, 5, 0).unwrap();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 5, 0).unwrap();
+
+        // Equal load: lowest address wins.
+        assert_eq!(grants.assign_review(GOVERNANCE, (id, None), 0), Ok(REVIEWER_A));
+        // A now has one slot, so B is least loaded.
+        assert_eq!(grants.assign_review(GOVERNANCE, (id, Some(0)), 0), Ok(REVIEWER_B));
+        assert_eq!(grants.reviewer(REVIEWER_A).unwrap().current, 1);
+        assert_eq!(grants.reviewer(REVIEWER_B).unwrap().current, 1);
+    }
+
+    #[test]
+    fn respects_capacity() {
+        let (mut grants, id) = with_grant();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 1, 0).unwrap();
+
+        assert_eq!(grants.assign_review(GOVERNANCE, (id, None), 0), Ok(REVIEWER_A));
+        assert_eq!(
+            grants.assign_review(GOVERNANCE, (id, Some(0)), 0),
+            Err(GrantsError::NoEligibleReviewer)
+        );
+    }
+
+    #[test]
+    fn required_tags_filter_reviewers() {
+        let (mut grants, id) = with_grant();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 5, 0).unwrap();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_B, 5, TAG_LEGAL).unwrap();
+
+        assert_eq!(
+            grants.assign_review(GOVERNANCE, (id, None), TAG_LEGAL),
+            Ok(REVIEWER_B)
+        );
+    }
+
+    #[test]
+    fn deactivated_reviewer_is_not_picked() {
+        let (mut grants, id) = with_grant();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 5, 0).unwrap();
+        grants.deactivate_reviewer(GOVERNANCE, REVIEWER_A).unwrap();
+
+        assert_eq!(
+            grants.assign_review(GOVERNANCE, (id, None), 0),
+            Err(GrantsError::NoEligibleReviewer)
+        );
+    }
+
+    #[test]
+    fn reassign_moves_slot_and_keeps_history() {
+        let (mut grants, id) = with_grant();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 5, 0).unwrap();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_B, 5, 0).unwrap();
+        grants.assign_review(GOVERNANCE, (id, None), 0).unwrap();
+
+        grants.deactivate_reviewer(GOVERNANCE, REVIEWER_A).unwrap();
+        assert_eq!(grants.reassign_review(GOVERNANCE, (id, None), 0), Ok(REVIEWER_B));
+
+        let assignment = grants.assignment((id, None)).unwrap();
+        assert_eq!(assignment.reviewer, REVIEWER_B);
+        assert_eq!(assignment.history, vec![REVIEWER_A, REVIEWER_B]);
+        assert_eq!(grants.reviewer(REVIEWER_A).unwrap().current, 0);
+        assert_eq!(grants.reviewer(REVIEWER_B).unwrap().current, 1);
+    }
+
+    #[test]
+    fn assignment_changes_are_logged() {
+        let (mut grants, id) = with_grant();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 5, 0).unwrap();
+        grants.assign_review(GOVERNANCE, (id, None), 0).unwrap();
+
+        assert!(grants.events().contains(&GrantsEvent::Assigned {
+            slot: (id, None),
+            reviewer: REVIEWER_A,
+        }));
+    }
+
+    #[test]
+    fn reviewer_registry_is_governance_gated() {
+        let mut grants = contract();
+        assert_eq!(
+            grants.register_reviewer(STRANGER, REVIEWER_A, 1, 0),
+            Err(GrantsError::Unauthorized)
+        );
+        assert_eq!(
+            grants.register_reviewer(GOVERNANCE, REVIEWER_A, 0, 0),
+            Err(GrantsError::InvalidCapacity)
+        );
+    }
+
+    #[test]
+    fn slot_cannot_be_assigned_twice() {
+        let (mut grants, id) = with_grant();
+        grants.register_reviewer(GOVERNANCE, REVIEWER_A, 5, 0).unwrap();
+        grants.assign_review(GOVERNANCE, (id, None), 0).unwrap();
+
+        assert_eq!(
+            grants.assign_review(GOVERNANCE, (id, None), 0),
+            Err(GrantsError::AlreadyAssigned)
         );
     }
 }
