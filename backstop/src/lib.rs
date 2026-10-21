@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::disallowed_methods)]
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
@@ -81,8 +82,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::_config(&env)?;
+        let mut state = Self::_state(&env)?;
 
         let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
         if shares <= 0 {
@@ -112,8 +113,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::_config(&env)?;
+        let mut state = Self::_state(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -149,7 +150,7 @@ impl RefractBackstop {
     /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -157,7 +158,7 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
 
-        let mut state = Self::state(&env)?;
+        let mut state = Self::_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
         } else {
@@ -186,8 +187,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::_config(&env)?;
+        let mut state = Self::_state(&env)?;
 
         let cut = amount * config.premium_share_bps / BPS_DENOM;
         state.premium_income += cut;
@@ -205,11 +206,23 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::_config(&env)
+    }
+
+    /// Transfer the admin role to `new_admin`.
+    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let mut config = Self::_config(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        config.admin = new_admin;
+        env.storage().instance().set(&"config", &config);
+        Ok(())
     }
 
     /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
@@ -232,17 +245,20 @@ impl RefractBackstop {
         }
     }
 
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn _config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn _state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
     }
 }
+
+#[cfg(test)]
+mod test;

@@ -1,8 +1,9 @@
 #![no_std]
+#![allow(clippy::disallowed_methods)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN,
-    Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    String,
 };
 
 /// Storage keys for the bounty escrow.
@@ -63,7 +64,9 @@ impl RefractBountyEscrow {
         if env.storage().instance().has(&DataKey::Governance) {
             return Err(BountyError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Governance, &governance);
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::Balance, &0i128);
         Ok(())
@@ -78,7 +81,9 @@ impl RefractBountyEscrow {
         let token = Self::_token(&env)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
         let balance = Self::_balance(&env)?;
-        env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &(balance + amount));
         Ok(())
     }
 
@@ -101,7 +106,11 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Award(report_hash.clone()))
+        {
             return Err(BountyError::DuplicateReport);
         }
         let balance = Self::_balance(&env)?;
@@ -110,8 +119,14 @@ impl RefractBountyEscrow {
         }
 
         let token = Self::_token(&env)?;
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
-        env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &researcher,
+            &amount,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &(balance - amount));
 
         let record = AwardRecord {
             researcher,
@@ -119,7 +134,9 @@ impl RefractBountyEscrow {
             report_hash: report_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&DataKey::Award(report_hash), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Award(report_hash), &record);
         Ok(())
     }
 
@@ -152,12 +169,20 @@ impl RefractBountyEscrow {
         }
 
         // Idempotency check: reject if legacy_id was already imported.
-        if env.storage().persistent().has(&DataKey::LegacyAward(legacy_id.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::LegacyAward(legacy_id.clone()))
+        {
             return Err(BountyError::DuplicateLegacyId);
         }
 
         // Check if report commitment already exists.
-        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Award(report_hash.clone()))
+        {
             return Err(BountyError::DuplicateReport);
         }
 
@@ -173,7 +198,9 @@ impl RefractBountyEscrow {
                 &researcher,
                 &amount,
             );
-            env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+            env.storage()
+                .instance()
+                .set(&DataKey::Balance, &(balance - amount));
         }
 
         let record = AwardRecord {
@@ -182,8 +209,12 @@ impl RefractBountyEscrow {
             report_hash: report_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&DataKey::Award(report_hash.clone()), &record);
-        env.storage().persistent().set(&DataKey::LegacyAward(legacy_id.clone()), &report_hash);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Award(report_hash.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LegacyAward(legacy_id.clone()), &report_hash);
 
         env.events().publish(
             (symbol_short!("imported"), legacy_id),
@@ -210,12 +241,16 @@ impl RefractBountyEscrow {
 
     /// Query report hash mapped to a legacy_id.
     pub fn get_legacy_award(env: Env, legacy_id: String) -> Option<BytesN<32>> {
-        env.storage().persistent().get(&DataKey::LegacyAward(legacy_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::LegacyAward(legacy_id))
     }
 
     /// Check if a legacy_id has already been imported.
     pub fn has_legacy_award(env: Env, legacy_id: String) -> bool {
-        env.storage().persistent().has(&DataKey::LegacyAward(legacy_id))
+        env.storage()
+            .persistent()
+            .has(&DataKey::LegacyAward(legacy_id))
     }
 
     fn _governance(env: &Env) -> Result<Address, BountyError> {

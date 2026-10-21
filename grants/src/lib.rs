@@ -153,7 +153,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -267,6 +269,7 @@ impl RefractGrants {
     /// - `confirmed_count`: how many milestones were delivered and confirmed off-chain.
     /// - `claimed_count`: how many confirmed milestones were already claimed/paid off-chain.
     /// - Any milestone confirmed but not yet claimed becomes immediately claimable by recipient.
+    #[allow(clippy::too_many_arguments)]
     pub fn import_legacy_grant(
         &mut self,
         caller: Address,
@@ -297,7 +300,9 @@ impl RefractGrants {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = sum
+                .checked_add(*amount)
+                .ok_or(GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -349,6 +354,17 @@ impl RefractGrants {
         self.legacy_grants.contains_key(legacy_id)
     }
 
+    /// Transfer governance authority to `new_governance`.
+    pub fn set_governance(
+        &mut self,
+        caller: Address,
+        new_governance: Address,
+    ) -> Result<(), GrantsError> {
+        self.require_governance(caller)?;
+        self.governance = new_governance;
+        Ok(())
+    }
+
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
         if caller != self.governance {
             return Err(GrantsError::Unauthorized);
@@ -358,260 +374,4 @@ impl RefractGrants {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const GOVERNANCE: Address = 1;
-    const RECIPIENT: Address = 2;
-    const STRANGER: Address = 3;
-
-    fn contract() -> RefractGrants {
-        RefractGrants::new(GOVERNANCE)
-    }
-
-    #[test]
-    fn full_lifecycle_create_confirm_claim() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        // Nothing claimable before any confirmation.
-        assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        assert_eq!(grants.claimable(id), Some(100));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-        assert_eq!(grants.claimable(id), Some(0));
-
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 2).unwrap();
-        assert_eq!(grants.claimable(id), Some(200));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn claim_releases_only_confirmed_amounts() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
-            .unwrap();
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn rejects_milestone_sum_mismatch() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_milestones() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![]),
-            Err(GrantsError::NoMilestones)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 0, vec![0]),
-            Err(GrantsError::InvalidTotalAmount)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![100, 0]),
-            Err(GrantsError::InvalidMilestoneAmount)
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_order_confirmation() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneAlreadyConfirmed)
-        );
-    }
-
-    #[test]
-    fn enforces_governance_gating() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
-            Err(GrantsError::Unauthorized)
-        );
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-
-        assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
-        );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
-        );
-    }
-
-    #[test]
-    fn test_import_legacy_grant_with_confirmed_and_claimed_milestones() {
-        let mut grants = contract();
-        let legacy_id = "GRANT-LEGACY-001".to_string();
-
-        assert!(!grants.has_legacy_grant(&legacy_id));
-        assert_eq!(grants.get_grant_by_legacy_id(&legacy_id), None);
-
-        // Grant of 300 with 3 milestones of 100 each.
-        // Milestone 0: confirmed and claimed off-chain.
-        // Milestone 1: confirmed off-chain, NOT claimed.
-        // Milestone 2: pending / unconfirmed.
-        let grant_id = grants
-            .import_legacy_grant(
-                GOVERNANCE,
-                legacy_id.clone(),
-                RECIPIENT,
-                300,
-                vec![100, 100, 100],
-                2, // confirmed_count: 0 and 1
-                1, // claimed_count: 0
-            )
-            .unwrap();
-
-        assert!(grants.has_legacy_grant(&legacy_id));
-        assert_eq!(grants.get_grant_by_legacy_id(&legacy_id), Some(grant_id));
-
-        let grant = grants.get_grant(grant_id).unwrap();
-        assert_eq!(grant.legacy_id.as_deref(), Some("GRANT-LEGACY-001"));
-        assert_eq!(grant.total_amount, 300);
-        assert_eq!(grant.milestones[0].confirmed, true);
-        assert_eq!(grant.milestones[0].claimed, true);
-        assert_eq!(grant.milestones[1].confirmed, true);
-        assert_eq!(grant.milestones[1].claimed, false);
-        assert_eq!(grant.milestones[2].confirmed, false);
-        assert_eq!(grant.milestones[2].claimed, false);
-        // Only milestone 1 is confirmed-but-unclaimed (100)
-        assert_eq!(grant.claimable, 100);
-
-        // Recipient can claim the remaining confirmed milestone
-        assert_eq!(grants.claim(RECIPIENT, grant_id), Ok(100));
-        assert_eq!(grants.claimable(grant_id), Some(0));
-
-        // Governance can confirm the 3rd milestone on-chain
-        grants.confirm_milestone(GOVERNANCE, grant_id, 2).unwrap();
-        assert_eq!(grants.claimable(grant_id), Some(100));
-        assert_eq!(grants.claim(RECIPIENT, grant_id), Ok(100));
-
-        // Re-importing duplicate legacy_id must be rejected
-        let dup_res = grants.import_legacy_grant(
-            GOVERNANCE,
-            legacy_id,
-            RECIPIENT,
-            300,
-            vec![100, 100, 100],
-            0,
-            0,
-        );
-        assert_eq!(dup_res, Err(GrantsError::DuplicateLegacyId));
-    }
-
-    #[test]
-    fn test_import_legacy_grant_unauthorized() {
-        let mut grants = contract();
-        let res = grants.import_legacy_grant(
-            STRANGER,
-            "GRANT-002".to_string(),
-            RECIPIENT,
-            100,
-            vec![100],
-            0,
-            0,
-        );
-        assert_eq!(res, Err(GrantsError::Unauthorized));
-    }
-
-    #[test]
-    fn test_import_legacy_grant_invalid_bounds() {
-        let mut grants = contract();
-        // claimed_count > confirmed_count
-        let res = grants.import_legacy_grant(
-            GOVERNANCE,
-            "GRANT-003".to_string(),
-            RECIPIENT,
-            100,
-            vec![100],
-            0,
-            1,
-        );
-        assert_eq!(res, Err(GrantsError::MilestoneOutOfOrder));
-
-        // confirmed_count > milestones.len()
-        let res2 = grants.import_legacy_grant(
-            GOVERNANCE,
-            "GRANT-004".to_string(),
-            RECIPIENT,
-            100,
-            vec![100],
-            2,
-            0,
-        );
-        assert_eq!(res2, Err(GrantsError::MilestoneOutOfOrder));
-    }
-}
+mod test;

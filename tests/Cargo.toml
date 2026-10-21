@@ -1,0 +1,17 @@
+[package]
+name = "refract-auth-tests"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+soroban-sdk = { workspace = true }
+refract-backstop = { path = "../backstop" }
+refract-bounty = { path = "../bounty" }
+refract-treasury = { path = "../treasury" }
+refract-grants = { path = "../grants" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
