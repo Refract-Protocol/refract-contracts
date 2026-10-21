@@ -23,6 +23,8 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
+pub mod rate_limit;
+
 use std::collections::BTreeMap;
 
 /// Most grant ids one page returns. Larger requested limits are capped to this,
