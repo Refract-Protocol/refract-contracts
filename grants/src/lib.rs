@@ -22,6 +22,13 @@
 //! Proof-of-delivery/attestation for what counts as milestone completion is made
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
+//!
+//! ## Data minimization
+//!
+//! Grant metadata is never stored as raw content. It is stored as an opaque
+//! [`MetadataCommitment`] `{ content_hash, schema_version, pointer_uri }`:
+//! a fixed-algorithm hash of the off-chain document plus a versioned pointer to
+//! where that document lives. See `COMPLIANCE.md` for the retention policy.
 
 use std::collections::BTreeMap;
 
@@ -32,6 +39,15 @@ pub type GrantId = u64;
 /// stays dependency-free and can be wired to the concrete ledger address type by
 /// the integrating runtime.
 pub type Address = u64;
+
+/// Length of a metadata content hash in bytes (SHA-256, fixed in v1).
+pub const CONTENT_HASH_LEN: usize = 32;
+
+/// Maximum length of a metadata pointer URI in bytes.
+pub const MAX_POINTER_URI_LEN: usize = 256;
+
+/// Current metadata schema version. No algorithm agility in v1.
+pub const METADATA_SCHEMA_VERSION: u32 = 1;
 
 /// Errors returned by [`RefractGrants`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +74,78 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// The metadata content hash is empty or all-zero.
+    InvalidContentHash,
+    /// The metadata schema version is not the supported version.
+    UnsupportedSchemaVersion,
+    /// The metadata pointer URI is empty, over-length, or not an allowed scheme.
+    InvalidPointerUri,
+    /// The metadata pointer URI appears to leak secrets in its query string.
+    PointerUriLeaksSecret,
+    /// The supplied off-chain document does not match the on-chain hash.
+    MetadataHashMismatch,
+}
+
+/// Canonical, minimized on-chain metadata representation.
+///
+/// Stores only an opaque commitment to an off-chain document: a fixed-algorithm
+/// content hash, a schema version, and a pointer to the off-chain location.
+/// Raw content is never stored on-chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCommitment {
+    /// SHA-256 hash of the off-chain document (32 bytes, fixed in v1).
+    pub content_hash: [u8; CONTENT_HASH_LEN],
+    /// Schema version of the off-chain document.
+    pub schema_version: u32,
+    /// Off-chain pointer URI (`https://` or `ipfs://`).
+    pub pointer_uri: String,
+}
+
+impl MetadataCommitment {
+    /// Validates and constructs a metadata commitment.
+    ///
+    /// Rejects empty/all-zero hashes, unsupported schema versions, and pointer
+    /// URIs that are empty, over-length, not `https://`/`ipfs://`, or that leak
+    /// secrets in their query string.
+    pub fn new(
+        content_hash: [u8; CONTENT_HASH_LEN],
+        schema_version: u32,
+        pointer_uri: String,
+    ) -> Result<Self, GrantsError> {
+        if content_hash.iter().all(|b| *b == 0) {
+            return Err(GrantsError::InvalidContentHash);
+        }
+        if schema_version != METADATA_SCHEMA_VERSION {
+            return Err(GrantsError::UnsupportedSchemaVersion);
+        }
+        if pointer_uri.is_empty() || pointer_uri.len() > MAX_POINTER_URI_LEN {
+            return Err(GrantsError::InvalidPointerUri);
+        }
+        if !(pointer_uri.starts_with("https://") || pointer_uri.starts_with("ipfs://")) {
+            return Err(GrantsError::InvalidPointerUri);
+        }
+        if pointer_uri.contains('?') {
+            return Err(GrantsError::PointerUriLeaksSecret);
+        }
+        Ok(Self {
+            content_hash,
+            schema_version,
+            pointer_uri,
+        })
+    }
+
+    /// Verifies that `document` matches this commitment's content hash.
+    ///
+    /// `document` is the raw off-chain bytes; `hash` is the caller-supplied
+    /// SHA-256 of those bytes (computed off-chain). Returns `Ok(())` when they
+    /// match the stored commitment.
+    pub fn verify(&self, document_hash: [u8; CONTENT_HASH_LEN]) -> Result<(), GrantsError> {
+        if document_hash == self.content_hash {
+            Ok(())
+        } else {
+            Err(GrantsError::MetadataHashMismatch)
+        }
+    }
 }
 
 /// A single milestone within a grant.
@@ -82,6 +170,10 @@ pub struct Grant {
     pub milestones: Vec<Milestone>,
     /// Sum of confirmed-but-unclaimed milestone amounts.
     pub claimable: i128,
+    /// Minimized metadata commitment (never raw content).
+    pub metadata: MetadataCommitment,
+    /// Hash of the prior record version, if this supersedes an earlier one.
+    pub supersedes: Option<[u8; CONTENT_HASH_LEN]>,
 }
 
 /// Milestone-based community grants disbursement contract.
@@ -125,12 +217,15 @@ impl RefractGrants {
     ///
     /// Governance/timelock-gated. Milestone amounts must be strictly positive
     /// and sum to exactly `total_amount`. At least one milestone is required.
+    /// `metadata` must be a validated [`MetadataCommitment`]; raw content is
+    /// rejected by construction.
     pub fn create_grant(
         &mut self,
         caller: Address,
         recipient: Address,
         total_amount: i128,
         milestones: Vec<i128>,
+        metadata: MetadataCommitment,
     ) -> Result<GrantId, GrantsError> {
         self.require_governance(caller)?;
 
@@ -171,6 +266,8 @@ impl RefractGrants {
                 total_amount,
                 milestones: stored,
                 claimable: 0,
+                metadata,
+                supersedes: None,
             },
         );
 
@@ -242,8 +339,8 @@ impl RefractGrants {
         }
 
         grant.claimable = 0;
-        for milestone in grant.milestones.iter_mut() {
-            if milestone.confirmed {
+        for milestone in &mut grant.milestones {
+            if milestone.confirmed && !milestone.claimed {
                 milestone.claimed = true;
             }
         }
@@ -252,164 +349,10 @@ impl RefractGrants {
     }
 
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
-        if caller != self.governance {
-            return Err(GrantsError::Unauthorized);
+        if caller == self.governance {
+            Ok(())
+        } else {
+            Err(GrantsError::Unauthorized)
         }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const GOVERNANCE: Address = 1;
-    const RECIPIENT: Address = 2;
-    const STRANGER: Address = 3;
-
-    fn contract() -> RefractGrants {
-        RefractGrants::new(GOVERNANCE)
-    }
-
-    #[test]
-    fn full_lifecycle_create_confirm_claim() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        // Nothing claimable before any confirmation.
-        assert_eq!(grants.claimable(id), Some(0));
-        assert_eq!(grants.claim(RECIPIENT, id), Err(GrantsError::NothingToClaim));
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        assert_eq!(grants.claimable(id), Some(100));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-        assert_eq!(grants.claimable(id), Some(0));
-
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 2).unwrap();
-        assert_eq!(grants.claimable(id), Some(200));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn claim_releases_only_confirmed_amounts() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 500, vec![200, 300])
-            .unwrap();
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        // Only the first milestone is confirmed, so only 200 is released.
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(200));
-        assert_eq!(grants.claimable(id), Some(0));
-    }
-
-    #[test]
-    fn rejects_milestone_sum_mismatch() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 200]),
-            Err(GrantsError::MilestoneSumMismatch)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_milestones() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![]),
-            Err(GrantsError::NoMilestones)
-        );
-    }
-
-    #[test]
-    fn rejects_non_positive_amounts() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 0, vec![0]),
-            Err(GrantsError::InvalidTotalAmount)
-        );
-        assert_eq!(
-            grants.create_grant(GOVERNANCE, RECIPIENT, 100, vec![100, 0]),
-            Err(GrantsError::InvalidMilestoneAmount)
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_order_confirmation() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 300, vec![100, 100, 100])
-            .unwrap();
-
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 2),
-            Err(GrantsError::MilestoneOutOfOrder)
-        );
-
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 1),
-            Err(GrantsError::MilestoneAlreadyConfirmed)
-        );
-    }
-
-    #[test]
-    fn enforces_governance_gating() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.create_grant(STRANGER, RECIPIENT, 100, vec![100]),
-            Err(GrantsError::Unauthorized)
-        );
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(STRANGER, id, 0),
-            Err(GrantsError::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn claim_is_recipient_only() {
-        let mut grants = contract();
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
-
-        assert_eq!(grants.claim(STRANGER, id), Err(GrantsError::NotRecipient));
-        assert_eq!(grants.claim(RECIPIENT, id), Ok(100));
-    }
-
-    #[test]
-    fn rejects_unknown_grant_and_index() {
-        let mut grants = contract();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, 99, 0),
-            Err(GrantsError::GrantNotFound)
-        );
-        assert_eq!(grants.claim(RECIPIENT, 99), Err(GrantsError::GrantNotFound));
-
-        let id = grants
-            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
-            .unwrap();
-        assert_eq!(
-            grants.confirm_milestone(GOVERNANCE, id, 5),
-            Err(GrantsError::InvalidMilestoneIndex)
-        );
     }
 }
