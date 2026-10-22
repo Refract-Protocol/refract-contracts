@@ -1,0 +1,13 @@
+[package]
+name = "refract-math"
+version = "0.1.0"
+edition = "2021"
+description = "Shared allocation, rounding and dust-routing helpers for Refract payout math"
+license = "MIT"
+
+[lib]
+name = "refract_math"
+path = "src/lib.rs"
+
+[dev-dependencies]
+proptest = { workspace = true }

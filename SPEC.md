@@ -213,3 +213,118 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Rounding, Dust and Remainder Distribution
+
+Every division that splits money between parties goes through the shared
+`refract-math` crate (`math/src/lib.rs`). No contract does its own `/` or `%`
+on amounts. All helpers return a typed error instead of panicking and use
+256-bit intermediates, so `a * b / c` never overflows when the result fits in
+an `i128`.
+
+### 8.1 Rules
+
+| Situation | Helper | Rounding | Where the remainder goes |
+|-----------|--------|----------|--------------------------|
+| Split among several recipients (bounty co-researchers, pro-rata shares) | `allocate(total, weights)` | Largest remainder | Handed out one unit at a time to the largest fractional remainders; there is no dust |
+| Two-party split (backstop premium share, partial milestone credit on termination) | `split_bps` / `split_ratio` | Floor the cut | `rest = amount - cut` goes to the other party explicitly |
+| One party against a pool (share mint, share redemption) | `mul_div_floor` | Floor, in the protocol's favour | Stays in the pool and is owned by the remaining holders |
+| Balance owned by nobody (backstop capital with zero shares) | `route_dust` | n/a | Treasury dust account (`RefractTreasury::credit_dust`) |
+
+Truncation is only used where the floor is safe: the residue stays in a pool
+whose remaining holders own it, so nothing becomes unowned and the pool can
+never become under-collateralised by rounding up.
+
+### 8.2 Largest-remainder allocation
+
+For `total >= 0` and weights `w_i >= 0` with `W = sum(w_i)`:
+
+1. `out_i = floor(total * w_i / W)`, `r_i = (total * w_i) mod W`.
+2. `L = total - sum(out_i)`; always `0 <= L < n`.
+3. Sort indices by `r_i` descending, then by index ascending (deterministic
+   tie-break). Add 1 to the first `L` of them.
+
+Guarantees: `sum(out) == total`; a zero weight gets zero; each `out_i` is
+within one unit of the exact share.
+
+### 8.3 Edge cases
+
+| Case | Result |
+|------|--------|
+| `total == 0` | All zeros (also for an empty or all-zero weight list) |
+| Zero-weight entries | Receive 0 |
+| Single recipient | Receives `total` |
+| More recipients than units | The first `total` recipients by remainder/index get 1 |
+| All weights zero, `total > 0` | `NoRecipients` error; the caller must route `total` to the dust account |
+| Weight sum exceeds `u128` | `Overflow` error |
+| Negative amount or weight | `Negative` error |
+
+### 8.4 Conservation
+
+For every allocation `sum(outputs) == input`, with no exceptions. This is
+asserted in code (debug assertion in `allocate`, `cut + rest == amount` by
+construction in `split_*`) and in tests: table tests per edge case and
+property tests over random totals and weights in `math/src/tests.rs`, plus
+regression tests at each call site (`backstop`, `bounty`, `grants`,
+`treasury`).
+
+### 8.5 Dust account
+
+`RefractTreasury` keeps a per-asset dust ledger. `credit_dust(from, token,
+amount)` pulls tokens in and records them; only the admin (timelock) can spend
+them with `withdraw_dust`. `withdraw` cannot touch dust or reserved funds.
+`RefractBackstop::sweep_dust` routes capital left over when no shares are
+outstanding.
+
+---
+
+## 9. Merkle Bulk Disbursement Encoding
+
+`RefractTreasury` can fund many recipients with one governance action by
+publishing a Merkle root (issue #278).
+
+### 9.1 Encoding
+
+```text
+leaf = sha256(0x00 || xdr(recipient) || xdr(asset) || be_i128(amount) || salt[32])
+node = sha256(0x01 || min(a, b) || max(a, b))
+```
+
+* `xdr(addr)` is the XDR of the address as an `ScVal` (what `Address::to_xdr`
+  returns): `u32 18` (SCV_ADDRESS), then `u32 0` + `u32 0` + 32-byte ed25519
+  key for an account, or `u32 1` + 32-byte hash for a contract.
+* `be_i128` is the 16-byte big-endian two's-complement amount.
+* The `0x00`/`0x01` prefixes separate leaves from inner nodes.
+* Leaves are sorted by hash before building the tree; an odd node at the end
+  of a level is carried up unchanged. Because pairs are sorted before hashing,
+  a proof is just the list of sibling hashes from leaf to root (at most
+  `MAX_PROOF_LEN = 32`).
+
+`scripts/merkle_batch.py` implements the same encoding. A golden vector is
+checked on both sides (`python3 scripts/merkle_batch.py selftest` and
+`golden_vector_matches_offchain_tool` in `treasury/src/test.rs`).
+
+### 9.2 Lifecycle
+
+| Step | Entrypoint | Rules |
+|------|------------|-------|
+| Publish | `publish_batch(caller, root, total_amount, asset, expiry)` | Admin (timelock) only. `total_amount > 0`, `expiry` in the future, and `total_amount <= free balance`. Reserves `total_amount`. Emits `batch_published`. |
+| Claim | `claim_leaf(batch_id, recipient, amount, salt, proof)` | Permissionless; pays the leaf's recipient. Fails after expiry, on a bad proof, on a second claim of the same leaf hash, or if cumulative claims would exceed `total_amount`. Emits `leaf_claimed` with the cumulative total. |
+| Sweep | `sweep_unclaimed(batch_id)` | Permissionless after expiry. Releases the unclaimed remainder back to free balance. Idempotent: a second call returns 0. Emits `batch_swept` with the cumulative total. |
+
+Claimed flags are stored per `(batch_id, leaf_hash)`, so storage grows with
+claims, not with the size of the leaf set. The off-chain tool rejects zero
+amounts and duplicate leaves and checks that the leaves sum to `total_amount`
+before printing the publish command; on-chain, a duplicate leaf can only be
+paid once and an over-committed tree cannot pay out more than was reserved.
+
+A lost proof can be recovered only by re-running `merkle_batch.py proof`
+against the saved batch file (it holds the salts) before the batch expires.
+
+### 9.3 Cost
+
+A claim against a 300-leaf batch (9-hash proof) costs about 2M CPU
+instructions in the test host, about 2% of the per-transaction limit
+(`stress_three_hundred_leaves_within_budget`).
