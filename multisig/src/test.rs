@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
-    Address, Env, Symbol, Val, Vec,
+    Address, Env, IntoVal, Symbol, Val, Vec,
 };
 
 // ── Minimal stub target ───────────────────────────────────────────────────────

@@ -69,9 +69,9 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        let token = Self::token(&env)?;
+        let token = Self::get_token(&env)?;
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
-        let balance = Self::balance(&env)?;
+        let balance = Self::get_balance(&env)?;
         env.storage().instance().set(&DataKey::Balance, &(balance + amount));
         Ok(())
     }
@@ -88,7 +88,7 @@ impl RefractBountyEscrow {
         report_hash: BytesN<32>,
     ) -> Result<(), BountyError> {
         caller.require_auth();
-        let governance = Self::governance(&env)?;
+        let governance = Self::get_governance(&env)?;
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
@@ -98,12 +98,12 @@ impl RefractBountyEscrow {
         if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
             return Err(BountyError::DuplicateReport);
         }
-        let balance = Self::balance(&env)?;
+        let balance = Self::get_balance(&env)?;
         if amount > balance {
             return Err(BountyError::InsufficientBalance);
         }
 
-        let token = Self::token(&env)?;
+        let token = Self::get_token(&env)?;
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
         env.storage().instance().set(&DataKey::Balance, &(balance - amount));
 
@@ -117,14 +117,29 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
+    /// Update governance/timelock address. Callable only by current governance.
+    pub fn set_governance(
+        env: Env,
+        caller: Address,
+        new_governance: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::get_governance(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Governance, &new_governance);
+        Ok(())
+    }
+
     /// Current funds held in escrow.
     pub fn balance(env: Env) -> Result<i128, BountyError> {
-        Self::balance(&env)
+        Self::get_balance(&env)
     }
 
     /// The governance/timelock address authorized to award payouts.
     pub fn governance(env: Env) -> Result<Address, BountyError> {
-        Self::governance(&env)
+        Self::get_governance(&env)
     }
 
     /// Immutable record of a rewarded disclosure, if any.
@@ -132,21 +147,21 @@ impl RefractBountyEscrow {
         env.storage().persistent().get(&DataKey::Award(report_hash))
     }
 
-    fn governance(env: &Env) -> Result<Address, BountyError> {
+    fn get_governance(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Governance)
             .ok_or(BountyError::NotInitialized)
     }
 
-    fn token(env: &Env) -> Result<Address, BountyError> {
+    fn get_token(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Token)
             .ok_or(BountyError::NotInitialized)
     }
 
-    fn balance(env: &Env) -> Result<i128, BountyError> {
+    fn get_balance(env: &Env) -> Result<i128, BountyError> {
         env.storage()
             .instance()
             .get(&DataKey::Balance)
