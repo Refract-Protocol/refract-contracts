@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 soroban-sdk = "21.0.0"
+sha2 = "0.10"
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
