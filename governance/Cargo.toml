@@ -8,6 +8,10 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+refract-interfaces = { path = "../interfaces" }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+refract-vetoken = { path = "../vetoken" }
+refract-backstop = { path = "../backstop", features = ["testutils"] }
+refract-timelock = { path = "../timelock" }
