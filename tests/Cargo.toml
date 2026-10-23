@@ -1,0 +1,15 @@
+[package]
+name = "refract-integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+refract-harness = { path = "../harness" }
+refract-treasury = { path = "../treasury" }
+refract-bounty = { path = "../bounty" }
+refract-backstop = { path = "../backstop" }
+refract-grants = { path = "../grants" }

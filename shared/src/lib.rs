@@ -5,5 +5,8 @@
 //! here.
 
 pub mod allowlist;
+pub mod facility;
 pub mod guardians;
+pub mod loss_event;
+pub mod version;
 pub mod withdrawal_queue;

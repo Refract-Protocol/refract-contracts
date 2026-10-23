@@ -289,6 +289,46 @@ combined. Quorum is `quorum_bps` of `GovernorConfig::total_voting_supply`.
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
 
+## 8. Protocol Revenue, Backstop, and Storage TTL
+
+### Bounty and grant payout fees
+
+`RefractBountyEscrow` and `RefractGrants` use a governance-authorized fee rate
+bounded by 1,000 basis points. `quote_payout` rounds the fee down so the
+recipient receives any fractional remainder; `net + fee == gross`. Accrued
+fees remain in the paying contract until permissionless `sweep_fees(token)`
+transfers the bucket to the configured treasury. Empty sweeps are no-ops.
+Stake refunds and rescue/treasury seeding paths do not use this payout helper.
+
+`RefractParams` is the shared source for `fee_bps`; its admin should be the
+RefractTimelock address. Bounty and grants read the value at payout time after
+their governance caller configures the registry and treasury addresses.
+
+### Multi-pool backstop accounting
+
+The backstop bounds its registry at 16 pools. For each pool it tracks the
+allocation, per-pool drawdown cap, absorbed losses, and premium contribution.
+Drawdowns use that pool's remaining allocation and then the unallocated shared
+buffer; a pool cannot consume another pool's reservation. Staker withdrawals
+cannot reduce capital below the sum of outstanding reservations. Deactivated
+pools may settle against their remaining allocation through the dedicated
+in-flight settlement entrypoint.
+
+Policy premiums can also be split between the treasury fee, the backstop share,
+and the LP remainder. The pool fee is separately configured by its governance
+admin and uses the same 1,000-basis-point ceiling and recipient-favoring
+rounding.
+
+### TTL keeper
+
+The four auxiliary contracts expose permissionless `bump(keys, requested_extend)`
+entrypoints with a 16-key batch limit and a 17,280–535,680 ledger extension
+range. Only instance storage and existing typed persistent records are
+allowlisted. `scripts/ttl_keeper.py` reads configured TTL ledger keys over
+Stellar RPC and emits JSON; `cargo xtask ttl status` and `cargo xtask ttl bump`
+use the same configuration. Live invocations require deployment-specific
+contract IDs, ledger keys, CLI commands, and a funded keeper identity.
+
 ---
 
 ## 8. Rounding, Dust and Remainder Distribution
@@ -403,6 +443,27 @@ against the saved batch file (it holds the salts) before the batch expires.
 A claim against a 300-leaf batch (9-hash proof) costs about 2M CPU
 instructions in the test host, about 2% of the per-transaction limit
 (`stress_three_hundred_leaves_within_budget`).
+
+---
+
+## 10. Interface Versioning (issue #248)
+
+Each contract crate embeds an interface version in its wasm:
+
+```rust
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
+```
+
+**Rule:** bump `refract_iface` by one in the same PR as any change to that
+contract's public interface: entrypoints added, removed or renamed, argument
+or return types changed, or `#[contracttype]` / `#[contracterror]` fields,
+variants or discriminants changed. Doc-comment-only edits don't need a bump.
+The version never goes down.
+
+The exported spec for every contract is committed under [`specs/`](specs/README.md).
+`python3 scripts/contract_specs.py check` (run in CI by the `contract-specs`
+job) fails when the committed spec differs from a fresh release build, or when
+the interface changed without a version bump.
 
 ---
 

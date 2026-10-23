@@ -1,24 +1,39 @@
 [workspace]
 resolver = "2"
 members = [
-    "common",
-    "shared",
-    "registry",
+    "harness",
+    "tests",
+    "timelock",
+    "multisig",
+    "integration",
+    "payout_registry",
     "backstop",
     "bounty",
     "grants",
     "treasury",
-    "integration",
-    "payout_registry",
+    "governance",
+    "vetoken",
     "pool",
     "policy",
     "oracle",
     "incident_response",
+    "params",
+    "snapshot_harness",
+    "xtask",
+]
+exclude = [
+    "pool",
+    "policy",
+    "oracle",
+    "incident_response",
+    "governance",
     "vetoken",
     "timelock",
     "multisig",
     "governance",
     "math",
+    "snapshot_harness",
+    "xtask",
 ]
 
 [workspace.dependencies]

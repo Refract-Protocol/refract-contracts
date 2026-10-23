@@ -1,0 +1,31 @@
+[keeper]
+rpc_url = "http://127.0.0.1:8000"
+network = "testnet"
+source_account = "ttl-keeper"
+stellar_cli = "stellar"
+threshold = 17280
+extend_to = 535680
+
+[[contracts]]
+name = "backstop"
+id = ""
+ttl_keys = []
+bump_command = []
+
+[[contracts]]
+name = "bounty"
+id = ""
+ttl_keys = []
+bump_command = []
+
+[[contracts]]
+name = "grants"
+id = ""
+ttl_keys = []
+bump_command = []
+
+[[contracts]]
+name = "treasury"
+id = ""
+ttl_keys = []
+bump_command = []

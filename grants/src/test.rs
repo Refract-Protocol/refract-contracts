@@ -1,723 +1,622 @@
-#![allow(clippy::disallowed_methods)]
-
 use super::*;
-use crate::appeals::{APPEAL_WINDOW_SECS, REREVIEW_TIMEOUT_SECS};
-use refract_common::payout::{PayoutStatus, RECLAIM_TIMEOUT_SECS};
-use refract_common::testutils::{MockMode, MockToken, MockTokenClient};
-use refract_registry::{RefractRegistry, RefractRegistryClient};
-use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk::vec;
 
-struct T {
-    env: Env,
-    g: RefractGrantsClient<'static>,
-    id: Address,
-    /// Registry `Timelock`: required for binding decisions.
-    tl: Address,
-    /// Registry `Governance`: day-to-day governance actions.
-    gov: Address,
-    mock: MockTokenClient<'static>,
+const GOVERNANCE: Address = 1;
+const RECIPIENT: Address = 2;
+const STRANGER: Address = 3;
+const CONTRACT: Address = 100;
+const TREASURY: Address = 101;
+const ASSET: Address = 500;
+const FUNDER_A: Address = 10;
+const FUNDER_B: Address = 11;
+const FUNDER_C: Address = 12;
+
+fn contract() -> RefractGrants {
+    let mut grants = RefractGrants::new(GOVERNANCE, CONTRACT);
+    grants
+        .set_funding_policy(GOVERNANCE, FundingPolicy::Permissionless)
+        .unwrap();
+    grants.set_treasury(GOVERNANCE, TREASURY).unwrap();
+    grants
 }
 
-fn h(env: &Env, n: u8) -> BytesN<32> {
-    BytesN::from_array(env, &[n; 32])
-}
-
-fn setup() -> T {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|l| l.timestamp = 1_000);
-    let deployer = Address::generate(&env);
-    let tl = Address::generate(&env);
-    let gov = Address::generate(&env);
-
-    let registry_id = env.register_contract(None, RefractRegistry);
-    let registry = RefractRegistryClient::new(&env, &registry_id);
-    registry.initialize(&deployer, &u64::MAX);
-    registry.bootstrap_set(&Role::Timelock, &tl);
-    registry.bootstrap_set(&Role::Governance, &gov);
-
-    let token = env.register_contract(None, MockToken);
-    let mock = MockTokenClient::new(&env, &token);
-
-    let id = env.register_contract(None, RefractGrants);
-    let g = RefractGrantsClient::new(&env, &id);
-    g.initialize(&registry_id, &token);
-    mock.mint(&id, &10_000);
-    T {
-        env,
-        g,
-        id,
-        tl,
-        gov,
-        mock,
+fn ledger() -> MemoryLedger {
+    let mut l = MemoryLedger::new();
+    for who in [FUNDER_A, FUNDER_B, FUNDER_C, TREASURY, STRANGER] {
+        l.mint(ASSET, who, 1_000_000);
     }
+    l
 }
 
-fn addrs(env: &Env, n: usize) -> Vec<Address> {
-    let mut v = Vec::new(env);
-    for _ in 0..n {
-        v.push_back(Address::generate(env));
-    }
-    v
+/// Creates a grant and funds it in full from FUNDER_A.
+fn funded_grant(
+    grants: &mut RefractGrants,
+    l: &mut MemoryLedger,
+    total: i128,
+    milestones: Vec<i128>,
+) -> GrantId {
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, total, milestones)
+        .unwrap();
+    grants.co_fund(FUNDER_A, id, total, l).unwrap();
+    id
 }
 
-// ─── Grants (ported from the original model) ─────────────────────────────────
+fn held(grants: &RefractGrants, id: GrantId, who: Address) -> i128 {
+    grants.funder_position(id, who).unwrap().held()
+}
+
+// ─── Existing behaviour ──────────────────────────────────────────────────
 
 #[test]
 fn full_lifecycle_create_confirm_claim() {
-    let t = setup();
-    let r = Address::generate(&t.env);
-    let id =
-        t.g.create_grant(&t.gov, &r, &300, &vec![&t.env, 100, 100, 100]);
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = funded_grant(&mut grants, &mut l, 300, vec![100, 100, 100]);
 
-    assert_eq!(t.g.get_grant(&id).map(|g| g.claimable), Some(0));
-    assert_eq!(t.g.try_claim(&r, &id), Err(Ok(GrantsError::NothingToClaim)));
+    // Nothing claimable before any confirmation.
+    assert_eq!(grants.claimable(id), Some(0));
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Err(GrantsError::NothingToClaim));
 
-    t.g.confirm_milestone(&t.gov, &id, &0);
-    assert_eq!(t.g.get_grant(&id).map(|g| g.claimable), Some(100));
-    assert_eq!(t.g.claim(&r, &id).amount, 100);
-    assert_eq!(t.mock.balance(&r), 100);
-    assert_eq!(t.g.get_grant(&id).map(|g| g.claimable), Some(0));
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+    assert_eq!(grants.claimable(id), Some(100));
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Ok(100));
+    assert_eq!(grants.claimable(id), Some(0));
 
-    t.g.confirm_milestone(&t.gov, &id, &1);
-    t.g.confirm_milestone(&t.tl, &id, &2);
-    assert_eq!(t.g.claim(&r, &id).amount, 200);
-    assert_eq!(t.mock.balance(&r), 300);
-    assert_eq!(t.g.committed(), 0);
+    grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
+    grants.confirm_milestone(GOVERNANCE, id, 2).unwrap();
+    assert_eq!(grants.claimable(id), Some(200));
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Ok(200));
+    assert_eq!(grants.claimable(id), Some(0));
+    assert_eq!(l.balance(ASSET, RECIPIENT), 300);
+    assert_eq!(grants.escrow_balance(ASSET), 0);
+    assert!(grants.escrow_matches_positions());
 }
 
 #[test]
-fn rejects_bad_milestones_and_totals() {
-    let t = setup();
-    let r = Address::generate(&t.env);
-    assert_eq!(
-        t.g.try_create_grant(&t.gov, &r, &300, &vec![&t.env, 100, 100]),
-        Err(Ok(GrantsError::MilestoneSumMismatch))
-    );
-    assert_eq!(
-        t.g.try_create_grant(&t.gov, &r, &100, &Vec::new(&t.env)),
-        Err(Ok(GrantsError::NoMilestones))
-    );
-    assert_eq!(
-        t.g.try_create_grant(&t.gov, &r, &0, &vec![&t.env, 0]),
-        Err(Ok(GrantsError::InvalidTotalAmount))
-    );
-    assert_eq!(
-        t.g.try_create_grant(&t.gov, &r, &100, &vec![&t.env, 100, 0]),
-        Err(Ok(GrantsError::InvalidMilestoneAmount))
-    );
+fn claim_releases_only_confirmed_amounts() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = funded_grant(&mut grants, &mut l, 500, vec![200, 300]);
+
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+    // Only the first milestone is confirmed, so only 200 is released.
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Ok(200));
+    assert_eq!(grants.claimable(id), Some(0));
 }
 
 #[test]
-fn grants_must_be_fully_backed() {
-    let t = setup();
-    let r = Address::generate(&t.env);
-    t.g.create_grant(&t.gov, &r, &8_000, &vec![&t.env, 8_000]);
-    assert_eq!(t.g.available(), 2_000);
+fn rejects_milestone_sum_mismatch() {
+    let mut grants = contract();
     assert_eq!(
-        t.g.try_create_grant(&t.gov, &r, &2_001, &vec![&t.env, 2_001]),
-        Err(Ok(GrantsError::InsufficientFunds))
+        grants.create_grant(GOVERNANCE, RECIPIENT, ASSET, 300, vec![100, 100]),
+        Err(GrantsError::MilestoneSumMismatch)
+    );
+    assert_eq!(
+        grants.create_grant(GOVERNANCE, RECIPIENT, ASSET, 300, vec![100, 100, 200]),
+        Err(GrantsError::MilestoneSumMismatch)
     );
 }
 
 #[test]
-fn rejects_out_of_order_and_double_confirmation() {
-    let t = setup();
-    let r = Address::generate(&t.env);
-    let id =
-        t.g.create_grant(&t.gov, &r, &300, &vec![&t.env, 100, 100, 100]);
+fn rejects_zero_milestones() {
+    let mut grants = contract();
     assert_eq!(
-        t.g.try_confirm_milestone(&t.gov, &id, &1),
-        Err(Ok(GrantsError::MilestoneOutOfOrder))
-    );
-    t.g.confirm_milestone(&t.gov, &id, &0);
-    t.g.confirm_milestone(&t.gov, &id, &1);
-    assert_eq!(
-        t.g.try_confirm_milestone(&t.gov, &id, &1),
-        Err(Ok(GrantsError::MilestoneAlreadyConfirmed))
-    );
-    assert_eq!(
-        t.g.try_confirm_milestone(&t.gov, &id, &5),
-        Err(Ok(GrantsError::InvalidMilestoneIndex))
+        grants.create_grant(GOVERNANCE, RECIPIENT, ASSET, 100, vec![]),
+        Err(GrantsError::NoMilestones)
     );
 }
 
 #[test]
-fn governance_gating_and_recipient_only_claim() {
-    let t = setup();
-    let r = Address::generate(&t.env);
-    let stranger = Address::generate(&t.env);
+fn rejects_non_positive_amounts() {
+    let mut grants = contract();
     assert_eq!(
-        t.g.try_create_grant(&stranger, &r, &100, &vec![&t.env, 100]),
-        Err(Ok(GrantsError::Unauthorized))
-    );
-    let id = t.g.create_grant(&t.gov, &r, &100, &vec![&t.env, 100]);
-    assert_eq!(
-        t.g.try_confirm_milestone(&stranger, &id, &0),
-        Err(Ok(GrantsError::Unauthorized))
-    );
-    t.g.confirm_milestone(&t.gov, &id, &0);
-    assert_eq!(
-        t.g.try_claim(&stranger, &id),
-        Err(Ok(GrantsError::NotRecipient))
-    );
-    assert_eq!(t.g.try_claim(&r, &99), Err(Ok(GrantsError::GrantNotFound)));
-}
-
-// ─── Payout resilience (#285) ────────────────────────────────────────────────
-
-#[test]
-fn frozen_recipient_claim_is_recorded_and_stays_committed() {
-    let t = setup();
-    let r = Address::generate(&t.env);
-    let id = t.g.create_grant(&t.gov, &r, &500, &vec![&t.env, 200, 300]);
-    t.g.confirm_milestone(&t.gov, &id, &0);
-    t.mock.set_mode(&r, &MockMode::Frozen);
-
-    let res = t.g.claim(&r, &id);
-    assert_eq!(res.outcome, TransferOutcome::Frozen);
-    assert_eq!(res.amount, 200);
-    let pid = res.payout_id.unwrap();
-
-    let grant = t.g.get_grant(&id).unwrap();
-    let m0 = grant.milestones.get(0).unwrap();
-    assert_eq!(m0.status, MilestoneStatus::Failed);
-    assert_eq!(m0.payout_id, Some(pid));
-    assert_eq!(grant.claimable, 0);
-    // Still owed: committed and liability both carry it.
-    assert_eq!(t.g.committed(), 500);
-    assert_eq!(t.g.liability(), 200);
-    assert_eq!(t.mock.balance(&t.id), 10_000);
-    assert_eq!(t.g.try_claim(&r, &id), Err(Ok(GrantsError::NothingToClaim)));
-
-    t.mock.set_mode(&r, &MockMode::Normal);
-    assert_eq!(t.g.retry_payout(&pid), TransferOutcome::Success);
-    assert_eq!(t.mock.balance(&r), 200);
-    assert_eq!(
-        t.g.get_grant(&id)
-            .unwrap()
-            .milestones
-            .get(0)
-            .unwrap()
-            .status,
-        MilestoneStatus::Paid
-    );
-    assert_eq!(t.g.committed(), 300);
-    assert_eq!(t.g.liability(), 0);
-}
-
-#[test]
-fn recipient_redirects_failed_and_future_payouts() {
-    let t = setup();
-    let r = Address::generate(&t.env);
-    let wallet = Address::generate(&t.env);
-    let id = t.g.create_grant(&t.gov, &r, &300, &vec![&t.env, 100, 200]);
-    t.g.confirm_milestone(&t.gov, &id, &0);
-    t.mock.set_mode(&r, &MockMode::MissingTrustline);
-    let pid = t.g.claim(&r, &id).payout_id.unwrap();
-
-    t.g.update_payout_address(&pid, &wallet);
-    assert_eq!(t.g.retry_payout(&pid), TransferOutcome::Success);
-    t.g.set_payout_address(&id, &wallet);
-    t.g.confirm_milestone(&t.gov, &id, &1);
-    assert_eq!(t.g.claim(&r, &id).outcome, TransferOutcome::Success);
-    assert_eq!(t.mock.balance(&wallet), 300);
-}
-
-#[test]
-fn reclaim_after_timeout_releases_commitment() {
-    let t = setup();
-    let r = Address::generate(&t.env);
-    let id = t.g.create_grant(&t.gov, &r, &400, &vec![&t.env, 400]);
-    t.g.confirm_milestone(&t.gov, &id, &0);
-    t.mock.set_mode(&r, &MockMode::Blocked);
-    let pid = t.g.claim(&r, &id).payout_id.unwrap();
-
-    assert_eq!(
-        t.g.try_reclaim_payout(&t.tl, &pid),
-        Err(Ok(GrantsError::ReclaimTooEarly))
-    );
-    t.env
-        .ledger()
-        .with_mut(|l| l.timestamp += RECLAIM_TIMEOUT_SECS);
-    // Governance role alone cannot reclaim: it must go through the timelock.
-    assert_eq!(
-        t.g.try_reclaim_payout(&t.gov, &pid),
-        Err(Ok(GrantsError::Unauthorized))
-    );
-    assert_eq!(t.g.reclaim_payout(&t.tl, &pid), 400);
-    assert_eq!(t.g.committed(), 0);
-    assert_eq!(t.g.available(), 10_000);
-    assert_eq!(
-        t.g.get_grant(&id)
-            .unwrap()
-            .milestones
-            .get(0)
-            .unwrap()
-            .status,
-        MilestoneStatus::Reclaimed
+        grants.create_grant(GOVERNANCE, RECIPIENT, ASSET, 0, vec![0]),
+        Err(GrantsError::InvalidTotalAmount)
     );
     assert_eq!(
-        t.g.get_failed_payout(&pid).unwrap().status,
-        PayoutStatus::Reclaimed
-    );
-}
-
-// ─── Applications and appeals (#282) ─────────────────────────────────────────
-
-/// Submits an application and has a 3-member panel reject it 1–2.
-fn rejected_app(t: &T) -> (u64, Address, Vec<Address>) {
-    let applicant = Address::generate(&t.env);
-    let app =
-        t.g.submit_application(&applicant, &h(&t.env, 1), &vec![&t.env, 300, 200]);
-    let reviewers = addrs(&t.env, 3);
-    t.g.assign_reviewers(&t.gov, &app, &reviewers);
-    t.g.submit_review(&reviewers.get(0).unwrap(), &app, &true, &h(&t.env, 10));
-    t.g.submit_review(&reviewers.get(1).unwrap(), &app, &false, &h(&t.env, 11));
-    let status =
-        t.g.submit_review(&reviewers.get(2).unwrap(), &app, &false, &h(&t.env, 12));
-    assert_eq!(status, ApplicationStatus::Rejected);
-    (app, applicant, reviewers)
-}
-
-#[test]
-fn initial_review_majority_and_tie_rules() {
-    let t = setup();
-    let a = Address::generate(&t.env);
-    let app =
-        t.g.submit_application(&a, &h(&t.env, 1), &vec![&t.env, 100]);
-    let rv = addrs(&t.env, 2);
-    t.g.assign_reviewers(&t.gov, &app, &rv);
-    t.g.submit_review(&rv.get(0).unwrap(), &app, &true, &h(&t.env, 2));
-    // 1-1 tie rejects.
-    assert_eq!(
-        t.g.submit_review(&rv.get(1).unwrap(), &app, &false, &h(&t.env, 3)),
-        ApplicationStatus::Rejected
-    );
-
-    let app2 =
-        t.g.submit_application(&a, &h(&t.env, 4), &vec![&t.env, 100]);
-    let rv2 = addrs(&t.env, 1);
-    t.g.assign_reviewers(&t.gov, &app2, &rv2);
-    assert_eq!(
-        t.g.submit_review(&rv2.get(0).unwrap(), &app2, &true, &h(&t.env, 5)),
-        ApplicationStatus::Approved
-    );
-    let gid = t.g.fund_application(&t.gov, &app2);
-    assert_eq!(t.g.get_grant(&gid).unwrap().recipient, a);
-    assert_eq!(
-        t.g.get_application(&app2).unwrap().status,
-        ApplicationStatus::Funded
+        grants.create_grant(GOVERNANCE, RECIPIENT, ASSET, 100, vec![100, 0]),
+        Err(GrantsError::InvalidMilestoneAmount)
     );
 }
 
 #[test]
-fn review_guards() {
-    let t = setup();
-    let a = Address::generate(&t.env);
-    let app =
-        t.g.submit_application(&a, &h(&t.env, 1), &vec![&t.env, 100]);
-    let rv = addrs(&t.env, 2);
-    // Applicant cannot review their own application.
+fn rejects_out_of_order_confirmation() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = funded_grant(&mut grants, &mut l, 300, vec![100, 100, 100]);
+
     assert_eq!(
-        t.g.try_assign_reviewers(&t.gov, &app, &vec![&t.env, a.clone()]),
-        Err(Ok(GrantsError::IneligibleReviewer))
+        grants.confirm_milestone(GOVERNANCE, id, 1),
+        Err(GrantsError::MilestoneOutOfOrder)
     );
-    let r0 = rv.get(0).unwrap();
     assert_eq!(
-        t.g.try_assign_reviewers(&t.gov, &app, &vec![&t.env, r0.clone(), r0.clone()]),
-        Err(Ok(GrantsError::InvalidPanel))
+        grants.confirm_milestone(GOVERNANCE, id, 2),
+        Err(GrantsError::MilestoneOutOfOrder)
     );
-    t.g.assign_reviewers(&t.gov, &app, &rv);
-    let outsider = Address::generate(&t.env);
+
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+    grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
     assert_eq!(
-        t.g.try_submit_review(&outsider, &app, &true, &h(&t.env, 2)),
-        Err(Ok(GrantsError::NotAssigned))
-    );
-    t.g.submit_review(&r0, &app, &true, &h(&t.env, 2));
-    assert_eq!(
-        t.g.try_submit_review(&r0, &app, &true, &h(&t.env, 2)),
-        Err(Ok(GrantsError::AlreadyVoted))
-    );
-    // Panel locked once voting has started.
-    assert_eq!(
-        t.g.try_assign_reviewers(&t.gov, &app, &addrs(&t.env, 2)),
-        Err(Ok(GrantsError::InvalidState))
+        grants.confirm_milestone(GOVERNANCE, id, 1),
+        Err(GrantsError::MilestoneAlreadyConfirmed)
     );
 }
 
 #[test]
-fn appeal_window_boundaries() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    let decided = t.g.get_application(&app).unwrap().decided_at;
+fn enforces_governance_gating() {
+    let mut grants = contract();
+    let mut l = ledger();
     assert_eq!(
-        t.g.appeal_status(&app).window_ends_at,
-        Some(decided + APPEAL_WINDOW_SECS)
+        grants.create_grant(STRANGER, RECIPIENT, ASSET, 100, vec![100]),
+        Err(GrantsError::Unauthorized)
     );
 
-    // Last second of the window is still open.
-    t.env
-        .ledger()
-        .with_mut(|l| l.timestamp = decided + APPEAL_WINDOW_SECS);
-    assert_eq!(t.g.submit_appeal(&applicant, &app, &h(&t.env, 50)), 1);
-
-    // A second application, one second past the window.
-    let (app2, applicant2, _) = rejected_app(&t);
-    let decided2 = t.g.get_application(&app2).unwrap().decided_at;
-    t.env
-        .ledger()
-        .with_mut(|l| l.timestamp = decided2 + APPEAL_WINDOW_SECS + 1);
+    let id = funded_grant(&mut grants, &mut l, 100, vec![100]);
     assert_eq!(
-        t.g.try_submit_appeal(&applicant2, &app2, &h(&t.env, 50)),
-        Err(Ok(GrantsError::AppealWindowClosed))
+        grants.confirm_milestone(STRANGER, id, 0),
+        Err(GrantsError::Unauthorized)
+    );
+    assert_eq!(grants.cancel_grant(STRANGER, id), Err(GrantsError::Unauthorized));
+    assert_eq!(grants.clawback_grant(STRANGER, id), Err(GrantsError::Unauthorized));
+    assert_eq!(
+        grants.set_funding_policy(STRANGER, FundingPolicy::Allowlist),
+        Err(GrantsError::Unauthorized)
+    );
+    assert_eq!(
+        grants.set_funder_allowed(STRANGER, STRANGER, true),
+        Err(GrantsError::Unauthorized)
+    );
+    assert_eq!(grants.set_treasury(STRANGER, STRANGER), Err(GrantsError::Unauthorized));
+    assert_eq!(
+        grants.credit_treasury_deposit(STRANGER, id, 1, &l),
+        Err(GrantsError::Unauthorized)
     );
 }
 
 #[test]
-fn only_applicant_and_only_rejected_can_appeal() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    let stranger = Address::generate(&t.env);
+fn claim_is_recipient_only() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = funded_grant(&mut grants, &mut l, 100, vec![100]);
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+
+    assert_eq!(grants.claim(STRANGER, id, &mut l), Err(GrantsError::NotRecipient));
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Ok(100));
+}
+
+#[test]
+fn rejects_unknown_grant_and_index() {
+    let mut grants = contract();
+    let mut l = ledger();
     assert_eq!(
-        t.g.try_submit_appeal(&stranger, &app, &h(&t.env, 50)),
-        Err(Ok(GrantsError::Unauthorized))
+        grants.confirm_milestone(GOVERNANCE, 99, 0),
+        Err(GrantsError::GrantNotFound)
     );
-    // Withdrawn applications cannot be appealed.
-    t.g.withdraw_application(&applicant, &app);
+    assert_eq!(grants.claim(RECIPIENT, 99, &mut l), Err(GrantsError::GrantNotFound));
+
+    let id = funded_grant(&mut grants, &mut l, 100, vec![100]);
     assert_eq!(
-        t.g.try_submit_appeal(&applicant, &app, &h(&t.env, 50)),
-        Err(Ok(GrantsError::InvalidState))
+        grants.confirm_milestone(GOVERNANCE, id, 5),
+        Err(GrantsError::InvalidMilestoneIndex)
+    );
+}
+
+// ─── Co-funding (#250) ───────────────────────────────────────────────────
+
+#[test]
+fn two_funders_pay_milestones_pro_rata() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 1_000, vec![400, 600])
+        .unwrap();
+    grants.co_fund(TREASURY, id, 750, &mut l).unwrap();
+    grants.co_fund(FUNDER_A, id, 250, &mut l).unwrap();
+    assert_eq!(grants.escrow_balance(ASSET), 1_000);
+
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+    assert_eq!(grants.funder_position(id, TREASURY).unwrap().allocated, 300);
+    assert_eq!(grants.funder_position(id, FUNDER_A).unwrap().allocated, 100);
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Ok(400));
+
+    grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Ok(600));
+    assert_eq!(grants.funder_position(id, TREASURY).unwrap().disbursed, 750);
+    assert_eq!(grants.funder_position(id, FUNDER_A).unwrap().disbursed, 250);
+    assert_eq!(grants.escrow_balance(ASSET), 0);
+    assert!(grants.escrow_matches_positions());
+}
+
+#[test]
+fn three_funders_remainder_goes_to_earliest_funders() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 300, vec![100, 200])
+        .unwrap();
+    for f in [FUNDER_A, FUNDER_B, FUNDER_C] {
+        grants.co_fund(f, id, 100, &mut l).unwrap();
+    }
+
+    // 100 / 3 = 33 each, leftover 1 goes to FUNDER_A (first depositor).
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+    let alloc: Vec<i128> = [FUNDER_A, FUNDER_B, FUNDER_C]
+        .iter()
+        .map(|f| grants.funder_position(id, *f).unwrap().allocated)
+        .collect();
+    assert_eq!(alloc, vec![34, 33, 33]);
+
+    // Unspent is now 66/67/67 = 200: the last milestone takes everything.
+    grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Ok(300));
+    for f in [FUNDER_A, FUNDER_B, FUNDER_C] {
+        let p = grants.funder_position(id, f).unwrap();
+        assert_eq!(p.disbursed, 100);
+        assert_eq!(p.unspent(), 0);
+    }
+    assert!(grants.escrow_matches_positions());
+}
+
+#[test]
+fn pro_rata_shares_are_deterministic_and_never_stuck() {
+    let mut a = FunderPosition::new(FUNDER_A);
+    a.deposited = 1;
+    let mut b = FunderPosition::new(FUNDER_B);
+    b.deposited = 1;
+    let mut c = FunderPosition::new(FUNDER_C);
+    c.deposited = 1;
+    let funders = vec![a, b, c];
+    assert_eq!(pro_rata_shares(&funders, 1).unwrap(), vec![1, 0, 0]);
+    assert_eq!(pro_rata_shares(&funders, 2).unwrap(), vec![1, 1, 0]);
+    assert_eq!(pro_rata_shares(&funders, 3).unwrap(), vec![1, 1, 1]);
+    assert_eq!(pro_rata_shares(&funders, 4), Err(GrantsError::InsufficientEscrow));
+
+    // A funder with nothing left never receives a remainder unit.
+    let mut empty = FunderPosition::new(FUNDER_A);
+    empty.deposited = 5;
+    empty.disbursed = 5;
+    let mut full = FunderPosition::new(FUNDER_B);
+    full.deposited = 7;
+    assert_eq!(pro_rata_shares(&[empty, full], 7).unwrap(), vec![0, 7]);
+}
+
+#[test]
+fn milestone_needs_enough_escrow() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 300, vec![200, 100])
+        .unwrap();
+    grants.co_fund(FUNDER_A, id, 150, &mut l).unwrap();
+    assert_eq!(
+        grants.confirm_milestone(GOVERNANCE, id, 0),
+        Err(GrantsError::InsufficientEscrow)
+    );
+    grants.co_fund(FUNDER_B, id, 50, &mut l).unwrap();
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+}
+
+#[test]
+fn clawback_refunds_each_funder_their_unspent_share() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 900, vec![300, 300, 300])
+        .unwrap();
+    grants.co_fund(FUNDER_A, id, 600, &mut l).unwrap();
+    grants.co_fund(FUNDER_B, id, 300, &mut l).unwrap();
+
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+    grants.claim(RECIPIENT, id, &mut l).unwrap(); // A paid 200, B paid 100
+    grants.confirm_milestone(GOVERNANCE, id, 1).unwrap(); // allocated, not claimed
+
+    grants.clawback_grant(GOVERNANCE, id).unwrap();
+    assert_eq!(grants.claimable(id), Some(0));
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Err(GrantsError::NothingToClaim));
+
+    let a_before = l.balance(ASSET, FUNDER_A);
+    let b_before = l.balance(ASSET, FUNDER_B);
+    assert_eq!(grants.withdraw_refund(FUNDER_A, id, &mut l), Ok(400));
+    assert_eq!(grants.withdraw_refund(FUNDER_B, id, &mut l), Ok(200));
+    assert_eq!(l.balance(ASSET, FUNDER_A), a_before + 400);
+    assert_eq!(l.balance(ASSET, FUNDER_B), b_before + 200);
+    assert_eq!(
+        grants.withdraw_refund(FUNDER_A, id, &mut l),
+        Err(GrantsError::NothingToRefund)
+    );
+    assert_eq!(grants.escrow_balance(ASSET), 0);
+    assert!(grants.escrow_matches_positions());
+}
+
+#[test]
+fn cancel_keeps_confirmed_amounts_claimable() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 300, vec![100, 200])
+        .unwrap();
+    grants.co_fund(FUNDER_A, id, 150, &mut l).unwrap();
+    grants.co_fund(FUNDER_B, id, 150, &mut l).unwrap();
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+
+    grants.cancel_grant(GOVERNANCE, id).unwrap();
+    assert_eq!(
+        grants.confirm_milestone(GOVERNANCE, id, 1),
+        Err(GrantsError::GrantNotActive)
+    );
+    assert_eq!(
+        grants.co_fund(FUNDER_C, id, 1, &mut l),
+        Err(GrantsError::GrantNotActive)
+    );
+    assert_eq!(grants.cancel_grant(GOVERNANCE, id), Err(GrantsError::GrantNotActive));
+
+    assert_eq!(grants.claim(RECIPIENT, id, &mut l), Ok(100));
+    assert_eq!(grants.withdraw_refund(FUNDER_A, id, &mut l), Ok(100));
+    assert_eq!(grants.withdraw_refund(FUNDER_B, id, &mut l), Ok(100));
+    assert_eq!(grants.escrow_balance(ASSET), 0);
+    assert!(grants.escrow_matches_positions());
+}
+
+#[test]
+fn late_co_funder_only_funds_later_milestones() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 400, vec![200, 200])
+        .unwrap();
+    grants.co_fund(FUNDER_A, id, 200, &mut l).unwrap();
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+    grants.claim(RECIPIENT, id, &mut l).unwrap();
+
+    // FUNDER_B joins after milestone 0 was paid.
+    grants.co_fund(FUNDER_B, id, 200, &mut l).unwrap();
+    grants.confirm_milestone(GOVERNANCE, id, 1).unwrap();
+    assert_eq!(grants.funder_position(id, FUNDER_A).unwrap().allocated, 0);
+    assert_eq!(grants.funder_position(id, FUNDER_B).unwrap().allocated, 200);
+    assert!(grants.escrow_matches_positions());
+}
+
+#[test]
+fn funder_cap_is_enforced() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 1_000, vec![1_000])
+        .unwrap();
+    for i in 0..MAX_FUNDERS as u64 {
+        let f = 1_000 + i;
+        l.mint(ASSET, f, 10);
+        grants.co_fund(f, id, 10, &mut l).unwrap();
+    }
+    l.mint(ASSET, 9_999, 10);
+    assert_eq!(
+        grants.co_fund(9_999, id, 10, &mut l),
+        Err(GrantsError::TooManyFunders)
+    );
+    // An existing funder may still top up.
+    l.mint(ASSET, 1_000, 10);
+    grants.co_fund(1_000, id, 10, &mut l).unwrap();
+    assert_eq!(grants.get_grant(id).unwrap().funders.len(), MAX_FUNDERS);
+}
+
+#[test]
+fn deposits_cannot_exceed_total() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 100, vec![100])
+        .unwrap();
+    grants.co_fund(FUNDER_A, id, 60, &mut l).unwrap();
+    assert_eq!(grants.co_fund(FUNDER_B, id, 41, &mut l), Err(GrantsError::OverFunded));
+    grants.co_fund(FUNDER_B, id, 40, &mut l).unwrap();
+    assert_eq!(grants.co_fund(FUNDER_B, id, 0, &mut l), Err(GrantsError::InvalidAmount));
+}
+
+#[test]
+fn allowlist_policy_gates_co_funding() {
+    let mut grants = contract();
+    let mut l = ledger();
+    grants
+        .set_funding_policy(GOVERNANCE, FundingPolicy::Allowlist)
+        .unwrap();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 100, vec![100])
+        .unwrap();
+    assert_eq!(
+        grants.co_fund(FUNDER_A, id, 10, &mut l),
+        Err(GrantsError::FunderNotAllowed)
+    );
+    grants.set_funder_allowed(GOVERNANCE, FUNDER_A, true).unwrap();
+    grants.co_fund(FUNDER_A, id, 10, &mut l).unwrap();
+    // The treasury is always allowed.
+    grants.co_fund(TREASURY, id, 10, &mut l).unwrap();
+    grants.set_funder_allowed(GOVERNANCE, FUNDER_A, false).unwrap();
+    assert_eq!(
+        grants.co_fund(FUNDER_A, id, 10, &mut l),
+        Err(GrantsError::FunderNotAllowed)
     );
 }
 
 #[test]
-fn original_reviewers_and_applicant_excluded_from_panel() {
-    let t = setup();
-    let (app, applicant, reviewers) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
+fn treasury_push_deposit_is_credited_once() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 500, vec![500])
+        .unwrap();
+    // Treasury pushes funds with its own `withdraw(.., to = grants)`.
+    l.transfer(ASSET, TREASURY, CONTRACT, 300).unwrap();
+    grants.credit_treasury_deposit(GOVERNANCE, id, 300, &l).unwrap();
+    assert_eq!(grants.funder_position(id, TREASURY).unwrap().deposited, 300);
+    // The same tokens can't be credited twice.
+    assert_eq!(
+        grants.credit_treasury_deposit(GOVERNANCE, id, 1, &l),
+        Err(GrantsError::UnaccountedBalanceTooLow)
+    );
+    assert!(grants.escrow_matches_positions());
+}
 
-    let mut tainted = addrs(&t.env, 2);
-    tainted.push_back(reviewers.get(1).unwrap());
-    assert_eq!(
-        t.g.try_assign_appeal_panel(&t.gov, &app, &tainted),
-        Err(Ok(GrantsError::IneligibleReviewer))
-    );
-    assert_eq!(
-        t.g.try_assign_appeal_panel(&t.gov, &app, &vec![&t.env, applicant.clone()]),
-        Err(Ok(GrantsError::IneligibleReviewer))
-    );
-    assert_eq!(
-        t.g.try_assign_appeal_panel(&t.gov, &app, &Vec::new(&t.env)),
-        Err(Ok(GrantsError::InvalidPanel))
-    );
+/// A token that charges a fee on transfer, so the contract receives less
+/// than `amount`.
+struct FeeLedger(MemoryLedger);
 
-    let panel = addrs(&t.env, 3);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    // An original reviewer cannot vote on the appeal.
-    assert_eq!(
-        t.g.try_submit_appeal_review(
-            &reviewers.get(0).unwrap(),
-            &app,
-            &AppealVote::Overturn,
-            &h(&t.env, 60)
-        ),
-        Err(Ok(GrantsError::NotAssigned))
-    );
+impl TokenLedger for FeeLedger {
+    fn balance(&self, asset: Address, owner: Address) -> i128 {
+        self.0.balance(asset, owner)
+    }
+    fn transfer(
+        &mut self,
+        asset: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), TransferError> {
+        self.0.transfer(asset, from, to, amount - 1)
+    }
 }
 
 #[test]
-fn duplicate_appeal_rejected_until_governance_reopens() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
-    // Second appeal while the first is open: wrong state.
+fn deposit_is_rejected_when_balance_delta_differs() {
+    let mut grants = contract();
+    let mut l = FeeLedger(ledger());
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 100, vec![100])
+        .unwrap();
     assert_eq!(
-        t.g.try_submit_appeal(&applicant, &app, &h(&t.env, 51)),
-        Err(Ok(GrantsError::InvalidState))
+        grants.co_fund(FUNDER_A, id, 50, &mut l),
+        Err(GrantsError::TransferMismatch)
     );
-
-    let panel = addrs(&t.env, 1);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    assert_eq!(
-        t.g.submit_appeal_review(
-            &panel.get(0).unwrap(),
-            &app,
-            &AppealVote::Uphold,
-            &h(&t.env, 60)
-        ),
-        ApplicationStatus::Upheld
-    );
-
-    // Reopen requires the timelock, not plain governance.
-    assert_eq!(
-        t.g.try_reopen_appeal(&t.gov, &app),
-        Err(Ok(GrantsError::Unauthorized))
-    );
-    t.g.reopen_appeal(&t.tl, &app);
-    let view = t.g.appeal_status(&app);
-    assert_eq!(view.status, ApplicationStatus::Rejected);
-    assert_eq!(view.appeals_allowed, 2);
-    assert_eq!(t.g.submit_appeal(&applicant, &app, &h(&t.env, 52)), 2);
-
-    // Round 1's record is preserved.
-    let r1 = t.g.get_appeal(&app, &1).unwrap();
-    assert_eq!(r1.outcome, AppealOutcome::Upheld);
-    assert_eq!(r1.evidence_hash, h(&t.env, 50));
-    assert_eq!(
-        t.g.get_appeal(&app, &2).unwrap().evidence_hash,
-        h(&t.env, 52)
-    );
+    assert!(grants.funder_position(id, FUNDER_A).is_none());
+    assert_eq!(grants.escrow_balance(ASSET), 0);
 }
 
 #[test]
-fn appeal_limit_enforced_after_upheld_without_reopen() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
-    let panel = addrs(&t.env, 1);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    t.g.submit_appeal_review(
-        &panel.get(0).unwrap(),
-        &app,
-        &AppealVote::Uphold,
-        &h(&t.env, 60),
-    );
-    // Governance forces it back to Rejected via final decision? No: Upheld is
-    // not appealable, and appeals_used == appeals_allowed.
+fn frozen_funder_does_not_block_other_refunds() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = grants
+        .create_grant(GOVERNANCE, RECIPIENT, ASSET, 200, vec![200])
+        .unwrap();
+    grants.co_fund(FUNDER_A, id, 100, &mut l).unwrap();
+    grants.co_fund(FUNDER_B, id, 100, &mut l).unwrap();
+    grants.clawback_grant(GOVERNANCE, id).unwrap();
+
+    l.set_frozen(ASSET, FUNDER_A, true);
     assert_eq!(
-        t.g.try_submit_appeal(&applicant, &app, &h(&t.env, 51)),
-        Err(Ok(GrantsError::InvalidState))
+        grants.withdraw_refund(FUNDER_A, id, &mut l),
+        Err(GrantsError::TransferFailed(TransferError::Frozen))
     );
-    assert_eq!(t.g.appeal_status(&app).appeals_used, 1);
+    // Nothing changed for A, and B is unaffected.
+    assert_eq!(grants.funder_position(id, FUNDER_A).unwrap().refund_owed, 100);
+    assert_eq!(grants.withdraw_refund(FUNDER_B, id, &mut l), Ok(100));
+    assert!(grants.escrow_matches_positions());
+
+    l.set_frozen(ASSET, FUNDER_A, false);
+    assert_eq!(grants.withdraw_refund(FUNDER_A, id, &mut l), Ok(100));
+    assert_eq!(grants.escrow_balance(ASSET), 0);
 }
 
 #[test]
-fn panel_overturn_makes_application_fundable() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
-    let panel = addrs(&t.env, 3);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    t.g.submit_appeal_review(
-        &panel.get(0).unwrap(),
-        &app,
-        &AppealVote::Overturn,
-        &h(&t.env, 60),
-    );
-    t.g.submit_appeal_review(
-        &panel.get(1).unwrap(),
-        &app,
-        &AppealVote::Uphold,
-        &h(&t.env, 61),
-    );
+fn failed_claim_transfer_changes_nothing() {
+    let mut grants = contract();
+    let mut l = ledger();
+    let id = funded_grant(&mut grants, &mut l, 100, vec![100]);
+    grants.confirm_milestone(GOVERNANCE, id, 0).unwrap();
+    l.set_frozen(ASSET, RECIPIENT, true);
     assert_eq!(
-        t.g.submit_appeal_review(
-            &panel.get(2).unwrap(),
-            &app,
-            &AppealVote::Overturn,
-            &h(&t.env, 62)
-        ),
-        ApplicationStatus::Overturned
+        grants.claim(RECIPIENT, id, &mut l),
+        Err(GrantsError::TransferFailed(TransferError::Frozen))
     );
-    let gid = t.g.fund_application(&t.gov, &app);
-    assert_eq!(t.g.get_grant(&gid).unwrap().total_amount, 500);
-    assert_eq!(t.g.get_grant(&gid).unwrap().application_id, Some(app));
+    assert_eq!(grants.claimable(id), Some(100));
+    assert_eq!(held(&grants, id, FUNDER_A), 100);
+    assert_eq!(grants.escrow_balance(ASSET), 100);
+    assert!(grants.escrow_matches_positions());
+}
+
+/// xorshift64, so the randomized test needs no extra dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
 }
 
 #[test]
-fn split_panel_escalates_and_only_timelock_decides() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
-    let panel = addrs(&t.env, 2);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    t.g.submit_appeal_review(
-        &panel.get(0).unwrap(),
-        &app,
-        &AppealVote::Overturn,
-        &h(&t.env, 60),
-    );
-    assert_eq!(
-        t.g.submit_appeal_review(
-            &panel.get(1).unwrap(),
-            &app,
-            &AppealVote::Uphold,
-            &h(&t.env, 61)
-        ),
-        ApplicationStatus::Escalated
-    );
-    // Not fundable while escalated.
-    assert_eq!(
-        t.g.try_fund_application(&t.gov, &app),
-        Err(Ok(GrantsError::InvalidState))
-    );
-    // Governance role cannot bypass the timelock.
-    assert_eq!(
-        t.g.try_final_decision(&t.gov, &app, &true, &h(&t.env, 70)),
-        Err(Ok(GrantsError::Unauthorized))
-    );
-    assert_eq!(
-        t.g.final_decision(&t.tl, &app, &true, &h(&t.env, 70)),
-        ApplicationStatus::Overturned
-    );
-    let appeal = t.g.get_appeal(&app, &1).unwrap();
-    assert!(appeal.finalized);
-    assert_eq!(appeal.final_reason_hash, h(&t.env, 70));
-    assert!(t.g.appeal_status(&app).finalized);
-}
+fn escrow_equals_sum_of_positions_under_random_sequences() {
+    for seed in 1..=200u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut grants = contract();
+        let mut l = MemoryLedger::new();
+        let funders: Vec<Address> = (0..6).map(|i| 10 + i).collect();
+        for f in &funders {
+            l.mint(ASSET, *f, 1_000_000);
+        }
+        l.mint(ASSET, TREASURY, 1_000_000);
 
-#[test]
-fn governance_override_of_panel_outcome() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
-    let panel = addrs(&t.env, 1);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    t.g.submit_appeal_review(
-        &panel.get(0).unwrap(),
-        &app,
-        &AppealVote::Overturn,
-        &h(&t.env, 60),
-    );
-    assert_eq!(
-        t.g.final_decision(&t.tl, &app, &false, &h(&t.env, 71)),
-        ApplicationStatus::Upheld
-    );
-    assert_eq!(
-        t.g.try_fund_application(&t.gov, &app),
-        Err(Ok(GrantsError::InvalidState))
-    );
-}
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let n = 1 + rng.below(4) as usize;
+            let ms: Vec<i128> = (0..n).map(|_| 1 + rng.below(500) as i128).collect();
+            let total = ms.iter().sum();
+            ids.push(
+                grants
+                    .create_grant(GOVERNANCE, RECIPIENT, ASSET, total, ms)
+                    .unwrap(),
+            );
+        }
 
-#[test]
-fn reviewer_unavailability_panel_replacement_and_stall_escalation() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
-
-    // No panel assigned in time: anyone can escalate after the timeout.
-    assert_eq!(
-        t.g.try_escalate_stalled(&app),
-        Err(Ok(GrantsError::NotStalled))
-    );
-
-    let panel = addrs(&t.env, 3);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    t.g.submit_appeal_review(
-        &panel.get(0).unwrap(),
-        &app,
-        &AppealVote::Overturn,
-        &h(&t.env, 60),
-    );
-
-    // One member goes dark: governance swaps the panel; votes reset.
-    let panel2 = addrs(&t.env, 3);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel2);
-    let appeal = t.g.get_appeal(&app, &1).unwrap();
-    assert_eq!(appeal.panel_version, 2);
-    assert_eq!(appeal.overturn, 0);
-    t.g.submit_appeal_review(
-        &panel2.get(0).unwrap(),
-        &app,
-        &AppealVote::Overturn,
-        &h(&t.env, 61),
-    );
-
-    // The replacement panel also stalls.
-    let now = t.env.ledger().timestamp();
-    t.env
-        .ledger()
-        .with_mut(|l| l.timestamp = now + REREVIEW_TIMEOUT_SECS);
-    assert_eq!(
-        t.g.try_escalate_stalled(&app),
-        Err(Ok(GrantsError::NotStalled))
-    );
-    t.env
-        .ledger()
-        .with_mut(|l| l.timestamp = now + REREVIEW_TIMEOUT_SECS + 1);
-    t.g.escalate_stalled(&app);
-    assert_eq!(
-        t.g.get_application(&app).unwrap().status,
-        ApplicationStatus::Escalated
-    );
-    // Late votes are refused.
-    assert_eq!(
-        t.g.try_submit_appeal_review(
-            &panel2.get(1).unwrap(),
-            &app,
-            &AppealVote::Overturn,
-            &h(&t.env, 62)
-        ),
-        Err(Ok(GrantsError::InvalidState))
-    );
-}
-
-#[test]
-fn original_decision_and_appeal_records_are_kept_separately() {
-    let t = setup();
-    let (app, applicant, reviewers) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
-    let panel = addrs(&t.env, 1);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    t.g.submit_appeal_review(
-        &panel.get(0).unwrap(),
-        &app,
-        &AppealVote::Overturn,
-        &h(&t.env, 60),
-    );
-    t.g.fund_application(&t.gov, &app);
-
-    // Original decision intact.
-    let a = t.g.get_application(&app).unwrap();
-    assert_eq!((a.approvals, a.rejections), (1, 2));
-    let rv = t.g.get_review(&app, &reviewers.get(1).unwrap()).unwrap();
-    assert!(!rv.approve);
-    assert_eq!(rv.review_hash, h(&t.env, 11));
-    // Appeal evidence and vote intact.
-    assert_eq!(
-        t.g.get_appeal(&app, &1).unwrap().evidence_hash,
-        h(&t.env, 50)
-    );
-    let v =
-        t.g.get_appeal_vote(&app, &1, &1, &panel.get(0).unwrap())
-            .unwrap();
-    assert_eq!(v.vote, AppealVote::Overturn);
-}
-
-/// State invariants across every path: a funded application has exactly one
-/// grant; terminal states accept no transitions.
-#[test]
-fn terminal_states_accept_no_transitions() {
-    let t = setup();
-    let (app, applicant, _) = rejected_app(&t);
-    t.g.submit_appeal(&applicant, &app, &h(&t.env, 50));
-    let panel = addrs(&t.env, 1);
-    t.g.assign_appeal_panel(&t.gov, &app, &panel);
-    t.g.submit_appeal_review(
-        &panel.get(0).unwrap(),
-        &app,
-        &AppealVote::Overturn,
-        &h(&t.env, 60),
-    );
-    t.g.fund_application(&t.gov, &app);
-
-    assert_eq!(
-        t.g.try_fund_application(&t.gov, &app),
-        Err(Ok(GrantsError::InvalidState))
-    );
-    assert_eq!(
-        t.g.try_final_decision(&t.tl, &app, &false, &h(&t.env, 1)),
-        Err(Ok(GrantsError::InvalidState))
-    );
-    assert_eq!(
-        t.g.try_withdraw_application(&applicant, &app),
-        Err(Ok(GrantsError::InvalidState))
-    );
-    assert_eq!(
-        t.g.try_submit_appeal(&applicant, &app, &h(&t.env, 1)),
-        Err(Ok(GrantsError::InvalidState))
-    );
-    assert!(t.g.get_application(&app).unwrap().grant_id.is_some());
+        for _ in 0..60 {
+            let id = ids[rng.below(ids.len() as u64) as usize];
+            let f = funders[rng.below(funders.len() as u64) as usize];
+            // Errors are expected for many random steps; the invariant must
+            // hold either way.
+            let _ = match rng.below(7) {
+                0 | 1 => grants.co_fund(f, id, 1 + rng.below(300) as i128, &mut l),
+                2 => {
+                    let next = grants
+                        .get_grant(id)
+                        .unwrap()
+                        .milestones
+                        .iter()
+                        .position(|m| !m.confirmed)
+                        .unwrap_or(0);
+                    grants.confirm_milestone(GOVERNANCE, id, next)
+                }
+                3 => grants.claim(RECIPIENT, id, &mut l).map(|_| ()),
+                4 => {
+                    if rng.below(2) == 0 {
+                        grants.cancel_grant(GOVERNANCE, id)
+                    } else {
+                        grants.clawback_grant(GOVERNANCE, id)
+                    }
+                }
+                5 => grants.withdraw_refund(f, id, &mut l).map(|_| ()),
+                _ => {
+                    let amount = 1 + rng.below(100) as i128;
+                    if l.transfer(ASSET, TREASURY, CONTRACT, amount).is_ok() {
+                        grants.credit_treasury_deposit(GOVERNANCE, id, amount, &l)
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            assert!(grants.escrow_matches_positions(), "seed {seed}");
+            assert!(
+                l.balance(ASSET, CONTRACT) >= grants.escrow_balance(ASSET),
+                "seed {seed}: escrow not backed by tokens"
+            );
+            for id in &ids {
+                for p in &grants.get_grant(*id).unwrap().funders {
+                    assert!(p.unspent() >= 0, "seed {seed}");
+                }
+            }
+        }
+    }
 }

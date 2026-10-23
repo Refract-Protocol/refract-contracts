@@ -21,6 +21,14 @@
 //! An owner approving the same proposal twice does not double-count — the
 //! approval is silently idempotent (the second call is a no-op).
 //!
+//! ## Sponsor account
+//!
+//! Claimant fee-bump sponsorship (see `docs/CLAIMANT_SPONSORSHIP.md`) uses this
+//! multisig as the sponsor account. Naming, rotating, or revoking that sponsor
+//! is an owner action and must go through propose → approve → execute. The
+//! multisig does not sign claimant transactions itself; the operational relay
+//! holds a signer threshold only for fee-bumps of unchanged inner transactions.
+//!
 //! ## Removed-owner approval handling
 //! If an owner who has already approved a pending proposal is subsequently
 //! removed via `remove_owner`, their approval is **retracted** — the
@@ -177,6 +185,10 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Val, Vec,
 };
+
+// Interface version of this contract's public spec. Bump it whenever an
+// entrypoint or contract type changes. See specs/README.md.
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 

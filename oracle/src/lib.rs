@@ -79,6 +79,10 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
 };
 
+// Interface version of this contract's public spec. Bump it whenever an
+// entrypoint or contract type changes. See specs/README.md.
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
+
 /// Maximum oracle staleness in seconds (30 minutes).
 pub const MAX_STALENESS_SECS: u64 = 1_800;
 
