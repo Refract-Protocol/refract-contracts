@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "network": "local",
+  "contracts": {
+    "refract_multisig": {
+      "contract_id": "CCO5BH3DYYYAVZIQXXBKVXLKWW3FRMMODR2HKYANCFF5NSV4BMPTHOTQ",
+      "wasm_sha256": "ec2786ef7b8e3246039de9238ad4ab41dd0e6d206934b116db1a038a4bdf87b3",
+      "initialized": true,
+      "init_args": {
+        "owners": [
+          "GBXEAS6ALJH4H45A4MNM5QQ2LCJUXAOXZVIIYTX7WH3LSHNKGUX3DTRT"
+        ],
+        "threshold": 1
+      }
+    },
+    "refract_timelock": {
+      "contract_id": "CCAVYGBILWMMK3WV2TPV3PVUTXH43S6JJZ6YLY3PF5777UFT3VKTW63V",
+      "wasm_sha256": "e9e9ca07bf6bcf117511a9b89afc8cc8d5a5cea3f2e8ec4f2e67649dddf4c9a4",
+      "initialized": true,
+      "init_args": {
+        "admin": "GBXEAS6ALJH4H45A4MNM5QQ2LCJUXAOXZVIIYTX7WH3LSHNKGUX3DTRT",
+        "min_delay": 60
+      }
+    },
+    "refract_treasury": {
+      "contract_id": "CBLX2IYPWPKG4ELMY5ICWHF73Q7HL6ZGK4XBBPAMXQFEYKGNUFSCIMOF",
+      "wasm_sha256": "143436804365e153ac68d31b8e1c745233d9e0daa894bd9c9e1e3e94d024e64e",
+      "initialized": true,
+      "init_args": {
+        "admin": "CCAVYGBILWMMK3WV2TPV3PVUTXH43S6JJZ6YLY3PF5777UFT3VKTW63V"
+      }
+    },
+    "refract_vetoken": {
+      "contract_id": "CDP6SHKZ7WWZX3KDPXMS3CWQNRGPCKEQTFIJU32WE6YRVKPDPX5D7XAI",
+      "wasm_sha256": "d26707fe917f30b581c1b8cfe885bd92c0235a89f5b9d42b393f836e3889ad45",
+      "initialized": true,
+      "init_args": {
+        "token": "CDMLFMKMMD7MWZP3FKUBZPVHTUEDLSX4BYGYKH4GCESXYHS3IHQ4EIG4",
+        "treasury": "CBLX2IYPWPKG4ELMY5ICWHF73Q7HL6ZGK4XBBPAMXQFEYKGNUFSCIMOF"
+      }
+    },
+    "refract_incident_response": {
+      "contract_id": "CBKBBEDHH4KSTZRL7XDEOI3ZNUQH7RDEY4R4T7F2RMKRDIUCULVEO764",
+      "wasm_sha256": "b5366218eab3ca1c31dcc749c991086c3d7b22d4b161c71a14d693852d2668f0",
+      "initialized": true,
+      "init_args": {
+        "admin": "CCAVYGBILWMMK3WV2TPV3PVUTXH43S6JJZ6YLY3PF5777UFT3VKTW63V",
+        "guardian": "GBXEAS6ALJH4H45A4MNM5QQ2LCJUXAOXZVIIYTX7WH3LSHNKGUX3DTRT"
+      }
+    },
+    "refract_backstop": {
+      "contract_id": "CB5IPVONIAEXOZ6XIX5AHP5MNR5UHGHZVRSJZ3WJZ5ICVMCIDHXWIMPJ",
+      "wasm_sha256": "56d9af24442a94f38436b8a2ba6f9393e2d398126b9417c5b31c7ec855220e5e",
+      "initialized": true,
+      "init_args": {
+        "pool": "CCTAQO52FYW25FOPY733FPLMJSEASGWKZQCVJTOFQQVQ7HIOVTT3US33",
+        "admin": "CCAVYGBILWMMK3WV2TPV3PVUTXH43S6JJZ6YLY3PF5777UFT3VKTW63V",
+        "token": "CDMLFMKMMD7MWZP3FKUBZPVHTUEDLSX4BYGYKH4GCESXYHS3IHQ4EIG4",
+        "premium_share_bps": 500
+      }
+    },
+    "refract_bounty": {
+      "contract_id": "CCRAI3MA5R4QX2CEWPFLQE427CVYL3CKNWUQ34ODEFOMEEOM3EYDOJKH",
+      "wasm_sha256": "c39112c8d4b12708469ae5162fe0590980acff79166903c9820f42b783c024ca",
+      "init_args": {
+        "governance": "CCAVYGBILWMMK3WV2TPV3PVUTXH43S6JJZ6YLY3PF5777UFT3VKTW63V",
+        "token": "CDMLFMKMMD7MWZP3FKUBZPVHTUEDLSX4BYGYKH4GCESXYHS3IHQ4EIG4",
+        "approvers": [
+          "GBXEAS6ALJH4H45A4MNM5QQ2LCJUXAOXZVIIYTX7WH3LSHNKGUX3DTRT"
+        ],
+        "approval_threshold": 1,
+        "reward_tiers": {
+          "critical": "500000000000",
+          "high": "100000000000",
+          "medium": "20000000000",
+          "low": "5000000000"
+        }
+      },
+      "initialized": true
+    },
+    "refract_grants": {
+      "contract_id": "CDDVRHCAOH4CLC45CA25YHPKE6IT4L2662KPBF5HLLFU3V5ATQDY7HNE",
+      "wasm_sha256": "71a0360a772ffe57e6712531dce332e8c9ca43a3884da0ef6cc99e52705fb49a",
+      "initialized": true,
+      "init_args": {
+        "governance": "CCAVYGBILWMMK3WV2TPV3PVUTXH43S6JJZ6YLY3PF5777UFT3VKTW63V",
+        "token": "CDMLFMKMMD7MWZP3FKUBZPVHTUEDLSX4BYGYKH4GCESXYHS3IHQ4EIG4"
+      }
+    }
+  },
+  "wiring_done": [],
+  "deployer": "GBXEAS6ALJH4H45A4MNM5QQ2LCJUXAOXZVIIYTX7WH3LSHNKGUX3DTRT",
+  "rpc_url": "http://localhost:8000/rpc",
+  "network_passphrase": "Standalone Network ; February 2017",
+  "wasm_manifest": "dist/wasm/manifest.json",
+  "updated_at": "2026-10-20T06:10:54Z"
+}

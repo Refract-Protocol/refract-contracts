@@ -831,6 +831,53 @@ impl RefractOracle {
         }
     }
 
+    /// Guardian helper: true when a feed has no reading or is older than
+    /// `max_staleness_secs`. Never reverts so breakers can poll safely.
+    pub fn is_stale(env: Env, feed_id: Symbol, max_staleness_secs: u64) -> bool {
+        let reading: Option<OracleReading> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Reading(feed_id));
+        match reading {
+            None => true,
+            Some(r) => env.ledger().timestamp().saturating_sub(r.timestamp) > max_staleness_secs,
+        }
+    }
+
+    /// Guardian helper: absolute deviation of a feed from `peg_price` in
+    /// basis points. Returns `None` when the feed is missing or `peg <= 0`.
+    pub fn depeg_bps(env: Env, feed_id: Symbol, peg_price: i128) -> Option<i128> {
+        if peg_price <= 0 {
+            return None;
+        }
+        let reading: OracleReading = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Reading(feed_id))?;
+        let diff = if reading.value >= peg_price {
+            reading.value.checked_sub(peg_price)?
+        } else {
+            peg_price.checked_sub(reading.value)?
+        };
+        diff.checked_mul(10_000)?.checked_div(peg_price)
+    }
+
+    /// Guardian helper: combined staleness + depeg status for a feed.
+    /// `tripped` is true when stale or when the depeg band exceeds
+    /// `depeg_bps`. Never reverts; missing feeds report stale.
+    pub fn guardian_status(
+        env: Env,
+        feed_id: Symbol,
+        max_staleness_secs: u64,
+        peg_price: i128,
+        depeg_bps: i128,
+    ) -> (bool, bool, i128) {
+        let stale = Self::is_stale(env.clone(), feed_id.clone(), max_staleness_secs);
+        let band = Self::depeg_bps(env, feed_id, peg_price).unwrap_or(i128::MAX);
+        let depegged = band > depeg_bps;
+        (stale || depegged, stale, band)
+    }
+
     /// Return a composite health summary for a given feed.
     ///
     /// Always succeeds — a feed with no submissions ever returns a

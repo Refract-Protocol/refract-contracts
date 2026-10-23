@@ -1,0 +1,19 @@
+[package]
+name = "refract-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared helpers for Refract contracts: non-reverting token payouts and the trusted contract registry interface"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+# Exposes the mock SEP-41 token used by downstream test suites.
+testutils = ["soroban-sdk/testutils"]

@@ -47,14 +47,16 @@ def check_storage_key_invariants():
 
 def check_wasm_sizes():
     print("[3/4] Measuring Wasm Binary Size & Budget...")
-    # Budget baseline in bytes:
-    # pool: 65,000 bytes
+    # Budget baseline in bytes (keep in sync with measure_wasm_sizes.py):
+    # pool: 80,000 bytes (raised from 65,000 for the typed oracle and
+    #       backstop clients and the shortfall drawdown path, #215/#218)
     # policy: 45,000 bytes
-    # oracle: 40,000 bytes
+    # oracle: 48,000 bytes (raised from 40,000; measured 42,964 after the
+    #       relayer notice-period and bonding features merged)
     wasm_budget = {
-        "refract_pool.wasm": 65000,
+        "refract_pool.wasm": 80000,
         "refract_policy.wasm": 45000,
-        "refract_oracle.wasm": 40000,
+        "refract_oracle.wasm": 48000,
     }
     
     wasm_files = glob.glob("target/wasm32-unknown-unknown/release/*.wasm")

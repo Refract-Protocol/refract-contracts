@@ -1,10 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, Env, Symbol, Val, Vec,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env, IntoVal, Symbol, Val, Vec};
 
 // ── Minimal stub target ───────────────────────────────────────────────────────
 
@@ -17,7 +14,9 @@ mod stub {
     #[contractimpl]
     impl Stub {
         pub fn set_value(env: Env, value: i128) -> i128 {
-            env.storage().instance().set(&Symbol::new(&env, "v"), &value);
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "v"), &value);
             value
         }
 
@@ -74,8 +73,14 @@ fn invalid_threshold_is_rejected() {
     let ms_id = env.register_contract(None, RefractMultisig);
     let ms = RefractMultisigClient::new(&env, &ms_id);
     let owners = make_owners(&env, 2);
-    assert_eq!(ms.try_initialize(&owners, &5u32), Err(Ok(MultisigError::InvalidThreshold)));
-    assert_eq!(ms.try_initialize(&owners, &0u32), Err(Ok(MultisigError::InvalidThreshold)));
+    assert_eq!(
+        ms.try_initialize(&owners, &5u32),
+        Err(Ok(MultisigError::InvalidThreshold))
+    );
+    assert_eq!(
+        ms.try_initialize(&owners, &0u32),
+        Err(Ok(MultisigError::InvalidThreshold))
+    );
 }
 
 #[test]
@@ -89,7 +94,12 @@ fn below_threshold_execute_is_rejected() {
     ms.initialize(&owners, &2u32); // 2-of-3
 
     let owner0 = owner_at(&owners, 0);
-    let id = ms.propose(&owner0, &target_id, &Symbol::new(&env, "set_value"), &stub_args(&env, 10));
+    let id = ms.propose(
+        &owner0,
+        &target_id,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 10),
+    );
 
     // Only 1 approval (proposer auto-approves) but need 2.
     let res = ms.try_execute(&id);
@@ -109,7 +119,12 @@ fn threshold_met_execute_succeeds() {
     let owner0 = owner_at(&owners, 0);
     let owner1 = owner_at(&owners, 1);
 
-    let id = ms.propose(&owner0, &target_id, &Symbol::new(&env, "set_value"), &stub_args(&env, 99));
+    let id = ms.propose(
+        &owner0,
+        &target_id,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 99),
+    );
     ms.approve(&owner1, &id);
     ms.execute(&id);
 
@@ -129,7 +144,12 @@ fn double_approval_does_not_inflate_count() {
 
     let owner0 = owner_at(&owners, 0);
 
-    let id = ms.propose(&owner0, &target_id, &Symbol::new(&env, "set_value"), &stub_args(&env, 5));
+    let id = ms.propose(
+        &owner0,
+        &target_id,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 5),
+    );
     // owner0 approves again — should be no-op.
     ms.approve(&owner0, &id);
 
@@ -153,7 +173,12 @@ fn executed_proposal_cannot_be_re_executed() {
     ms.initialize(&owners, &1u32); // 1-of-2
 
     let owner0 = owner_at(&owners, 0);
-    let id = ms.propose(&owner0, &target_id, &Symbol::new(&env, "set_value"), &stub_args(&env, 3));
+    let id = ms.propose(
+        &owner0,
+        &target_id,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 3),
+    );
     ms.execute(&id);
 
     let res = ms.try_execute(&id);
@@ -193,7 +218,12 @@ fn non_owner_cannot_approve() {
     let owner0 = owner_at(&owners, 0);
     let stranger = Address::generate(&env);
 
-    let id = ms.propose(&owner0, &target_id, &Symbol::new(&env, "set_value"), &stub_args(&env, 1));
+    let id = ms.propose(
+        &owner0,
+        &target_id,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 1),
+    );
 
     let res = ms.try_approve(&stranger, &id);
     assert_eq!(res, Err(Ok(MultisigError::NotOwner)));
@@ -210,7 +240,12 @@ fn proposer_approval_is_auto_counted() {
     ms.initialize(&owners, &1u32); // 1-of-2
 
     let owner0 = owner_at(&owners, 0);
-    let id = ms.propose(&owner0, &target_id, &Symbol::new(&env, "set_value"), &stub_args(&env, 77));
+    let id = ms.propose(
+        &owner0,
+        &target_id,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 77),
+    );
 
     // Should execute immediately without extra approve() calls.
     ms.execute(&id);
