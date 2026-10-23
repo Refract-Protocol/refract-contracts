@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec,
+};
 
 /// Storage keys for the bounty escrow.
 #[contracttype]
@@ -38,6 +40,19 @@ pub enum BountyError {
     InsufficientBalance = 4,
     Unauthorized = 5,
     DuplicateReport = 6,
+    NoExcessFunds = 7,
+    TooManyOperations = 8,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum BountyOp {
+    Award {
+        researcher: Address,
+        amount: i128,
+        report_hash: BytesN<32>,
+    },
+    SetGovernance(Address),
 }
 
 /// Governance-controlled bug bounty escrow.
@@ -130,6 +145,94 @@ impl RefractBountyEscrow {
     /// Immutable record of a rewarded disclosure, if any.
     pub fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
         env.storage().persistent().get(&DataKey::Award(report_hash))
+    }
+
+    pub fn accounted_liabilities(env: Env) -> Result<i128, BountyError> {
+        Self::balance(&env)
+    }
+
+    pub fn rescue(
+        env: Env,
+        caller: Address,
+        token: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<i128, BountyError> {
+        caller.require_auth();
+        let governance = Self::governance(&env)?;
+        let configured_token = Self::token(&env)?;
+        if caller != governance || to != governance || token != configured_token || amount <= 0 {
+            return Err(BountyError::Unauthorized);
+        }
+        let balance = token::Client::new(&env, &token).balance(&env.current_contract_address());
+        let excess = balance - Self::balance(&env)?;
+        if amount > excess {
+            return Err(BountyError::NoExcessFunds);
+        }
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &to,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "FundsRescued"),),
+            (token, to, amount, excess - amount),
+        );
+        Ok(excess - amount)
+    }
+
+    pub fn batch(env: Env, caller: Address, operations: Vec<BountyOp>) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        if operations.len() > 16 {
+            return Err(BountyError::TooManyOperations);
+        }
+        for operation in operations.iter() {
+            match operation {
+                BountyOp::Award {
+                    researcher,
+                    amount,
+                    report_hash,
+                } => {
+                    if *amount <= 0
+                        || env.storage().persistent().has(&DataKey::Award(report_hash.clone()))
+                    {
+                        return Err(BountyError::InvalidAmount);
+                    }
+                    let balance = Self::balance(&env)?;
+                    if *amount > balance {
+                        return Err(BountyError::InsufficientBalance);
+                    }
+                    let token = Self::token(&env)?;
+                    token::Client::new(&env, &token).transfer(
+                        &env.current_contract_address(),
+                        &researcher,
+                        &amount,
+                    );
+                    env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+                    env.storage().persistent().set(
+                        &DataKey::Award(report_hash.clone()),
+                        &AwardRecord {
+                            researcher,
+                            amount,
+                            report_hash,
+                            timestamp: env.ledger().timestamp(),
+                        },
+                    );
+                }
+                BountyOp::SetGovernance(governance) => {
+                    env.storage().instance().set(&DataKey::Governance, &governance)
+                }
+            }
+        }
+        env.events().publish(
+            (Symbol::new(&env, "AdminBatch"),),
+            operations.len(),
+        );
+        Ok(())
     }
 
     fn governance(env: &Env) -> Result<Address, BountyError> {
