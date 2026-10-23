@@ -554,3 +554,4 @@ impl RefractBountyEscrow {
 
 #[cfg(test)]
 mod test;
+

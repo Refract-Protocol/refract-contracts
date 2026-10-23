@@ -164,8 +164,8 @@ impl RefractBackstop {
         if Self::pending_loss(env.clone()) {
             return Err(BackstopError::PendingLossFreeze);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::get_config(&env)?;
+        let mut state = Self::get_state(&env)?;
         let mut tranche_state = Self::_tranche_state(&env, tranche)?;
 
         let shares = Self::calc_shares(
@@ -234,8 +234,8 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
         Self::sync_matured(env.clone())?;
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::get_config(&env)?;
+        let mut state = Self::get_state(&env)?;
         let mut tranche_state = Self::_tranche_state(&env, tranche)?;
 
         let key = DataKey::Shares(staker.clone(), tranche, true);
@@ -281,7 +281,7 @@ impl RefractBackstop {
     /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::config(&env)?;
+        let config = Self::get_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -289,9 +289,15 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
         Self::sync_matured(env.clone())?;
+        let mut state = Self::get_state(&env)?;
+        let covered = if amount > state.total_capital {
+            state.total_capital
+        } else {
+            amount
+        };
         let loss_id: u64 = env.storage().instance().get(&DataKey::NextLossId).unwrap_or(1);
         env.storage().instance().set(&DataKey::NextLossId, &(loss_id + 1));
-        let covered = Self::_apply_loss(&env, loss_id, amount)?;
+        let covered = Self::_apply_loss(&env, loss_id, covered)?;
         if covered <= 0 {
             env.storage().instance().set(&DataKey::PendingLoss, &false);
             return Ok(0);
@@ -427,8 +433,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
+        let config = Self::get_config(&env)?;
+        let mut state = Self::get_state(&env)?;
 
         let cut = amount * config.premium_share_bps / BPS_DENOM;
         let junior_bps: i128 = env.storage().instance().get(&DataKey::JuniorPremiumBps).unwrap_or(BPS_DENOM / 2);
@@ -458,11 +464,11 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        Self::state(&env)
+        Self::get_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        Self::config(&env)
+        Self::get_config(&env)
     }
 
     fn _tranche_state(env: &Env, tranche: Tranche) -> Result<TrancheState, BackstopError> {
@@ -581,17 +587,44 @@ impl RefractBackstop {
         }
     }
 
-    fn config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn get_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn get_state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")
             .ok_or(BackstopError::NotInitialized)
     }
+
+    /// Update the contract administrator. Admin-gated.
+    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let mut config = Self::get_config(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        config.admin = new_admin;
+        env.storage().instance().set(&"config", &config);
+        Ok(())
+    }
+
+    /// Update the authorized pool address. Admin-gated.
+    pub fn set_pool(env: Env, caller: Address, new_pool: Address) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let mut config = Self::get_config(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        config.pool = new_pool;
+        env.storage().instance().set(&"config", &config);
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod test;

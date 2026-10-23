@@ -1,0 +1,24 @@
+# Fails when a SPEC.md clause has no mapped test, or a mapped test is missing.
+# See tests/conformance/clauses.toml and scripts/check_clauses.py.
+
+name: clause-conformance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  clauses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check clause-to-test mapping
+        run: python3 scripts/check_clauses.py

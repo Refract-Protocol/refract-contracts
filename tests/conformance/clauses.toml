@@ -1,0 +1,66 @@
+# Maps each normative clause in SPEC.md ("Governance-Adjacent Contract
+# Specifications") to the tests that check it. scripts/check_clauses.py fails
+# CI when a clause has no test here, or when a listed test is not defined in
+# the named file.
+
+[[clause]]
+id = "BACKSTOP-CURVE-1"
+tests = [
+  { file = "backstop/src/curve.rs", name = "flat_curve_keeps_premium_share" },
+]
+
+[[clause]]
+id = "BACKSTOP-CURVE-2"
+tests = [
+  { file = "backstop/src/curve.rs", name = "multiplier_is_monotone_and_bounded" },
+  { file = "backstop/src/curve.rs", name = "multiplier_follows_both_slopes" },
+  { file = "backstop/src/curve.rs", name = "utilization_is_clamped_to_full" },
+]
+
+[[clause]]
+id = "BACKSTOP-CURVE-3"
+tests = [
+  { file = "backstop/src/curve.rs", name = "rejects_out_of_bound_parameters" },
+]
+
+[[clause]]
+id = "BACKSTOP-CURVE-4"
+tests = [
+  { file = "backstop/src/curve.rs", name = "premium_cut_never_exceeds_amount" },
+]
+
+[[clause]]
+id = "GRANTS-REVIEW-1"
+tests = [
+  { file = "grants/src/lib.rs", name = "assigns_to_least_loaded_then_lowest_address" },
+  { file = "grants/src/lib.rs", name = "respects_capacity" },
+  { file = "grants/src/lib.rs", name = "required_tags_filter_reviewers" },
+  { file = "grants/src/lib.rs", name = "deactivated_reviewer_is_not_picked" },
+]
+
+[[clause]]
+id = "GRANTS-REVIEW-2"
+tests = [
+  { file = "grants/src/lib.rs", name = "slot_cannot_be_assigned_twice" },
+]
+
+[[clause]]
+id = "GRANTS-REVIEW-3"
+tests = [
+  { file = "grants/src/lib.rs", name = "reassign_moves_slot_and_keeps_history" },
+  { file = "grants/src/lib.rs", name = "reviewer_registry_is_governance_gated" },
+]
+
+[[clause]]
+id = "GRANTS-AUDIT-1"
+tests = [
+  { file = "grants/src/lib.rs", name = "audit_chain_verifies_after_governed_actions" },
+  { file = "grants/src/lib.rs", name = "rejected_call_writes_no_record" },
+  { file = "grants/src/lib.rs", name = "assignment_changes_are_logged" },
+]
+
+[[clause]]
+id = "GRANTS-AUDIT-2"
+tests = [
+  { file = "grants/src/lib.rs", name = "tampered_or_removed_record_is_detected" },
+]
