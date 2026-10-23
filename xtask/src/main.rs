@@ -128,6 +128,29 @@
 // =============================================================================
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("ttl") => {
+            let Some(action) = args.next() else {
+                eprintln!("usage: cargo xtask ttl <status|bump> [keeper options]");
+                std::process::exit(2);
+            };
+            if action != "status" && action != "bump" {
+                eprintln!("unknown ttl action: {action}");
+                std::process::exit(2);
+            }
+            let status = std::process::Command::new("python3")
+                .arg("scripts/ttl_keeper.py")
+                .arg(action)
+                .args(args)
+                .status()
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to start TTL keeper: {error}");
+                    std::process::exit(1);
+                });
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Some("authz-matrix") => {
     // TODO (#133): Implement the authz-matrix verifier.
     //
     // Suggested implementation order:
@@ -147,4 +170,10 @@ fn main() {
 
     eprintln!("TODO: implement authz-matrix verifier (see documentation above)");
     std::process::exit(0);
+        }
+        _ => {
+            eprintln!("usage: cargo xtask <ttl|authz-matrix> ...");
+            std::process::exit(2);
+        }
+    }
 }

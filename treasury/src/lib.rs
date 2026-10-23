@@ -1,12 +1,31 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+#[path = "../../shared/ttl.rs"]
+mod ttl;
+
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol, Vec,
+};
 
 /// Storage keys for the treasury contract.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum BumpKey {
+    Instance,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum TreasuryError {
+    BatchTooLarge = 1,
+    InvalidAmount = 2,
 }
 
 /// `RefractTreasury` is a deliberately minimal token-custody vault.
@@ -50,6 +69,61 @@ impl RefractTreasury {
         }
         let client = token::Client::new(&env, &token);
         client.transfer(&env.current_contract_address(), &to, &amount);
+    }
+
+    pub fn seed_backstop(
+        env: Env,
+        caller: Address,
+        token: Address,
+        amount: i128,
+        backstop: Address,
+    ) -> Result<(), TreasuryError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if caller != admin {
+            panic!("unauthorized");
+        }
+        if amount <= 0 {
+            return Err(TreasuryError::InvalidAmount);
+        }
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &backstop,
+            &amount,
+        );
+        let _: () = env.invoke_contract(
+            &backstop,
+            &Symbol::new(&env, "record_treasury_seed"),
+            soroban_sdk::Vec::from_array(
+                &env,
+                [
+                    env.current_contract_address().into_val(&env),
+                    amount.into_val(&env),
+                ],
+            ),
+        );
+        Ok(())
+    }
+
+    pub fn bump(
+        env: Env,
+        keys: Vec<BumpKey>,
+        requested_extend: u32,
+    ) -> Result<u32, TreasuryError> {
+        if keys.len() > ttl::MAX_BUMP_BATCH {
+            return Err(TreasuryError::BatchTooLarge);
+        }
+        let extend_to = ttl::clamp_extend(requested_extend);
+        for _key in keys.iter() {
+            env.storage()
+                .instance()
+                .extend_ttl(ttl::MIN_TTL_THRESHOLD, extend_to);
+        }
+        Ok(extend_to)
     }
 }
 

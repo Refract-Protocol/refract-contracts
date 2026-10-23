@@ -1,5 +1,8 @@
 #![no_std]
 
+#[path = "../../shared/fee.rs"]
+mod fee;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
     IntoVal, Symbol, Vec,
@@ -57,7 +60,6 @@ pub struct PolicyRegistration {
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
-#[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolAccounting {
     pub total_capital: i128,
@@ -73,45 +75,10 @@ pub enum DataKey {
     Admin,
     UsdcToken,
     PolicyRegistry, // RefractPolicyRegistry contract address
-    TotalCapital,
-    TotalCoverage, // sum of all active policy coverage amounts
-    TotalPremiums, // accumulated premiums (protocol revenue)
-    Shares(Address),
-    TotalShares,
-    Policy(u64),
-    UserPolicies(Address),
-    NextPolicyId,
-}
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    UsdcToken,
-    PolicyRegistry, // RefractPolicyRegistry contract address
-    TotalCapital,
-    TotalCoverage, // sum of all active policy coverage amounts
-    TotalPremiums, // accumulated premiums (protocol revenue)
-    Shares(Address),
-    TotalShares,
-    Policy(u64),
-    UserPolicies(Address),
-    NextPolicyId,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PoolAccounting {
-    pub total_capital: i128,
-    pub total_coverage: i128,
-    pub total_premiums: i128,
-    pub total_shares: i128,
-    pub next_policy_id: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    UsdcToken,
-    PolicyRegistry, // RefractPolicyRegistry contract address
+    Backstop,
+    OracleContract,
+    Treasury,
+    PremiumFeeBps,
     Accounting,     // Consolidated PoolAccounting struct
     TotalCapital,   // Legacy key for migration
     TotalCoverage,  // Legacy key for migration
@@ -128,21 +95,6 @@ pub enum DataKey {
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum PoolError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    InsufficientCapacity = 4,
-    Pol
-    PoolConfig,
-    Initialized,
-    OracleData(CoverageType), // latest oracle reading per type
-    LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
-}
-
 // ── Errors ────────────────────────────────────────────────────────────────────
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -163,6 +115,40 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    BackstopUnavailable = 16,
+    InvalidBackstopAmount = 17,
+    OracleUnavailable = 18,
+    InvalidFeeBps = 19,
+    TreasuryUnavailable = 20,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleReading {
+    pub value: i128,
+    pub timestamp: u64,
+    pub source: Symbol,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum OracleContractError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    FeedNotFound = 4,
+    StaleReading = 5,
+    UnknownCoverageType = 6,
+    FutureTimestamp = 7,
+    StaleSubmission = 8,
+    NoPendingAdmin = 9,
+    SubmittedTooSoon = 10,
+    InsufficientBond = 11,
+    RelayerNotBonded = 12,
+    InvalidSlashAmount = 13,
+    RelayerNotPending = 14,
+    NoticePeriodNotElapsed = 15,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -307,6 +293,7 @@ impl RefractPool {
         };
         env.storage().instance().set(&DataKey::PoolConfig, &config);
         env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::PremiumFeeBps, &0u32);
 
         env.events().publish((symbol_short!("INIT"),), (admin,));
         Ok(())
@@ -488,10 +475,52 @@ impl RefractPool {
             &premium,
         );
 
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PremiumFeeBps)
+            .unwrap_or(0);
+        let (premium_after_fee, treasury_fee) = fee::assess_fee(premium, fee_bps)
+            .ok_or(PoolError::InvalidFeeBps)?;
+        if treasury_fee > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Treasury)
+                .ok_or(PoolError::TreasuryUnavailable)?;
+            token::Client::new(&env, &usdc).transfer(
+                &env.current_contract_address(),
+                &treasury,
+                &treasury_fee,
+            );
+        }
+
+        let backstop_cut = if let Some(backstop) =
+            env.storage().instance().get::<DataKey, Address>(&DataKey::Backstop)
+        {
+            let cut: i128 = env.invoke_contract(
+                &backstop,
+                &Symbol::new(&env, "receive_premium"),
+                Vec::from_array(
+                    &env,
+                    [
+                        env.current_contract_address().into_val(&env),
+                        premium_after_fee.into_val(&env),
+                    ],
+                ),
+            );
+            if cut < 0 || cut > premium_after_fee {
+                return Err(PoolError::InvalidBackstopAmount);
+            }
+            cut
+        } else {
+            0
+        };
+
         // Record in pool capital (premiums accrue to LPs) and create policy via single accounting record
         let mut acc = Self::_accounting(&env);
         let id = acc.next_policy_id;
-        acc.total_capital += premium;
+        acc.total_capital += premium_after_fee - backstop_cut;
         acc.total_premiums += premium;
         acc.total_coverage = new_coverage;
         acc.next_policy_id += 1;
@@ -592,26 +621,27 @@ impl RefractPool {
         }
 
         // Read oracle data
-        let oracle: Option<OracleData> = env
+        let triggered = if let Some(oracle_address) = env
             .storage()
             .instance()
-            .get(&DataKey::OracleData(policy.coverage_type.clone()));
-
-        let triggered = match oracle {
-            None => false,
-            Some(data) => {
-                // Oracle value must be fresh (within 30 minutes)
-                let fresh = now - data.updated_at < 1_800;
-                let triggered_value = match policy.coverage_type {
-                    CoverageType::StablecoinDepeg => {
-                        data.value < (PRECISION - policy.trigger_threshold * PRECISION / BPS)
-                    }
-                    CoverageType::MarketCrash => data.value < -policy.trigger_threshold, // negative percent
-                    CoverageType::LiquidationShield => data.value > 0, // position was liquidated
-                    CoverageType::SmartContractRisk => data.value > 0, // exploit detected
-                    CoverageType::FlightDelay => data.value > policy.trigger_threshold, // delay minutes
-                };
-                fresh && triggered_value
+            .get::<DataKey, Address>(&DataKey::OracleContract)
+        {
+            Self::_oracle_triggered(&env, &oracle_address, &policy, now)?
+        } else {
+            let oracle: Option<OracleData> = env
+                .storage()
+                .instance()
+                .get(&DataKey::OracleData(policy.coverage_type.clone()));
+            match oracle {
+                None => false,
+                Some(data) => {
+                    let fresh = now.saturating_sub(data.updated_at) < 1_800;
+                    fresh && Self::_triggered_value(
+                        &policy.coverage_type,
+                        policy.trigger_threshold,
+                        data.value,
+                    )
+                }
             }
         };
 
@@ -619,7 +649,34 @@ impl RefractPool {
             return Err(PoolError::PolicyNotTriggered);
         }
 
-        // Pay out!
+        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        let pool_address = env.current_contract_address();
+        let pool_balance = token::Client::new(&env, &usdc).balance(&pool_address);
+        let mut backstop_covered = 0i128;
+        if pool_balance < policy.coverage_amount {
+            let shortfall = policy.coverage_amount - pool_balance;
+            let backstop: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Backstop)
+                .ok_or(PoolError::BackstopUnavailable)?;
+            backstop_covered = env.invoke_contract(
+                &backstop,
+                &Symbol::new(&env, "absorb_loss"),
+                Vec::from_array(
+                    &env,
+                    [
+                        pool_address.into_val(&env),
+                        shortfall.into_val(&env),
+                    ],
+                ),
+            );
+            if backstop_covered < shortfall {
+                return Err(PoolError::BackstopUnavailable);
+            }
+        }
+
+        // Pay out after any required backstop drawdown has reached the pool.
         let payout = policy.coverage_amount;
         policy.status = PolicyStatus::Claimed;
         policy.payout_at = Some(now);
@@ -629,14 +686,13 @@ impl RefractPool {
 
         // Reduce pool capital and outstanding coverage in consolidated record
         let mut acc = Self::_accounting(&env);
-        acc.total_capital = (acc.total_capital - payout).max(0);
+        acc.total_capital = (acc.total_capital - (payout - backstop_covered)).max(0);
         acc.total_coverage = (acc.total_coverage - payout).max(0);
         Self::_save_accounting(&env, &acc);
 
         // Transfer USDC to holder
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc).transfer(
-            &env.current_contract_address(),
+            &pool_address,
             &policy.holder,
             &payout,
         );
@@ -712,6 +768,57 @@ impl RefractPool {
         env.events()
             .publish((symbol_short!("REG_SET"), caller), (policy_registry,));
         Ok(())
+    }
+
+    pub fn set_backstop(
+        env: Env,
+        caller: Address,
+        backstop: Address,
+    ) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Backstop, &backstop);
+        env.events()
+            .publish((symbol_short!("BACKSTOP"),), (backstop,));
+        Ok(())
+    }
+
+    pub fn set_premium_fee_config(
+        env: Env,
+        caller: Address,
+        fee_bps: u32,
+        treasury: Address,
+    ) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        if fee_bps > fee::MAX_FEE_BPS {
+            return Err(PoolError::InvalidFeeBps);
+        }
+        env.storage().instance().set(&DataKey::PremiumFeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.events()
+            .publish((symbol_short!("FEE_SET"),), (fee_bps, treasury));
+        Ok(())
+    }
+
+    pub fn backstop(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Backstop)
+    }
+
+    pub fn set_oracle(
+        env: Env,
+        caller: Address,
+        oracle: Address,
+    ) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleContract, &oracle);
+        env.events()
+            .publish((symbol_short!("ORACLE_SET"),), (oracle,));
+        Ok(())
+    }
+
+    pub fn oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::OracleContract)
     }
 
     /// Rotate the admin key. The only recovery path if the current admin
@@ -899,6 +1006,58 @@ impl RefractPool {
             CoverageType::LiquidationShield => RegistryCoverageType::LiquidationShield,
             CoverageType::SmartContractRisk => RegistryCoverageType::SmartContractRisk,
             CoverageType::FlightDelay => RegistryCoverageType::FlightDelay,
+        }
+    }
+
+    fn _oracle_triggered(
+        env: &Env,
+        oracle: &Address,
+        policy: &Policy,
+        now: u64,
+    ) -> Result<bool, PoolError> {
+        let result = env.try_invoke_contract::<OracleReading, OracleContractError>(
+            oracle,
+            &Symbol::new(env, "get_reading"),
+            Vec::from_array(env, [Self::_coverage_feed_id(env, &policy.coverage_type).into_val(env)]),
+        );
+        let reading = match result {
+            Ok(Ok(reading)) => reading,
+            _ => return Err(PoolError::OracleUnavailable),
+        };
+        let age = now.saturating_sub(reading.timestamp);
+        if reading.timestamp > now || age >= 1_800 {
+            return Ok(false);
+        }
+        Ok(Self::_triggered_value(
+            &policy.coverage_type,
+            policy.trigger_threshold,
+            reading.value,
+        ))
+    }
+
+    fn _coverage_feed_id(env: &Env, coverage_type: &CoverageType) -> Symbol {
+        let feed = match coverage_type {
+            CoverageType::StablecoinDepeg => "USDC_PRICE",
+            CoverageType::MarketCrash => "MARKET_24H_RETURN",
+            CoverageType::LiquidationShield => "LIQUIDATION_RATIO",
+            CoverageType::SmartContractRisk => "PROTOCOL_TVL",
+            CoverageType::FlightDelay => "FLIGHT_DELAY",
+        };
+        Symbol::new(env, feed)
+    }
+
+    fn _triggered_value(
+        coverage_type: &CoverageType,
+        trigger_threshold: i128,
+        value: i128,
+    ) -> bool {
+        match coverage_type {
+            CoverageType::StablecoinDepeg => {
+                value < (PRECISION - trigger_threshold * PRECISION / BPS)
+            }
+            CoverageType::MarketCrash => value < -trigger_threshold,
+            CoverageType::LiquidationShield | CoverageType::SmartContractRisk => value > 0,
+            CoverageType::FlightDelay => value > trigger_threshold,
         }
     }
 

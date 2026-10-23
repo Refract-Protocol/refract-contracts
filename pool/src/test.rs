@@ -1,6 +1,10 @@
 #![cfg(test)]
 
 use super::*;
+#[path = "../../backstop/src/lib.rs"]
+mod backstop_impl;
+#[path = "../../treasury/src/lib.rs"]
+mod treasury_impl;
 use refract_oracle::{RefractOracle, RefractOracleClient};
 use refract_policy::{RefractPolicyRegistry, RefractPolicyRegistryClient};
 use soroban_sdk::{
@@ -1708,6 +1712,122 @@ fn test_precision_loss_bounds_in_deferred_division() {
             * 150 / 100;
         assert!(premium >= naive);
     }
+}
+
+fn setup_lifecycle_backstop<'a>(
+    fixture: &'a Fixture<'a>,
+) -> (Address, Address, backstop_impl::RefractBackstopClient<'a>) {
+    let backstop_id = fixture.env.register_contract(None, backstop_impl::RefractBackstop);
+    let backstop = backstop_impl::RefractBackstopClient::new(&fixture.env, &backstop_id);
+    let treasury_id = fixture.env.register_contract(None, treasury_impl::RefractTreasury);
+    let treasury = treasury_impl::RefractTreasuryClient::new(&fixture.env, &treasury_id);
+
+    backstop.initialize(
+        &fixture.pool.address,
+        &fixture.admin,
+        &fixture.usdc.address,
+        &2_000,
+    );
+    backstop.set_treasury(&fixture.admin, &treasury_id);
+    treasury.initialize(&fixture.admin);
+    fixture
+        .pool
+        .set_premium_fee_config(&fixture.admin, &1_000, &treasury_id);
+    fixture
+        .usdc_admin
+        .mint(&treasury_id, &(500 * ONE_USDC));
+    treasury.seed_backstop(
+        &fixture.admin,
+        &fixture.usdc.address,
+        &(500 * ONE_USDC),
+        &backstop_id,
+    );
+    backstop.set_allocation(&fixture.admin, &fixture.pool.address, &(500 * ONE_USDC));
+    fixture.pool.set_backstop(&fixture.admin, &backstop_id);
+
+    (backstop_id, treasury_id, backstop)
+}
+
+fn activate_lifecycle_oracle(fixture: &Fixture) {
+    fixture.env.ledger().with_mut(|ledger| {
+        ledger.timestamp += 48 * 60 * 60;
+    });
+    fixture.oracle.activate_relayer(&fixture.relayer);
+}
+
+#[test]
+fn golden_path_lifecycle_with_backstop_shortfall_drawdown() {
+    let fixture = setup();
+    activate_lifecycle_oracle(&fixture);
+    let (backstop_id, treasury_id, backstop) = setup_lifecycle_backstop(&fixture);
+
+    let lp = funded(&fixture, 1_000 * ONE_USDC);
+    fixture.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+    let holder = funded(&fixture, 100 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let premium = fixture.pool.quote_premium(&params).unwrap();
+    let policy_id = fixture.pool.buy_policy(&holder, &params);
+    let (_, treasury_fee) = fee::assess_fee(premium, 1_000).unwrap();
+    let expected_cut = (premium - treasury_fee) * 2_000 / 10_000;
+    assert_eq!(fixture.usdc.balance(&treasury_id), treasury_fee);
+    assert_eq!(backstop.pool_premium_contributed(&fixture.pool.address), expected_cut);
+
+    fixture
+        .usdc_admin
+        .burn(&fixture.pool.address, &(700 * ONE_USDC));
+    let now = fixture.env.ledger().timestamp();
+    fixture.oracle.submit(
+        &fixture.relayer,
+        &Symbol::new(&fixture.env, "USDC_PRICE"),
+        &9_400_000,
+        &now,
+        &Symbol::new(&fixture.env, "lifecycle"),
+    );
+    fixture.pool.process_claim(&policy_id);
+
+    assert!(backstop.pool_losses(&fixture.pool.address) > 0);
+    assert_eq!(fixture.usdc.balance(&holder), 600 * ONE_USDC - premium);
+    let conserved = fixture.usdc.balance(&treasury_id)
+        + fixture.usdc.balance(&backstop_id)
+        + fixture.usdc.balance(&fixture.pool.address)
+        + fixture.usdc.balance(&lp)
+        + fixture.usdc.balance(&holder);
+    assert_eq!(conserved, 900 * ONE_USDC);
+}
+
+#[test]
+fn golden_path_lifecycle_without_backstop_drawdown() {
+    let fixture = setup();
+    activate_lifecycle_oracle(&fixture);
+    let (_backstop_id, _treasury_id, backstop) = setup_lifecycle_backstop(&fixture);
+
+    let lp = funded(&fixture, 1_000 * ONE_USDC);
+    fixture.pool.provide_capital(&lp, &(1_000 * ONE_USDC));
+    let holder = funded(&fixture, 100 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 500 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let policy_id = fixture.pool.buy_policy(&holder, &params);
+    let now = fixture.env.ledger().timestamp();
+    fixture.oracle.submit(
+        &fixture.relayer,
+        &Symbol::new(&fixture.env, "USDC_PRICE"),
+        &9_400_000,
+        &now,
+        &Symbol::new(&fixture.env, "lifecycle"),
+    );
+    fixture.pool.process_claim(&policy_id);
+
+    assert_eq!(backstop.pool_losses(&fixture.pool.address), 0);
+    assert_eq!(fixture.usdc.balance(&holder), 600 * ONE_USDC - fixture.pool.get_policy(&policy_id).unwrap().premium_paid);
 }
 
 }
