@@ -159,3 +159,5 @@ We welcome contributors — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) and our [
 <!-- handsoff-issue-118 -->
 - #118: [High] Build a generic governance-executed calldata forwarder with an allowlist of callable contracts
 
+<!-- handsoff-issue-273 -->
+- #273: Implement a Guardian-Based Admin Key Recovery Path for the Four Contracts
