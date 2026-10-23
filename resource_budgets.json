@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "description": "Per-entrypoint Soroban CPU-instruction and memory ceilings, measured with the soroban-sdk testutils budget by the `budget_*` tests in backstop/bounty/grants/treasury. Ceilings = measured x (1 + headroom_pct/100), rounded up. Check: `cargo xtask budget-check`; regenerate: `cargo xtask budget-check --update`. Measured natively on the CI toolchain: host-function costs (storage, auth, token calls, events) are counted, guest wasm instructions are not.",
+  "headroom_pct": 20,
+  "contracts": {
+    "refract_backstop": {
+      "initialize": {
+        "cpu_insns": 45000,
+        "mem_bytes": 6144,
+        "rationale": "one-time write of config + state structs"
+      },
+      "deposit": {
+        "cpu_insns": 288000,
+        "mem_bytes": 41984,
+        "rationale": "token transfer + share arithmetic + two persistent writes"
+      },
+      "withdraw": {
+        "cpu_insns": 299000,
+        "mem_bytes": 43008,
+        "rationale": "token transfer + share arithmetic + two persistent writes"
+      },
+      "cover_shortfall": {
+        "cpu_insns": 276000,
+        "mem_bytes": 40960,
+        "rationale": "authorization check + token transfer + state update"
+      },
+      "receive_premium": {
+        "cpu_insns": 82000,
+        "mem_bytes": 13312,
+        "rationale": "bps arithmetic + state update, no token transfer"
+      }
+    },
+    "refract_bounty": {
+      "initialize": {
+        "cpu_insns": 53000,
+        "mem_bytes": 8192,
+        "rationale": "one-time write of config + balance"
+      },
+      "fund": {
+        "cpu_insns": 280000,
+        "mem_bytes": 41984,
+        "rationale": "token transfer + balance update"
+      },
+      "submit_advisory": {
+        "cpu_insns": 124000,
+        "mem_bytes": 23552,
+        "rationale": "duplicate check + persistent write + event"
+      },
+      "approve_advisory": {
+        "cpu_insns": 190000,
+        "mem_bytes": 32768,
+        "rationale": "approver-set membership scan + approval list scan + threshold-crossing reservation + event"
+      },
+      "dispute_advisory": {
+        "cpu_insns": 147000,
+        "mem_bytes": 25600,
+        "rationale": "window check + status update"
+      },
+      "pay_advisory": {
+        "cpu_insns": 360000,
+        "mem_bytes": 58368,
+        "rationale": "window check + reservation release + token transfer + settlement event"
+      },
+      "resolve_dispute": {
+        "cpu_insns": 379000,
+        "mem_bytes": 60416,
+        "rationale": "governance auth + re-score + reservation release + token transfer + settlement event"
+      },
+      "set_reward_tiers": {
+        "cpu_insns": 119000,
+        "mem_bytes": 21504,
+        "rationale": "config update only"
+      },
+      "approve_advisory_worst_case": {
+        "cpu_insns": 231000,
+        "mem_bytes": 50176,
+        "rationale": "MAX_APPROVERS (20) set, 20-of-20 threshold: final approval scans the full approver set and approval list, then reserves escrow"
+      },
+      "set_approvers": {
+        "cpu_insns": 120000,
+        "mem_bytes": 21504,
+        "rationale": "governance auth + bounded O(M^2) duplicate check (M <= 20) + config write"
+      },
+      "set_dispute_window": {
+        "cpu_insns": 120000,
+        "mem_bytes": 22528,
+        "rationale": "governance auth + config write"
+      }
+    },
+    "refract_grants": {
+      "initialize": {
+        "cpu_insns": 43000,
+        "mem_bytes": 5120,
+        "rationale": "three instance writes"
+      },
+      "submit_application": {
+        "cpu_insns": 118000,
+        "mem_bytes": 18432,
+        "rationale": "counter increment + persistent application write + event"
+      },
+      "approve_application": {
+        "cpu_insns": 162000,
+        "mem_bytes": 27648,
+        "rationale": "milestone sum validation + two persistent writes (app + grant) + event"
+      },
+      "reject_application": {
+        "cpu_insns": 120000,
+        "mem_bytes": 18432,
+        "rationale": "status update + event"
+      },
+      "withdraw_application": {
+        "cpu_insns": 106000,
+        "mem_bytes": 17408,
+        "rationale": "auth + status update + event"
+      },
+      "confirm_milestone": {
+        "cpu_insns": 125000,
+        "mem_bytes": 21504,
+        "rationale": "in-order scan (bounded by milestone count) + grant write"
+      },
+      "claim": {
+        "cpu_insns": 312000,
+        "mem_bytes": 50176,
+        "rationale": "token transfer + milestone flag scan + grant write"
+      },
+      "approve_application_worst_case": {
+        "cpu_insns": 234000,
+        "mem_bytes": 45056,
+        "rationale": "24-milestone grant: validates and writes the full milestone list"
+      },
+      "claim_worst_case": {
+        "cpu_insns": 519000,
+        "mem_bytes": 105472,
+        "rationale": "claims 24 confirmed milestones: full flag scan + token transfer"
+      },
+      "confirm_milestone_worst_case": {
+        "cpu_insns": 256000,
+        "mem_bytes": 58368,
+        "rationale": "confirms the 24th milestone: in-order scan over all earlier milestones"
+      }
+    },
+    "refract_treasury": {
+      "initialize": {
+        "cpu_insns": 28000,
+        "mem_bytes": 4096,
+        "rationale": "single instance write"
+      },
+      "withdraw": {
+        "cpu_insns": 206000,
+        "mem_bytes": 28672,
+        "rationale": "admin auth check + token transfer"
+      }
+    }
+  }
+}

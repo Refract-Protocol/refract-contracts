@@ -49,6 +49,86 @@ jobs:
       - name: Script unit tests (contract_state snapshot/reconcile)
         run: python3 -m unittest discover -s scripts/tests -v
 
+  # Issue #221: Soroban CPU/memory budgets for backstop, bounty, grants and
+  # treasury. Fails if any entrypoint exceeds its ceiling in
+  # resource_budgets.json; the diff table goes to the job summary.
+  resource-budgets:
+    name: resource budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check resource budgets
+        run: cargo xtask budget-check
+
+  # Issue #222: deploy, initialise, wire and verify against a local Soroban
+  # sandbox, then re-run to prove the script is idempotent.
+  # pool, policy, oracle and governance are left out until they compile
+  # again on main; add them to DEPLOY_ONLY when they do.
+  deploy-sandbox:
+    name: deploy dry-run (local sandbox)
+    runs-on: ubuntu-latest
+    env:
+      STELLAR_CLI_VERSION: "28.1.0"
+      DEPLOY_ONLY: refract_multisig,refract_timelock,refract_treasury,refract_vetoken,refract_incident_response,refract_backstop,refract_bounty,refract_grants
+      RPC: http://localhost:8000/rpc
+      PASSPHRASE: "Standalone Network ; February 2017"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start Soroban sandbox
+        run: docker run -d --name sandbox -p 8000:8000 stellar/quickstart:latest --local --enable core,rpc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Stellar CLI
+        run: |
+          curl -sSL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | sudo tar xz -C /usr/local/bin stellar
+          stellar --version
+
+      - name: Build, optimise and collect wasm
+        run: |
+          pkgs=""
+          for c in ${DEPLOY_ONLY//,/ }; do pkgs="$pkgs -p ${c//_/-}"; done
+          cargo build --target wasm32-unknown-unknown --release $pkgs
+          # Rust >= 1.82 emits wasm the Soroban VM rejects (reference-types
+          # encoding); the optimiser rewrites it into a valid MVP module.
+          for f in target/wasm32-unknown-unknown/release/refract_*.wasm; do
+            stellar contract optimize --wasm "$f" --wasm-out "$f"
+          done
+          python3 scripts/wasm_manifest.py collect --out dist/wasm --skip-missing
+
+      - name: Wait for sandbox and fund deployer
+        run: |
+          for i in $(seq 90); do
+            curl -s -X POST "$RPC" -H 'content-type: application/json' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | grep -q healthy && break
+            sleep 4
+          done
+          stellar keys generate deployer --rpc-url "$RPC" --network-passphrase "$PASSPHRASE" --fund
+
+      - name: Deploy, initialise, wire, verify
+        run: python3 scripts/deploy.py deploy --network local --only "$DEPLOY_ONLY"
+
+      - name: Re-run (must be a no-op)
+        run: python3 scripts/deploy.py deploy --network local --only "$DEPLOY_ONLY"
+
+      - name: Publish registry
+        run: |
+          { echo '### deployments/local.json'; echo '```json'; cat deployments/local.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
   # Issue #131 (plan): add a `miri` job here:
   #   - dtolnay/rust-toolchain@nightly with components: miri
   #   - cargo miri setup
