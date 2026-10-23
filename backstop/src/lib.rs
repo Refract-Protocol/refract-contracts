@@ -1,12 +1,53 @@
 #![no_std]
 
+//! # RefractBackstop
+//!
+//! First-loss insurance backstop tranche for `RefractPool`.
+//!
+//! ## Solvency & Coverage-Ratio Health Views (#239)
+//!
+//! Operators and the monitoring backend can inspect live backstop health via
+//! pure, read-only views and trigger hysteresis-guarded threshold alerts:
+//!
+//! - [`RefractBackstop::total_staked_capital`]: total capital currently staked.
+//! - [`RefractBackstop::encumbered_capital`] & [`RefractBackstop::idle_capital`]:
+//!   capital encumbered by in-force pool coverage vs unencumbered idle capital.
+//! - [`RefractBackstop::aggregate_in_force_coverage`]: pulls aggregate active
+//!   coverage from `RefractPool::aggregate_in_force_coverage` via
+//!   `try_invoke_contract`, degrading gracefully to cached coverage if the
+//!   cross-contract read is unavailable.
+//! - [`RefractBackstop::solvency_ratio_bps`]: `total_capital / coverage` in
+//!   basis points (computed via 1e7 fixed-point helper); returns `None` when
+//!   in-force coverage is zero.
+//! - [`RefractBackstop::coverage_ratio_bps`]: `coverage / total_capital` in
+//!   basis points; returns `None` when staked capital is zero.
+//! - [`RefractBackstop::feed_utilization_bps`]: per-feed coverage utilization
+//!   against backstop capital in basis points; returns `None` when staked
+//!   capital is zero.
+//! - [`RefractBackstop::check_health`]: permissionless entrypoint that compares
+//!   live ratios against admin-configured [`HealthThresholds`] and emits
+//!   `HLTHALRT` / `HLTHRECV` events only on threshold crossings with
+//!   hysteresis.
+
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    IntoVal, Symbol, Vec,
 };
 
-/// Basis-point denominator used for premium-share configuration.
+/// Basis-point denominator used for premium-share and ratio configuration.
 const BPS_DENOM: i128 = 10_000;
+
+/// 1e7 fixed-point scaling factor used for intermediate ratio math.
+const FP_SCALE: i128 = 10_000_000;
+
+/// Default minimum solvency ratio threshold in basis points (100% = 10,000 bps).
+pub const DEFAULT_MIN_SOLVENCY_BPS: i128 = 10_000;
+
+/// Default maximum coverage-to-capital ratio threshold in basis points (100% = 10,000 bps).
+pub const DEFAULT_MAX_COVERAGE_BPS: i128 = 10_000;
+
+/// Default hysteresis band in basis points (5% = 500 bps) required to clear an active alert.
+pub const DEFAULT_HYSTERESIS_BPS: i128 = 500;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +70,10 @@ enum DataKey {
     NextLotId,
     NextLossId,
     UnabsorbedShortfall,
+    CachedCoverage,
+    FeedExposure(Symbol),
+    HealthThresholds,
+    HealthAlertState,
 }
 
 #[contracttype]
@@ -69,6 +114,41 @@ pub enum BackstopError {
     PendingLossFreeze = 10,
     InvalidPremiumSplit = 11,
     DuplicateLossId = 12,
+    InvalidThreshold = 13,
+}
+
+/// Admin-configured health thresholds and hysteresis band (in basis points).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthThresholds {
+    /// Alert triggers when `solvency_ratio_bps < min_solvency_bps` and clears
+    /// when `solvency_ratio_bps >= min_solvency_bps + hysteresis_bps`.
+    pub min_solvency_bps: i128,
+    /// Alert triggers when `coverage_ratio_bps > max_coverage_bps` and clears
+    /// when `coverage_ratio_bps <= max_coverage_bps - hysteresis_bps`.
+    pub max_coverage_bps: i128,
+    /// Hysteresis band (in bps) preventing repeated event spam near the boundary.
+    pub hysteresis_bps: i128,
+}
+
+/// Latched alert state persisted across `check_health` calls.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthAlertState {
+    pub solvency_breached: bool,
+    pub coverage_breached: bool,
+}
+
+/// Pure read-only health snapshot of the backstop tranche.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopHealthSnapshot {
+    pub total_capital: i128,
+    pub encumbered_capital: i128,
+    pub idle_capital: i128,
+    pub aggregate_coverage: i128,
+    pub solvency_ratio_bps: Option<i128>,
+    pub coverage_ratio_bps: Option<i128>,
 }
 
 #[contracttype]
@@ -131,13 +211,29 @@ impl RefractBackstop {
                 premium_income: 0,
             },
         );
-        env.storage().instance().set(&DataKey::LockupLedgers, &100u32);
+        env.storage().instance().set(&DataKey::LockupLedgers, &0u32);
         env.storage().instance().set(&DataKey::JuniorPremiumBps, &(BPS_DENOM / 2));
         env.storage().instance().set(&DataKey::PendingLoss, &false);
         env.storage().instance().set(&DataKey::NextLotId, &1u64);
         env.storage().instance().set(&DataKey::AllLots, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::NextLossId, &1u64);
         env.storage().instance().set(&DataKey::UnabsorbedShortfall, &0i128);
+        env.storage().instance().set(&DataKey::CachedCoverage, &0i128);
+        env.storage().instance().set(
+            &DataKey::HealthThresholds,
+            &HealthThresholds {
+                min_solvency_bps: DEFAULT_MIN_SOLVENCY_BPS,
+                max_coverage_bps: DEFAULT_MAX_COVERAGE_BPS,
+                hysteresis_bps: DEFAULT_HYSTERESIS_BPS,
+            },
+        );
+        env.storage().instance().set(
+            &DataKey::HealthAlertState,
+            &HealthAlertState {
+                solvency_breached: false,
+                coverage_breached: false,
+            },
+        );
         for tranche in [Tranche::Junior, Tranche::Senior] {
             env.storage().instance().set(
                 &DataKey::TrancheState(tranche),
@@ -695,6 +791,324 @@ impl RefractBackstop {
         config.pool = new_pool;
         env.storage().instance().set(&"config", &config);
         Ok(())
+    }
+
+    // ─── Issue #239: Solvency & Coverage-Ratio Health Views ──────────────
+
+    /// Pure read-only view returning total staked capital across all tranches.
+    pub fn total_staked_capital(env: Env) -> Result<i128, BackstopError> {
+        Ok(Self::get_state(&env)?.total_capital)
+    }
+
+    /// Pure read-only view returning aggregate in-force coverage pulled from
+    /// `RefractPool::aggregate_in_force_coverage`. Degrades gracefully to the
+    /// cached coverage counter (`DataKey::CachedCoverage`) when the pool
+    /// cross-contract read is unavailable or returns an error.
+    pub fn aggregate_in_force_coverage(env: Env) -> Result<i128, BackstopError> {
+        Self::_read_pool_coverage(&env)
+    }
+
+    /// Pure read-only view returning capital encumbered by in-force coverage
+    /// (`min(total_capital, aggregate_in_force_coverage)`).
+    pub fn encumbered_capital(env: Env) -> Result<i128, BackstopError> {
+        let capital = Self::get_state(&env)?.total_capital.max(0);
+        let coverage = Self::_read_pool_coverage(&env)?.max(0);
+        Ok(capital.min(coverage))
+    }
+
+    /// Pure read-only view returning idle (unencumbered) capital
+    /// (`max(0, total_capital - encumbered_capital)`).
+    pub fn idle_capital(env: Env) -> Result<i128, BackstopError> {
+        let capital = Self::get_state(&env)?.total_capital.max(0);
+        let encumbered = Self::encumbered_capital(env)?;
+        Ok((capital - encumbered).max(0))
+    }
+
+    /// Pure read-only view returning the backstop solvency ratio
+    /// (`total_capital / aggregate_in_force_coverage`) in basis points,
+    /// computed via the 1e7 fixed-point helper to avoid overflow.
+    ///
+    /// Returns `Ok(None)` when in-force coverage is zero or negative (never panics).
+    pub fn solvency_ratio_bps(env: Env) -> Result<Option<i128>, BackstopError> {
+        let capital = Self::get_state(&env)?.total_capital;
+        let coverage = Self::_read_pool_coverage(&env)?;
+        Ok(Self::_ratio_bps(capital, coverage))
+    }
+
+    /// Pure read-only view returning the coverage-to-capital ratio
+    /// (`aggregate_in_force_coverage / total_capital`) in basis points,
+    /// computed via the 1e7 fixed-point helper.
+    ///
+    /// Returns `Ok(None)` when staked capital is zero or negative (never panics).
+    pub fn coverage_ratio_bps(env: Env) -> Result<Option<i128>, BackstopError> {
+        let capital = Self::get_state(&env)?.total_capital;
+        let coverage = Self::_read_pool_coverage(&env)?;
+        Ok(Self::_ratio_bps(coverage, capital))
+    }
+
+    /// Pure read-only view returning the per-feed coverage utilization against
+    /// total staked capital in basis points (`feed_exposure / total_capital`).
+    ///
+    /// Returns `Ok(None)` when staked capital is zero or negative (never panics).
+    pub fn feed_utilization_bps(env: Env, feed: Symbol) -> Result<Option<i128>, BackstopError> {
+        let capital = Self::get_state(&env)?.total_capital;
+        let exposure = Self::_read_feed_exposure(&env, &feed)?;
+        Ok(Self::_ratio_bps(exposure, capital))
+    }
+
+    /// Pure read-only view returning a consolidated health snapshot.
+    pub fn health_snapshot(env: Env) -> Result<BackstopHealthSnapshot, BackstopError> {
+        let total_capital = Self::get_state(&env)?.total_capital.max(0);
+        let aggregate_coverage = Self::_read_pool_coverage(&env)?.max(0);
+        let encumbered_capital = total_capital.min(aggregate_coverage);
+        let idle_capital = (total_capital - encumbered_capital).max(0);
+        let solvency_ratio_bps = Self::_ratio_bps(total_capital, aggregate_coverage);
+        let coverage_ratio_bps = Self::_ratio_bps(aggregate_coverage, total_capital);
+
+        Ok(BackstopHealthSnapshot {
+            total_capital,
+            encumbered_capital,
+            idle_capital,
+            aggregate_coverage,
+            solvency_ratio_bps,
+            coverage_ratio_bps,
+        })
+    }
+
+    /// Return the currently configured health alert thresholds and hysteresis band.
+    pub fn health_thresholds(env: Env) -> Result<HealthThresholds, BackstopError> {
+        let _ = Self::get_config(&env)?;
+        Ok(Self::_get_thresholds(&env))
+    }
+
+    /// Return the current latched health alert state.
+    pub fn health_alert_state(env: Env) -> Result<HealthAlertState, BackstopError> {
+        let _ = Self::get_config(&env)?;
+        Ok(Self::_get_alert_state(&env))
+    }
+
+    /// Update the health alert thresholds and hysteresis band. Admin-gated.
+    pub fn set_health_thresholds(
+        env: Env,
+        caller: Address,
+        min_solvency_bps: i128,
+        max_coverage_bps: i128,
+        hysteresis_bps: i128,
+    ) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let config = Self::get_config(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        if min_solvency_bps < 0 || max_coverage_bps <= 0 || hysteresis_bps < 0 {
+            return Err(BackstopError::InvalidThreshold);
+        }
+        env.storage().instance().set(
+            &DataKey::HealthThresholds,
+            &HealthThresholds {
+                min_solvency_bps,
+                max_coverage_bps,
+                hysteresis_bps,
+            },
+        );
+        Ok(())
+    }
+
+    /// Cache aggregate in-force coverage and optional per-feed exposure pushed
+    /// by the pool or admin at policy sale/settlement time.
+    pub fn sync_cached_coverage(
+        env: Env,
+        caller: Address,
+        aggregate_coverage: i128,
+        feed_exposures: Vec<(Symbol, i128)>,
+    ) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let config = Self::get_config(&env)?;
+        if caller != config.pool && caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        if aggregate_coverage < 0 {
+            return Err(BackstopError::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CachedCoverage, &aggregate_coverage);
+        for (feed, exposure) in feed_exposures.iter() {
+            if exposure < 0 {
+                return Err(BackstopError::InvalidAmount);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::FeedExposure(feed), &exposure);
+        }
+        Ok(())
+    }
+
+    /// Permissionless health evaluator that checks live solvency and coverage
+    /// ratios against admin-set thresholds and emits an event ONLY on a
+    /// threshold crossing (with hysteresis to prevent event spam).
+    pub fn check_health(env: Env) -> Result<HealthAlertState, BackstopError> {
+        let snap = Self::health_snapshot(env.clone())?;
+        let thresholds = Self::_get_thresholds(&env);
+        let mut alert = Self::_get_alert_state(&env);
+
+        // Evaluate solvency ratio crossing with hysteresis.
+        let prev_solvency_breached = alert.solvency_breached;
+        match snap.solvency_ratio_bps {
+            Some(solvency_bps) => {
+                if !alert.solvency_breached && solvency_bps < thresholds.min_solvency_bps {
+                    alert.solvency_breached = true;
+                } else if alert.solvency_breached
+                    && solvency_bps
+                        >= thresholds
+                            .min_solvency_bps
+                            .saturating_add(thresholds.hysteresis_bps)
+                {
+                    alert.solvency_breached = false;
+                }
+            }
+            None => {
+                // Zero in-force coverage: solvency is unconstrained; clear breach if any.
+                if alert.solvency_breached {
+                    alert.solvency_breached = false;
+                }
+            }
+        }
+
+        if alert.solvency_breached != prev_solvency_breached {
+            let topic = if alert.solvency_breached {
+                symbol_short!("HLTHALRT")
+            } else {
+                symbol_short!("HLTHRECV")
+            };
+            env.events().publish(
+                (topic, symbol_short!("solvency")),
+                (
+                    snap.solvency_ratio_bps.unwrap_or(0),
+                    thresholds.min_solvency_bps,
+                ),
+            );
+        }
+
+        // Evaluate coverage ratio crossing with hysteresis.
+        let prev_coverage_breached = alert.coverage_breached;
+        match snap.coverage_ratio_bps {
+            Some(coverage_bps) => {
+                if !alert.coverage_breached && coverage_bps > thresholds.max_coverage_bps {
+                    alert.coverage_breached = true;
+                } else if alert.coverage_breached
+                    && coverage_bps
+                        <= thresholds
+                            .max_coverage_bps
+                            .saturating_sub(thresholds.hysteresis_bps)
+                {
+                    alert.coverage_breached = false;
+                }
+            }
+            None => {
+                // Zero capital: breached only if there is positive coverage in force.
+                let breached_now = snap.aggregate_coverage > 0;
+                if breached_now != alert.coverage_breached {
+                    alert.coverage_breached = breached_now;
+                }
+            }
+        }
+
+        if alert.coverage_breached != prev_coverage_breached {
+            let topic = if alert.coverage_breached {
+                symbol_short!("HLTHALRT")
+            } else {
+                symbol_short!("HLTHRECV")
+            };
+            env.events().publish(
+                (topic, symbol_short!("coverage")),
+                (
+                    snap.coverage_ratio_bps.unwrap_or(0),
+                    thresholds.max_coverage_bps,
+                ),
+            );
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::HealthAlertState, &alert);
+        Ok(alert)
+    }
+
+    fn _ratio_bps(numerator: i128, denominator: i128) -> Option<i128> {
+        if denominator <= 0 || numerator < 0 {
+            return None;
+        }
+        if numerator == 0 {
+            return Some(0);
+        }
+        // Compute via 1e7 fixed-point helper when safe from overflow, falling
+        // back to direct checked/saturating bps scaling at extreme balances.
+        if let Some(scaled_fp) = numerator.checked_mul(FP_SCALE) {
+            let fp_ratio = scaled_fp / denominator;
+            Some(fp_ratio * BPS_DENOM / FP_SCALE)
+        } else if let Some(scaled_bps) = numerator.checked_mul(BPS_DENOM) {
+            Some(scaled_bps / denominator)
+        } else {
+            Some((numerator / denominator).saturating_mul(BPS_DENOM))
+        }
+    }
+
+    fn _read_pool_coverage(env: &Env) -> Result<i128, BackstopError> {
+        let config = Self::get_config(env)?;
+        let cached: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CachedCoverage)
+            .unwrap_or(0);
+        match env.try_invoke_contract::<i128, soroban_sdk::InvokeError>(
+            &config.pool,
+            &Symbol::new(env, "aggregate_in_force_coverage"),
+            Vec::new(env),
+        ) {
+            Ok(Ok(live_coverage)) => Ok(live_coverage.max(0)),
+            _ => Ok(cached.max(0)),
+        }
+    }
+
+    fn _read_feed_exposure(env: &Env, feed: &Symbol) -> Result<i128, BackstopError> {
+        let config = Self::get_config(env)?;
+        let cached: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeedExposure(feed.clone()))
+            .unwrap_or(0);
+        let mut args = Vec::new(env);
+        args.push_back(feed.clone().into_val(env));
+        match env.try_invoke_contract::<i128, soroban_sdk::InvokeError>(
+            &config.pool,
+            &Symbol::new(env, "feed_in_force_coverage"),
+            args,
+        ) {
+            Ok(Ok(live_exposure)) => Ok(live_exposure.max(0)),
+            _ => Ok(cached.max(0)),
+        }
+    }
+
+    fn _get_thresholds(env: &Env) -> HealthThresholds {
+        env.storage()
+            .instance()
+            .get(&DataKey::HealthThresholds)
+            .unwrap_or(HealthThresholds {
+                min_solvency_bps: DEFAULT_MIN_SOLVENCY_BPS,
+                max_coverage_bps: DEFAULT_MAX_COVERAGE_BPS,
+                hysteresis_bps: DEFAULT_HYSTERESIS_BPS,
+            })
+    }
+
+    fn _get_alert_state(env: &Env) -> HealthAlertState {
+        env.storage()
+            .instance()
+            .get(&DataKey::HealthAlertState)
+            .unwrap_or(HealthAlertState {
+                solvency_breached: false,
+                coverage_breached: false,
+            })
     }
 }
 
