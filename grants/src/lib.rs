@@ -24,10 +24,22 @@
 //! mechanics once a milestone is confirmed on-chain.
 
 pub mod amounts;
+pub mod bond;
+pub mod budget;
+pub mod compensation;
 pub mod consistency;
+pub mod delegation;
+pub mod licensing;
 pub mod programs;
+pub mod rate_limit;
+pub mod reviewer_stake;
+pub mod scoring;
 
 use std::collections::BTreeMap;
+
+/// Most grant ids one page returns. Larger requested limits are capped to this,
+/// so a single read stays within the per-transaction budget.
+pub const MAX_PAGE_LIMIT: u32 = 100;
 
 /// Identifier for a grant.
 pub type GrantId = u64;
@@ -123,6 +135,40 @@ impl RefractGrants {
     /// Returns the confirmed-but-unclaimed amount for `grant_id`.
     pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
         self.grants.get(&grant_id).map(|grant| grant.claimable)
+    }
+
+    /// One page of grant ids in ascending order, for cursor-based reads.
+    ///
+    /// Returns up to `limit` ids strictly after `after` (or from the start when
+    /// `after` is `None`), capped at [`MAX_PAGE_LIMIT`]. The second value is the
+    /// cursor for the next page: the last id returned, or `None` when the page
+    /// reaches the end. Ids are never skipped or repeated, even if grants are
+    /// created between calls, because each page starts strictly after the
+    /// previous cursor. A cursor past the end returns an empty page.
+    pub fn grant_ids_page(
+        &self,
+        after: Option<GrantId>,
+        limit: u32,
+    ) -> (Vec<GrantId>, Option<GrantId>) {
+        let limit = limit.min(MAX_PAGE_LIMIT) as usize;
+        let lower = match after {
+            Some(cursor) => std::ops::Bound::Excluded(cursor),
+            None => std::ops::Bound::Unbounded,
+        };
+        let page: Vec<GrantId> = self
+            .grants
+            .range((lower, std::ops::Bound::Unbounded))
+            .take(limit)
+            .map(|(id, _)| *id)
+            .collect();
+        // The cursor is set only when at least one more grant follows the page.
+        let next = page.last().copied().filter(|last| {
+            self.grants
+                .range((std::ops::Bound::Excluded(*last), std::ops::Bound::Unbounded))
+                .next()
+                .is_some()
+        });
+        (page, next)
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
@@ -416,4 +462,51 @@ mod tests {
             Err(GrantsError::InvalidMilestoneIndex)
         );
     }
+
+    #[test]
+    fn grant_id_pages_run_end_to_end_without_gaps_or_repeats() {
+        let mut grants = contract();
+        for _ in 0..5 {
+            grants
+                .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
+                .unwrap();
+        }
+
+        let (first, cursor) = grants.grant_ids_page(None, 2);
+        assert_eq!(first, vec![0, 1]);
+        let (second, cursor) = grants.grant_ids_page(cursor, 2);
+        assert_eq!(second, vec![2, 3]);
+        let (last, cursor) = grants.grant_ids_page(cursor, 2);
+        assert_eq!(last, vec![4]);
+        assert_eq!(cursor, None, "the last page has no next cursor");
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_returns_an_empty_page() {
+        let mut grants = contract();
+        grants
+            .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
+            .unwrap();
+
+        let (page, cursor) = grants.grant_ids_page(Some(0), 10);
+        assert!(page.is_empty());
+        assert_eq!(cursor, None);
+        let (empty, _) = contract().grant_ids_page(None, 10);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_huge_limit_is_capped_to_the_page_maximum() {
+        let mut grants = contract();
+        for _ in 0..(MAX_PAGE_LIMIT + 1) {
+            grants
+                .create_grant(GOVERNANCE, RECIPIENT, 100, vec![100])
+                .unwrap();
+        }
+
+        let (page, cursor) = grants.grant_ids_page(None, u32::MAX);
+        assert_eq!(page.len(), MAX_PAGE_LIMIT as usize);
+        assert_eq!(cursor, Some(MAX_PAGE_LIMIT as GrantId - 1));
+    }
 }
+

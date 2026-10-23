@@ -32,6 +32,48 @@ We aim to acknowledge reports within **72 hours** and to provide a remediation
 timeline after triage. We will credit reporters who wish to be named once a fix
 ships.
 
+## On-chain bounty process (`RefractBounty`)
+
+Rewards for valid reports are escrowed and paid by the
+[`RefractBounty`](./bounty/src/lib.rs) contract. Report details stay off-chain;
+only a SHA-256 commitment to the report goes on-chain.
+
+**Severity tiers.** Each report is filed under one tier. The amounts below are
+the default deployment values in
+[`deployments/config.json`](./deployments/config.json) (token units; stored as
+1e7 fixed-point). Governance can change them with `set_reward_tiers`; a change
+applies to reports approved afterwards.
+
+| Severity | Default reward | Typical impact |
+|---|---|---|
+| Critical | 50,000 | Direct loss or permanent freezing of pooled funds |
+| High | 10,000 | Temporary freezing of funds, or theft needing unlikely conditions |
+| Medium | 2,000 | Griefing, or a contract failing to deliver promised returns |
+| Low | 500 | Minor issues with no funds at risk |
+
+**Lifecycle.**
+
+1. **Submitted** — the reporter calls `submit_advisory(report_hash, severity)`.
+   The same hash can't be submitted twice.
+2. **Approved** — members of the governance-managed approver set sign off with
+   `approve_advisory`. Each approver counts once, and the reporter can never
+   approve their own report. When the N-of-M threshold is reached, the
+   reward is reserved from escrow, so every approved report is fully funded.
+3. **Dispute window** — for `dispute_window_ledgers` ledgers after approval
+   (default 2,880), the reporter can call `dispute_advisory` (for example, to
+   contest the severity). A disputed report can't be paid until governance
+   resolves it.
+4. **Paid** — once the window closes with no dispute, anyone can call
+   `pay_advisory` to send the reserved reward to the reporter.
+5. **Resolution** — governance settles a dispute with
+   `resolve_dispute(final_severity, pay)`: it pays the reward for the
+   adjudicated tier, or rejects the report and releases the reservation.
+
+Only settlement (`pay_advisory` / `resolve_dispute`) moves escrowed funds.
+Each settlement emits an `advisory_settled` event with the severity, amount,
+approver count and final state. Expiry and refund of stale reports are not
+implemented yet.
+
 ## Scope
 
 In scope: the smart contracts, the backend services, and the web app in the
