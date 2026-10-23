@@ -291,6 +291,25 @@ combined. Quorum is `quorum_bps` of `GovernorConfig::total_voting_supply`.
 
 ---
 
+## 8. Interface Versioning (issue #248)
+
+Each contract crate embeds an interface version in its wasm:
+
+```rust
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
+```
+
+**Rule:** bump `refract_iface` by one in the same PR as any change to that
+contract's public interface: entrypoints added, removed or renamed, argument
+or return types changed, or `#[contracttype]` / `#[contracterror]` fields,
+variants or discriminants changed. Doc-comment-only edits don't need a bump.
+The version never goes down.
+
+The exported spec for every contract is committed under [`specs/`](specs/README.md).
+`python3 scripts/contract_specs.py check` (run in CI by the `contract-specs`
+job) fails when the committed spec differs from a fresh release build, or when
+the interface changed without a version bump.
+
 # Governance-Adjacent Contract Specifications
 
 Normative clauses for `RefractBackstop` and `RefractGrants`. Bounty and treasury

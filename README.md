@@ -63,6 +63,15 @@ RUSTUP_TOOLCHAIN=nightly-2026-09-20 python3 scripts/coverage.py run   # writes t
 python3 scripts/coverage.py report                                     # summary + floor check
 ```
 
+### Contract interface specs
+
+The Soroban spec of every contract is committed under [`specs/`](specs/README.md), and the backend and frontend generate their clients from it. After changing a contract's interface, bump its `refract_iface` version and regenerate:
+
+```bash
+python3 scripts/contract_specs.py generate   # build release wasm, write specs/*.json
+python3 scripts/contract_specs.py check      # what CI runs
+```
+
 ### Build artefacts and manifest
 
 Every CI run uploads the three release contracts as a workflow artefact named `refract-wasm-<commit sha>`. It holds `refract_pool.wasm`, `refract_policy.wasm`, `refract_oracle.wasm`, a `manifest.json` and a `SHA256SUMS` file. The checksums also appear in the run's job summary, so you can read them without downloading anything. Artefacts from pushes to `main` are kept for **90 days**, and artefacts from pull requests for **14 days**. On a pull request, the recorded commit is the merge commit GitHub built (`GITHUB_SHA`).

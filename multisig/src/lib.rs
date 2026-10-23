@@ -186,6 +186,10 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Val, Vec,
 };
 
+// Interface version of this contract's public spec. Bump it whenever an
+// entrypoint or contract type changes. See specs/README.md.
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
