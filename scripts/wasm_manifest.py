@@ -108,11 +108,14 @@ def toolchain_info():
     }
 
 
-def collect(out):
+def collect(out, skip_missing=False):
     os.makedirs(out, exist_ok=True)
     commit, dirty = git_info()
     entries = []
     for c in contracts_from_metadata():
+        if not os.path.isfile(c["source"]) and skip_missing:
+            print(f"warning: {c['source']} not built, skipping", file=sys.stderr)
+            continue
         if not os.path.isfile(c["source"]):
             sys.exit(
                 f"error: {c['source']} not found. Run "
@@ -195,11 +198,12 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_collect = sub.add_parser("collect", help="copy release wasm files and write the manifest")
     p_collect.add_argument("--out", default="dist/wasm", help="output directory (default: dist/wasm)")
+    p_collect.add_argument("--skip-missing", action="store_true", help="skip contracts that were not built instead of failing")
     p_verify = sub.add_parser("verify", help="check a directory's wasm files against its manifest.json")
     p_verify.add_argument("dir", nargs="?", default="dist/wasm")
     args = parser.parse_args()
     if args.cmd == "collect":
-        collect(args.out)
+        collect(args.out, args.skip_missing)
     else:
         verify(args.dir)
 
