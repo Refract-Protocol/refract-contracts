@@ -1,0 +1,16 @@
+[package]
+name = "refract-testutils"
+version = "0.1.0"
+edition = "2021"
+description = "Shared test utilities, mock contracts, and scenario builders for Refract contract tests"
+license = "MIT"
+
+# This crate is test-only — it must never be compiled into production wasm.
+# It is only ever used as a [dev-dependency].
+
+[lib]
+name = "refract_testutils"
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
