@@ -92,6 +92,7 @@ pub enum DataKey {
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
     LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    Backstop,                 // optional RefractBackstop contract address for per-feed caps (#240)
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -114,6 +115,7 @@ pub enum PoolError {
     CapitalLocked = 13, // can't withdraw during a claim event
     PolicyNotYetExpired = 14,
     LockupActive = 15, // can't withdraw until lockup_days have passed since the last deposit
+    FeedCapExceeded = 16,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -428,6 +430,31 @@ impl RefractPool {
 
         let state = PoolState::load(&env);
         let new_coverage = Self::_check_coverage_capacity(&state, params.coverage_amount)?;
+        let feed_sym = Self::_feed_symbol(&params.coverage_type);
+
+        // Enforce per-feed and per-holder concentration caps in RefractBackstop
+        // prior to transferring the premium (#240).
+        if let Some(backstop_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Backstop)
+        {
+            let check_res = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                &backstop_addr,
+                &Symbol::new(&env, "check_exposure_caps"),
+                Vec::from_array(
+                    &env,
+                    [
+                        holder.clone().into_val(&env),
+                        feed_sym.clone().into_val(&env),
+                        params.coverage_amount.into_val(&env),
+                    ],
+                ),
+            );
+            if !matches!(check_res, Ok(Ok(()))) {
+                return Err(PoolError::FeedCapExceeded);
+            }
+        }
 
         let premium = Self::_calc_premium(&state.config, &params);
         let now = env.ledger().timestamp();
@@ -519,6 +546,31 @@ impl RefractPool {
             "registry must echo back the id the pool assigned"
         );
 
+        // Record the policy's per-feed and per-holder exposure in RefractBackstop (#240).
+        if let Some(backstop_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Backstop)
+        {
+            let record_res = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                &backstop_addr,
+                &Symbol::new(&env, "record_policy_exposure"),
+                Vec::from_array(
+                    &env,
+                    [
+                        env.current_contract_address().into_val(&env),
+                        id.into_val(&env),
+                        holder.clone().into_val(&env),
+                        feed_sym.into_val(&env),
+                        params.coverage_amount.into_val(&env),
+                    ],
+                ),
+            );
+            if !matches!(record_res, Ok(Ok(()))) {
+                return Err(PoolError::FeedCapExceeded);
+            }
+        }
+
         env.events().publish(
             (symbol_short!("BUY"), holder),
             (id, params.coverage_amount, premium, end_time),
@@ -605,6 +657,7 @@ impl RefractPool {
         // is settled. See _deactivate_in_registry for why this is
         // best-effort and cannot roll back the payout above.
         Self::_deactivate_in_registry(&env, policy_id);
+        Self::_release_in_backstop(&env, policy_id);
 
         env.events().publish(
             (symbol_short!("CLAIM"), policy.holder),
@@ -647,6 +700,7 @@ impl RefractPool {
         Self::_save_accounting(&env, &acc);
 
         Self::_deactivate_in_registry(&env, policy_id);
+        Self::_release_in_backstop(&env, policy_id);
 
         env.events()
             .publish((symbol_short!("EXPIRE"), policy.holder), (policy_id, now));
@@ -655,6 +709,21 @@ impl RefractPool {
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
+
+    /// Wire the RefractBackstop contract consulted for per-feed underwriting
+    /// exposure limits (#240). Admin-gated.
+    pub fn set_backstop(env: Env, caller: Address, backstop: Address) -> Result<(), PoolError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Backstop, &backstop);
+        env.events()
+            .publish((symbol_short!("BKSTP_SET"), caller), (backstop,));
+        Ok(())
+    }
+
+    /// Return the configured RefractBackstop contract address, if any.
+    pub fn backstop(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Backstop)
+    }
 
     /// Repoint the RefractPolicyRegistry this pool indexes policies into.
     /// Only needed for redeploys/migrations — `initialize` already wires the
@@ -879,6 +948,37 @@ impl RefractPool {
         let _ = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
             &registry_addr,
             &Symbol::new(env, "deactivate_policy"),
+            Vec::from_array(
+                env,
+                [
+                    env.current_contract_address().into_val(env),
+                    policy_id.into_val(env),
+                ],
+            ),
+        );
+    }
+
+    fn _feed_symbol(t: &CoverageType) -> Symbol {
+        match t {
+            CoverageType::StablecoinDepeg => symbol_short!("depeg"),
+            CoverageType::MarketCrash => symbol_short!("crash"),
+            CoverageType::LiquidationShield => symbol_short!("liq"),
+            CoverageType::SmartContractRisk => symbol_short!("sc_risk"),
+            CoverageType::FlightDelay => symbol_short!("flight"),
+        }
+    }
+
+    fn _release_in_backstop(env: &Env, policy_id: u64) {
+        let Some(backstop_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Backstop)
+        else {
+            return;
+        };
+        let _ = env.try_invoke_contract::<i128, soroban_sdk::InvokeError>(
+            &backstop_addr,
+            &Symbol::new(env, "release_policy_exposure"),
             Vec::from_array(
                 env,
                 [
