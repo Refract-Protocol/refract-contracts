@@ -74,6 +74,24 @@ Each settlement emits an `advisory_settled` event with the severity, amount,
 approver count and final state. Expiry and refund of stale reports are not
 implemented yet.
 
+**Anonymity-preserving payout indirection (`RefractBountyEscrow`).** To prevent
+a reporter's disclosure history from being permanently linked on-chain to the
+funding wallet that receives rewards, disclosures can bind a reward to a
+32-byte commitment (`commitment = SHA-256(preimage)`) via `submit_disclosure`.
+Governance adjudicates and reserves the bounty against the commitment with
+`award_commitment` (`Awarded` state), without learning the destination wallet.
+Separately, the researcher registers a destination address using
+`register_payout_address(owner, preimage, payout_address)` (which requires the
+preimage so registrations cannot be front-run), may rotate that destination
+prior to settlement via `rotate_payout_address` (atomically revoking the prior
+binding), and redeems the reward into the bound wallet with
+`claim_by_commitment(caller, preimage)` (`Claimed` state). Governance can freeze
+a payout address flagged as compromised via `freeze_payout_address` without
+altering the awarded amount, allowing the binding owner to rotate to a clean
+address before claiming. A lost `preimage` or binding `owner` key is a
+permanent, unrecoverable loss; by design there is no administrative override to
+redirect an awarded commitment payout.
+
 ## Scope
 
 In scope: the smart contracts, the backend services, and the web app in the
