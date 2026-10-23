@@ -9,7 +9,9 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = { version = "21.0.0" }
+soroban-sdk = { workspace = true }
+refract-interfaces = { path = "../interfaces" }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+refract-backstop = { path = "../backstop", features = ["testutils"] }
