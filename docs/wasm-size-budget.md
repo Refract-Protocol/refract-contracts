@@ -24,6 +24,23 @@ Soroban smart contract deployment costs and execution instantiation limits depen
 | `refract-pool` | `refract_pool.wasm` | 65,000 B | ~63.5 KB |
 | `refract-policy` | `refract_policy.wasm` | 45,000 B | ~43.9 KB |
 | `refract-oracle` | `refract_oracle.wasm` | 40,000 B | ~39.0 KB |
+| `refract-registry` | `refract_registry.wasm` | 26,000 B | ~25.4 KB |
+| `refract-treasury` | `refract_treasury.wasm` | 36,000 B | ~35.2 KB |
+| `refract-bounty` | `refract_bounty.wasm` | 40,000 B | ~39.1 KB |
+| `refract-backstop` | `refract_backstop.wasm` | 42,000 B | ~41.0 KB |
+| `refract-grants` | `refract_grants.wasm` | 72,000 B | ~70.3 KB |
+
+Budgets for registry, treasury, bounty, backstop and grants were set from
+measured sizes (22.3 / 31.3 / 36.2 / 38.2 / 66.5 KB, unoptimized by
+`wasm-opt`) with roughly 10% headroom. Grants is the largest because it
+carries the application, review and appeal state machines. Exported doc
+comments are kept to one line because they are embedded in the
+`contractspecv0` section. All are well under the network's 128 KiB
+`contract_max_size_bytes`.
+
+The workspace `soroban-sdk` dependency no longer enables the `alloc`
+feature (no crate uses it outside tests). With it enabled, `std`'s panic
+and `String` machinery was linked into every contract (about 4 KB each).
 
 ## Verification Script
 The build-and-measure script `scripts/measure_wasm_sizes.py` compiles contracts and verifies byte counts against `wasm_sizes.json`:

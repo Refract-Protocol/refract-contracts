@@ -912,6 +912,8 @@ dependencies = [
 name = "refract-backstop"
 version = "0.1.0"
 dependencies = [
+ "refract-common",
+ "refract-registry",
  "soroban-sdk",
 ]
 
@@ -919,6 +921,132 @@ dependencies = [
 name = "refract-bounty"
 version = "0.1.0"
 dependencies = [
+ "refract-common",
+ "refract-registry",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-common"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-governance"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-grants"
+version = "0.1.0"
+dependencies = [
+ "refract-common",
+ "refract-registry",
+ "refract-timelock",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-incident-response"
+version = "0.1.0"
+dependencies = [
+ "refract-oracle",
+ "refract-policy",
+ "refract-pool",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-multisig"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-oracle"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "refract-interfaces",
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-backstop"
+version = "0.1.0"
+dependencies = [
+ "refract-backstop",
+ "refract-interfaces",
+ "refract-timelock",
+ "refract-vetoken",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-grants"
+version = "0.1.0"
+dependencies = [
+ "refract-interfaces",
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-bounty"
+version = "0.1.0"
+dependencies = [
+ "re
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "refract-interfaces",
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-backstop"
+version = "0.1.0"
+dependencies = [
+ "refract-backstop",
+ "refract-interfaces",
+ "refract-timelock",
+ "refract-vetoken",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-grants"
+version = "0.1.0"
+dependencies = [
+ "refract-interfaces",
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-bounty"
+version = "0.1.0"
+dependencies = [
+ "refract-interfaces",
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-governance"
+version = "0.1.0"
+dependencies = [
+ "refract-backstop",
+ "refract-interfaces",
+ "refract-timelock",
+ "refract-vetoken",
  "soroban-sdk",
 ]
 
@@ -930,6 +1058,82 @@ dependencies = [
 ]
 
 [[package]]
+name = "refract-incident-response"
+version = "0.1.0"
+dependencies = [
+ "refract-oracle",
+ "refract-policy",
+ "refract-pool",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-payout-registry"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-params"
+version = "0.1.0"
+dependencies = [
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-policy"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+name = "refract-params"
+version = "0.1.0"
+dependencies = [
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-payout-registry"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-pool"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+name = "refract-params"
+version = "0.1.0"
+dependencies = [
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-payout-registry"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-bounty"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-grants"
+version = "0.1.0"
+dependencies = [
 name = "refract-harness"
 version = "0.1.0"
 dependencies = [
@@ -937,6 +1141,43 @@ dependencies = [
  "refract-bounty",
  "refract-grants",
  "refract-treasury",
+ "refract-interfaces",
+ "refract-oracle",
+ "refract-policy",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-harness"
+version = "0.1.0"
+dependencies = [
+ "refract-backstop",
+ "refract-bounty",
+ "refract-grants",
+ "refract-treasury",
+ "refract-interfaces",
+ "refract-oracle",
+ "refract-policy",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-registry"
+version = "0.1.0"
+dependencies = [
+ "refract-backstop",
+ "refract-common",
+ "refract-interfaces",
+ "refract-oracle",
+ "refract-policy",
+ "refract-timelock",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-timelock"
+version = "0.1.0"
+dependencies = [
  "soroban-sdk",
 ]
 
@@ -953,9 +1194,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "refract-multisig"
+name = "refract-registry"
 version = "0.1.0"
 dependencies = [
+ "refract-backstop",
+ "refract-common",
+ "refract-interfaces",
+ "refract-oracle",
+ "refract-policy",
+ "refract-timelock",
  "soroban-sdk",
 ]
 
@@ -970,8 +1217,60 @@ dependencies = [
 name = "refract-treasury"
 version = "0.1.0"
 dependencies = [
+ "refract-backstop",
+ "refract-common",
+ "refract-interfaces",
+ "refract-oracle",
+ "refract-policy",
+ "refract-registry",
  "soroban-sdk",
 ]
+
+[[package]]
+name = "refract-vetoken"
+version = "0.1.0"
+dependencies = [
+ "refract-backstop",
+ "refract-interfaces",
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-timelock"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-treasury"
+version = "0.1.0"
+dependencies = [
+ "refract-backstop",
+ "refract-common",
+ "refract-interfaces",
+ "refract-oracle",
+ "refract-policy",
+ "refract-registry",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-vetoken"
+version = "0.1.0"
+dependencies = [
+ "refract-backstop",
+ "refract-interfaces",
+ "refract-testutils",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rfc6979"
@@ -1083,6 +1382,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap 2.14.0",
  "itoa",
  "memchr",
  "serde",
@@ -1657,6 +1957,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
+name = "wit-bindgen"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "refract-grants",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

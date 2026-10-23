@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "version": "1",
+  "network": "testnet",
+  "ledger_sequence": 51234567,
+  "close_time": 1729000000,
+  "hash": "447ea8e4cbf4c793211053bc2cfabf1dd6b4630bf23f84776bd4a2a7e12a3135",
+  "entries": [
+    {
+      "contract": "backstop",
+      "key": "shortfall",
+      "value": 500,
+      "xdr": "NTAw"
+    },
+    {
+      "contract": "backstop",
+      "key": "total_capital",
+      "value": 800,
+      "xdr": "ODAw"
+    },
+    {
+      "contract": "bounty",
+      "key": "escrow_balance",
+      "value": 400,
+      "xdr": "NDAw"
+    },
+    {
+      "contract": "bounty",
+      "key": "payout",
+      "value": 100,
+      "xdr": "MTAw"
+    },
+    {
+      "contract": "grants",
+      "key": "escrow_balance",
+      "value": 250,
+      "xdr": "MjUw"
+    },
+    {
+      "contract": "grants",
+      "key": "payout",
+      "value": 80,
+      "xdr": "ODA="
+    },
+    {
+      "contract": "oracle",
+      "key": "price",
+      "value": 2000000,
+      "xdr": "MjAwMDAwMA=="
+    },
+    {
+      "contract": "oracle",
+      "key": "timestamp",
+      "value": 1728999000,
+      "xdr": "MTcyODk5OTAwMA=="
+    },
+    {
+      "contract": "policy",
+      "key": "active",
+      "value": 1,
+      "xdr": "MQ=="
+    },
+    {
+      "contract": "pool",
+      "key": "max_staleness",
+      "value": 3600,
+      "xdr": "MzYwMA=="
+    },
+    {
+      "contract": "pool",
+      "key": "notional",
+      "value": 1000000,
+      "xdr": "MTAwMDAwMA=="
+    },
+    {
+      "contract": "pool",
+      "key": "premium_rate_bps",
+      "value": 250,
+      "xdr": "MjUw"
+    },
+    {
+      "contract": "treasury",
+      "key": "balance",
+      "value": 50,
+      "xdr": "NTA="
+    }
+  ]
+}

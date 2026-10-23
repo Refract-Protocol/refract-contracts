@@ -1,0 +1,22 @@
+# Enforces the panic-free policy for backstop, bounty, grants and treasury.
+# See scripts/check_panic_free.sh. Existing violations are allowlisted and
+# can only be removed, not added.
+
+name: panic-free
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  panic-free:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the panic-free policy
+        run: bash scripts/check_panic_free.sh

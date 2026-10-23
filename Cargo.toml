@@ -1,14 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "backstop",
-    "bounty",
-    "grants",
-    "treasury",
     "harness",
     "tests",
     "timelock",
     "multisig",
+    "integration",
+    "payout_registry",
 ]
 exclude = [
     "pool",
@@ -17,10 +15,35 @@ exclude = [
     "incident_response",
     "governance",
     "vetoken",
+    "timelock",
+    "multisig",
+    "snapshot_harness",
+    "xtask",
+]
+    "backstop",
+    "bounty",
+    "grants",
+    "treasury",
+    "governance",
+    "vetoken",
+    "timelock",
+    "multisig",
+    "snapshot_harness",
+    "xtask",
+    "pool",
+    "policy",
+    "oracle",
+    "incident_response",
+    "vetoken",
+    "timelock",
+    "multisig",
+    "governance",
+    "snapshot_harness",
+    "xtask",
 ]
 
 [workspace.dependencies]
-soroban-sdk = { version = "21.0.0", features = ["alloc"] }
+soroban-sdk = { version = "21.0.0" }
 proptest = "1.5.0"
 
 [profile.release]
