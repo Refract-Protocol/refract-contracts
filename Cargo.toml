@@ -15,6 +15,7 @@ members = [
     "treasury",
     "params",
     "testutils",
+    "xtask",
 ]
 
 [workspace.dependencies]

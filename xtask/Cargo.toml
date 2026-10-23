@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Repository automation tasks (authz-matrix verifier, resource-budget check)"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }

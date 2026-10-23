@@ -127,24 +127,226 @@
 //
 // =============================================================================
 
-fn main() {
-    // TODO (#133): Implement the authz-matrix verifier.
-    //
-    // Suggested implementation order:
-    //   1. Parse CLI args: list of contract src files to check
-    //   2. For each file: parse with syn::parse_file()
-    //   3. Find #[contractimpl] blocks via syn::ItemImpl with the attribute
-    //   4. Classify each pub fn as mutating vs view using the heuristic above
-    //   5. Build test name index from all *_tests.rs / test.rs / proptest.rs files
-    //   6. Cross-reference mutating fns against test name index
-    //   7. Report uncovered fns and exit 1 if any found
-    //
-    // Key dependencies to add to xtask/Cargo.toml:
-    //   syn = { version = "2", features = ["full", "visit"] }
-    //   quote = "1"
-    //   walkdir = "2"
-    //   anyhow = "1"
+// =============================================================================
+// Entry point
+//
+//   cargo xtask authz-matrix           — issue #133 (still a TODO, see above)
+//   cargo xtask budget-check           — issue #221: run the resource
+//                                        benchmarks and fail if any entrypoint
+//                                        exceeds its ceiling in
+//                                        resource_budgets.json
+//   cargo xtask budget-check --update  — re-measure and rewrite the ceilings
+//                                        (measured + headroom_pct), keeping
+//                                        each entry's rationale
+// =============================================================================
 
-    eprintln!("TODO: implement authz-matrix verifier (see documentation above)");
-    std::process::exit(0);
+// clippy.toml bans unwrap/expect for on-chain contract code; this is a host
+// tool where panicking on a malformed budget file is the right behaviour.
+#![allow(clippy::disallowed_methods)]
+
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::process::{self, Command};
+
+/// Crates whose `budget_*` tests emit `BUDGET <contract> <entrypoint> <cpu> <mem>`.
+const BUDGET_CRATES: &[&str] = &[
+    "refract-backstop",
+    "refract-bounty",
+    "refract-grants",
+    "refract-treasury",
+];
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("authz-matrix") => authz_matrix(),
+        Some("budget-check") => budget_check(args.iter().any(|a| a == "--update")),
+        _ => {
+            eprintln!("usage: cargo xtask <authz-matrix | budget-check [--update]>");
+            process::exit(2);
+        }
+    }
+}
+
+fn authz_matrix() {
+    // TODO (#133): implement following the specification above.
+    eprintln!("TODO: implement authz-matrix verifier (see issue #133)");
+}
+
+// ── budget-check ─────────────────────────────────────────────────────────────
+
+type Measurements = BTreeMap<(String, String), (u64, u64)>;
+
+fn budget_check(update: bool) {
+    let root = repo_root();
+    let path = root.join("resource_budgets.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| fatal(&format!("cannot read {}: {e}", path.display())));
+    let mut doc: Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| fatal(&format!("invalid JSON: {e}")));
+    let headroom = doc["headroom_pct"].as_u64().unwrap_or(20);
+
+    let measured = measure(&root);
+    if measured.is_empty() {
+        fatal("no BUDGET lines captured — did the budget_* tests run?");
+    }
+
+    if update {
+        let contracts = doc["contracts"]
+            .as_object_mut()
+            .unwrap_or_else(|| fatal("`contracts` must be an object"));
+        for ((contract, ep), (cpu, mem)) in &measured {
+            let entries = contracts
+                .entry(contract.clone())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .unwrap();
+            let entry = entries
+                .entry(ep.clone())
+                .or_insert_with(|| json!({ "rationale": "TODO: explain this ceiling" }));
+            entry["cpu_insns"] = json!(ceiling(*cpu, headroom, 1_000));
+            entry["mem_bytes"] = json!(ceiling(*mem, headroom, 1_024));
+        }
+        let out = serde_json::to_string_pretty(&doc).unwrap() + "\n";
+        std::fs::write(&path, out).unwrap_or_else(|e| fatal(&e.to_string()));
+        println!(
+            "Updated {} ({} entrypoints)",
+            path.display(),
+            measured.len()
+        );
+        return;
+    }
+
+    let (report, failures) = compare(&doc, &measured);
+    println!("{report}");
+    if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(summary) {
+            let _ = writeln!(f, "{report}");
+        }
+    }
+    if failures > 0 {
+        eprintln!("error: {failures} entrypoint(s) over budget or missing a budget/measurement");
+        eprintln!("If the increase is intended, run `cargo xtask budget-check --update` and justify it in the PR.");
+        process::exit(1);
+    }
+    println!("All {} entrypoints within budget.", measured.len());
+}
+
+/// `value * (100 + headroom) / 100`, rounded up to a multiple of `step`.
+fn ceiling(value: u64, headroom: u64, step: u64) -> u64 {
+    let raw = value * (100 + headroom) / 100;
+    raw.div_ceil(step) * step
+}
+
+/// Build a markdown diff table and count failures.
+fn compare(doc: &Value, measured: &Measurements) -> (String, usize) {
+    let mut out = String::from(
+        "## Soroban resource budgets\n\n\
+         | Contract | Entrypoint | CPU insns | CPU ceiling | CPU used | Mem bytes | Mem ceiling | Mem used | Status |\n\
+         |---|---|---:|---:|---:|---:|---:|---:|---|\n",
+    );
+    let mut failures = 0;
+    let empty = Map::new();
+    let contracts = doc["contracts"].as_object().unwrap_or(&empty);
+
+    for ((contract, ep), (cpu, mem)) in measured {
+        let budget = contracts.get(contract).and_then(|c| c.get(ep));
+        let Some(b) = budget else {
+            failures += 1;
+            let _ = writeln!(
+                out,
+                "| {contract} | {ep} | {cpu} | — | — | {mem} | — | — | ❌ no budget |"
+            );
+            continue;
+        };
+        let cpu_max = b["cpu_insns"].as_u64().unwrap_or(0);
+        let mem_max = b["mem_bytes"].as_u64().unwrap_or(0);
+        let ok = *cpu <= cpu_max && *mem <= mem_max;
+        if !ok {
+            failures += 1;
+        }
+        let _ = writeln!(
+            out,
+            "| {contract} | {ep} | {cpu} | {cpu_max} | {} | {mem} | {mem_max} | {} | {} |",
+            pct(*cpu, cpu_max),
+            pct(*mem, mem_max),
+            if ok { "✅" } else { "❌ over budget" }
+        );
+    }
+    // Budgets with no measurement mean an entrypoint lost its benchmark.
+    for (contract, entries) in contracts {
+        for ep in entries.as_object().map(|m| m.keys()).into_iter().flatten() {
+            if !measured.contains_key(&(contract.clone(), ep.clone())) {
+                failures += 1;
+                let _ = writeln!(
+                    out,
+                    "| {contract} | {ep} | — | — | — | — | — | — | ❌ not measured |"
+                );
+            }
+        }
+    }
+    (out, failures)
+}
+
+fn pct(v: u64, max: u64) -> String {
+    if max == 0 {
+        "—".into()
+    } else {
+        format!("{:.0}%", v as f64 * 100.0 / max as f64)
+    }
+}
+
+/// Run every `budget_*` test and collect the `BUDGET` lines they print.
+fn measure(root: &PathBuf) -> Measurements {
+    let mut out = Measurements::new();
+    for krate in BUDGET_CRATES {
+        eprintln!("measuring {krate} …");
+        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args([
+                "test",
+                "-p",
+                krate,
+                "--lib",
+                "budget_",
+                "--",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap_or_else(|e| fatal(&format!("failed to run cargo test: {e}")));
+        if !output.status.success() {
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            fatal(&format!("budget tests failed for {krate}"));
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            // libtest may print the test name on the same line, so search
+            // for the marker rather than requiring it at the start.
+            let Some(idx) = line.find("BUDGET ") else {
+                continue;
+            };
+            let f: Vec<&str> = line[idx + 7..].split_whitespace().collect();
+            if let [contract, ep, cpu, mem, ..] = f[..] {
+                if let (Ok(cpu), Ok(mem)) = (cpu.parse(), mem.parse()) {
+                    out.insert((contract.to_string(), ep.to_string()), (cpu, mem));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives inside the workspace")
+        .to_path_buf()
+}
+
+fn fatal(msg: &str) -> ! {
+    eprintln!("error: {msg}");
+    process::exit(1);
 }

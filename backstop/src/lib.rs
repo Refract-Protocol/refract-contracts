@@ -81,8 +81,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::get_config(&env)?;
-        let mut state = Self::get_state(&env)?;
+        let config = Self::load_config(&env)?;
+        let mut state = Self::load_state(&env)?;
 
         let shares = Self::calc_shares(amount, state.total_shares, state.total_capital);
         if shares <= 0 {
@@ -112,8 +112,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::get_config(&env)?;
-        let mut state = Self::get_state(&env)?;
+        let config = Self::load_config(&env)?;
+        let mut state = Self::load_state(&env)?;
 
         let key = ("shares", staker.clone());
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -149,7 +149,7 @@ impl RefractBackstop {
     /// proportionally — the core second-loss risk-bearing mechanic.
     pub fn cover_shortfall(env: Env, caller: Address, amount: i128) -> Result<i128, BackstopError> {
         caller.require_auth();
-        let config = Self::get_config(&env)?;
+        let config = Self::load_config(&env)?;
         if caller != config.pool && caller != config.admin {
             return Err(BackstopError::Unauthorized);
         }
@@ -157,7 +157,7 @@ impl RefractBackstop {
             return Err(BackstopError::InvalidAmount);
         }
 
-        let mut state = Self::get_state(&env)?;
+        let mut state = Self::load_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
         } else {
@@ -186,8 +186,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let config = Self::get_config(&env)?;
-        let mut state = Self::get_state(&env)?;
+        let config = Self::load_config(&env)?;
+        let mut state = Self::load_state(&env)?;
 
         let cut = amount * config.premium_share_bps / BPS_DENOM;
         state.premium_income += cut;
@@ -205,17 +205,11 @@ impl RefractBackstop {
     }
 
     pub fn state(env: Env) -> Result<BackstopState, BackstopError> {
-        env.storage()
-            .instance()
-            .get(&"state")
-            .ok_or(BackstopError::NotInitialized)
+        Self::load_state(&env)
     }
 
     pub fn config(env: Env) -> Result<BackstopConfig, BackstopError> {
-        env.storage()
-            .instance()
-            .get(&"config")
-            .ok_or(BackstopError::NotInitialized)
+        Self::load_config(&env)
     }
 
     fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
@@ -234,14 +228,14 @@ impl RefractBackstop {
         }
     }
 
-    fn get_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
+    fn load_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
         env.storage()
             .instance()
             .get(&"config")
             .ok_or(BackstopError::NotInitialized)
     }
 
-    fn get_state(env: &Env) -> Result<BackstopState, BackstopError> {
+    fn load_state(env: &Env) -> Result<BackstopState, BackstopError> {
         env.storage()
             .instance()
             .get(&"state")

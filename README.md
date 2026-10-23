@@ -92,25 +92,44 @@ If you rebuild the same commit with the same toolchain (see `toolchain.rustc` in
 ```
 ```
 
-## Deploy (testnet)
+## Deploy
 
-Deploy in dependency order — the oracle first, then the pool, then the registry:
+[`scripts/deploy.py`](./scripts/deploy.py) deploys, initialises and wires every
+contract from the declarative plan in
+[`deployments/config.json`](./deployments/config.json). It writes the address
+registry to `deployments/<network>.json`.
 
 ```bash
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/refract_oracle.wasm \
-  --source alice --network testnet
+cargo build --target wasm32-unknown-unknown --release
+for f in target/wasm32-unknown-unknown/release/refract_*.wasm; do
+  stellar contract optimize --wasm "$f" --wasm-out "$f"   # Soroban rejects raw Rust >= 1.82 output
+done
+python3 scripts/wasm_manifest.py collect --out dist/wasm
 
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/refract_pool.wasm \
-  --source alice --network testnet
-
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/refract_policy.wasm \
-  --source alice --network testnet
+python3 scripts/deploy.py plan   --network testnet --deployer G...   # offline preview
+python3 scripts/deploy.py deploy --network testnet --source deployer
+python3 scripts/deploy.py verify --network testnet --source deployer
 ```
 
-Then `initialize` each contract (admin, USDC token address, and pool↔registry wiring).
+* Contract ids are deterministic: a fixed salt per contract name, so each id
+  depends only on the network, the deployer and the name.
+* Re-running is safe. Deployed contracts, completed `initialize` calls and
+  finished wiring steps are all skipped.
+* Each wasm's SHA-256 is checked against the manifest before the contract is
+  configured. `verify` fetches the on-chain code and checks the admin and role
+  getters against the registry.
+* `--source` is a Stellar CLI identity alias. Secrets stay in the CLI keystore.
+
+CI runs the same flow against a local sandbox (`deploy-sandbox` job).
+
+## Resource budgets
+
+`resource_budgets.json` sets per-entrypoint CPU-instruction and memory
+ceilings for backstop, bounty, grants and treasury, including worst-case paths
+(largest approver set, longest milestone list). Run `cargo xtask budget-check`
+to measure and compare; CI fails on any regression and writes a diff table to
+the job summary. After an intended change, run
+`cargo xtask budget-check --update` and explain the change in the PR.
 
 ## Authorization model
 
