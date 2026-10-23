@@ -71,6 +71,28 @@ pub enum GrantsError {
     NotRecipient,
     /// There is no confirmed-but-unclaimed amount to release.
     NothingToClaim,
+    /// The requested rescue is larger than the model's live excess balance.
+    NoExcessFunds,
+    /// An amount was not positive.
+    InvalidRescueAmount,
+    /// A batch exceeded the bounded administrative operation limit.
+    BatchTooLarge,
+    /// An operation in a batch failed; the whole batch was rolled back.
+    BatchFailed { index: usize, error: Box<GrantsError> },
+}
+
+/// Governance operations supported by the grants administrator batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantsOp {
+    Create {
+        recipient: Address,
+        total_amount: i128,
+        milestones: Vec<i128>,
+    },
+    Confirm {
+        grant_id: GrantId,
+        milestone_index: usize,
+    },
 }
 
 /// A single milestone within a grant.
@@ -132,6 +154,22 @@ impl GrantsModel {
     /// Returns the confirmed-but-unclaimed amount for `grant_id`.
     pub fn claimable(&self, grant_id: GrantId) -> Option<i128> {
         self.grants.get(&grant_id).map(|grant| grant.claimable)
+    }
+
+    /// Returns the amount still owed by all grants, including milestones that
+    /// governance has approved but not confirmed yet.
+    pub fn accounted_liabilities(&self) -> i128 {
+        self.grants
+            .values()
+            .map(|grant| {
+                grant
+                    .milestones
+                    .iter()
+                    .filter(|milestone| !milestone.claimed)
+                    .map(|milestone| milestone.amount)
+                    .sum::<i128>()
+            })
+            .sum()
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
@@ -262,6 +300,67 @@ impl GrantsModel {
         }
 
         Ok(amount)
+    }
+
+    /// Applies a bounded set of governance operations atomically. The clone is
+    /// committed only after every operation succeeds, so callers observe no
+    /// intermediate state when a later operation fails.
+    pub fn batch(&mut self, caller: Address, operations: Vec<GrantsOp>) -> Result<(), GrantsError> {
+        const MAX_BATCH_OPS: usize = 16;
+        self.require_governance(caller)?;
+        if operations.len() > MAX_BATCH_OPS {
+            return Err(GrantsError::BatchTooLarge);
+        }
+
+        let mut staged = self.clone();
+        for (index, operation) in operations.into_iter().enumerate() {
+            let result = match operation {
+                GrantsOp::Create {
+                    recipient,
+                    total_amount,
+                    milestones,
+                } => staged
+                    .create_grant(caller, recipient, total_amount, milestones)
+                    .map(|_| ()),
+                GrantsOp::Confirm {
+                    grant_id,
+                    milestone_index,
+                } => staged.confirm_milestone(caller, grant_id, milestone_index),
+            };
+            if let Err(error) = result {
+                return Err(GrantsError::BatchFailed {
+                    index,
+                    error: Box::new(error),
+                });
+            }
+        }
+        *self = staged;
+        Ok(())
+    }
+
+    /// Calculates a governance-only rescue from a supplied live token balance.
+    /// The dependency-free grants model has no token client, so the caller
+    /// performs the actual token transfer after this excess check succeeds.
+    pub fn rescue(
+        &self,
+        caller: Address,
+        _token: Address,
+        to: Address,
+        amount: i128,
+        live_balance: i128,
+    ) -> Result<i128, GrantsError> {
+        self.require_governance(caller)?;
+        if to != self.governance {
+            return Err(GrantsError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(GrantsError::InvalidRescueAmount);
+        }
+        let excess = live_balance - self.accounted_liabilities();
+        if amount > excess {
+            return Err(GrantsError::NoExcessFunds);
+        }
+        Ok(excess - amount)
     }
 
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
@@ -427,3 +526,4 @@ mod tests {
         );
     }
 }
+

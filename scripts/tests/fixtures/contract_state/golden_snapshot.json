@@ -1,0 +1,438 @@
+{
+  "assets": [
+    "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L"
+  ],
+  "contracts": {
+    "backstop": {
+      "assets": [],
+      "entries": [
+        {
+          "durability": "persistent",
+          "key": "\"shares\"(GALBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMKWB)",
+          "key_xdr": "AAAABgAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAABAAAAABAAAAAgAAAA4AAAAGc2hhcmVzAAAAAAASAAAAAAAAAAAWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFgAAAAE=",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": "1000"
+        },
+        {
+          "durability": "persistent",
+          "key": "\"shares\"(GALROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LRPFOD)",
+          "key_xdr": "AAAABgAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAABAAAAABAAAAAgAAAA4AAAAGc2hhcmVzAAAAAAASAAAAAAAAAAAXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFwAAAAE=",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": "500"
+        }
+      ],
+      "id": "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526",
+      "instance": {
+        "durability": "persistent",
+        "key": "<instance>",
+        "key_xdr": "AAAABgAAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAABQAAAAB",
+        "last_modified_ledger": 999990,
+        "live_until_ledger": 1500000,
+        "status": "live",
+        "value": {
+          "executable": {
+            "wasm": "abababababababababababababababababababababababababababababababab"
+          },
+          "storage": {
+            "\"capacity\"": {
+              "deposit_cap": "10000000000",
+              "min_stake": "100",
+              "per_staker_cap": "1000000000"
+            },
+            "\"config\"": {
+              "admin": "GAKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIVGE",
+              "pool": "CAFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUTSM",
+              "premium_share_bps": "2000",
+              "token": "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L"
+            },
+            "\"state\"": {
+              "premium_income": "0",
+              "total_capital": "1500",
+              "total_shares": "1500"
+            }
+          }
+        }
+      },
+      "kind": "backstop",
+      "token_balances": {
+        "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L": {
+          "amount": "1500",
+          "live_until_ledger": 1500000,
+          "status": "live"
+        }
+      },
+      "views": {
+        "assumed_zero": [],
+        "capacity": {
+          "deposit_cap": "10000000000",
+          "min_stake": "100",
+          "per_staker_cap": "1000000000"
+        },
+        "initialized": true,
+        "premium_income": "0",
+        "staker_shares": {
+          "GALBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLBMKWB": "1000",
+          "GALROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LROFYXC4LRPFOD": "500"
+        },
+        "token": "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L",
+        "total_shares": "1500",
+        "total_staked": "1500"
+      }
+    },
+    "bounty": {
+      "assets": [],
+      "entries": [
+        {
+          "durability": "persistent",
+          "key": "Award(0x1111111111111111111111111111111111111111111111111111111111111111)",
+          "key_xdr": "AAAABgAAAAECAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgAAABAAAAABAAAAAgAAAA8AAAAFQXdhcmQAAAAAAAANAAAAIBERERERERERERERERERERERERERERERERERERERERERAAAAAQ==",
+          "last_modified_ledger": null,
+          "live_until_ledger": null,
+          "status": "missing",
+          "value": null
+        },
+        {
+          "durability": "persistent",
+          "key": "Award(0x2222222222222222222222222222222222222222222222222222222222222222)",
+          "key_xdr": "AAAABgAAAAECAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgAAABAAAAABAAAAAgAAAA8AAAAFQXdhcmQAAAAAAAANAAAAICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiAAAAAQ==",
+          "last_modified_ledger": null,
+          "live_until_ledger": null,
+          "status": "missing",
+          "value": null
+        },
+        {
+          "durability": "persistent",
+          "key": "PendingSplit(0x1111111111111111111111111111111111111111111111111111111111111111)",
+          "key_xdr": "AAAABgAAAAECAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgAAABAAAAABAAAAAgAAAA8AAAAMUGVuZGluZ1NwbGl0AAAADQAAACAREREREREREREREREREREREREREREREREREREREREREQAAAAE=",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": {
+            "amount": "300",
+            "approved_at": "1700000000",
+            "payouts": [
+              {
+                "amount": "201",
+                "recipient": "GAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQUG3",
+                "share_bps": 6667
+              },
+              {
+                "amount": "99",
+                "recipient": "GAMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRT36Z",
+                "share_bps": 3333
+              }
+            ],
+            "report_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "settled_at": "0"
+          }
+        },
+        {
+          "durability": "persistent",
+          "key": "PendingSplit(0x2222222222222222222222222222222222222222222222222222222222222222)",
+          "key_xdr": "AAAABgAAAAECAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgAAABAAAAABAAAAAgAAAA8AAAAMUGVuZGluZ1NwbGl0AAAADQAAACAiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIgAAAAE=",
+          "last_modified_ledger": null,
+          "live_until_ledger": null,
+          "status": "missing",
+          "value": null
+        },
+        {
+          "durability": "persistent",
+          "key": "Split(0x1111111111111111111111111111111111111111111111111111111111111111)",
+          "key_xdr": "AAAABgAAAAECAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgAAABAAAAABAAAAAgAAAA8AAAAFU3BsaXQAAAAAAAANAAAAIBERERERERERERERERERERERERERERERERERERERERERAAAAAQ==",
+          "last_modified_ledger": null,
+          "live_until_ledger": null,
+          "status": "missing",
+          "value": null
+        },
+        {
+          "durability": "persistent",
+          "key": "Split(0x2222222222222222222222222222222222222222222222222222222222222222)",
+          "key_xdr": "AAAABgAAAAECAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgAAABAAAAABAAAAAgAAAA8AAAAFU3BsaXQAAAAAAAANAAAAICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiAAAAAQ==",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": {
+            "amount": "101",
+            "approved_at": "1700000000",
+            "payouts": [
+              {
+                "amount": "51",
+                "recipient": "GAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQUG3",
+                "share_bps": 5000
+              },
+              {
+                "amount": "50",
+                "recipient": "GAMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRT36Z",
+                "share_bps": 5000
+              }
+            ],
+            "report_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "settled_at": "1700000100"
+          }
+        }
+      ],
+      "id": "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ",
+      "instance": {
+        "durability": "persistent",
+        "key": "<instance>",
+        "key_xdr": "AAAABgAAAAECAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgAAABQAAAAB",
+        "last_modified_ledger": 999990,
+        "live_until_ledger": 1500000,
+        "status": "live",
+        "value": {
+          "executable": {
+            "wasm": "abababababababababababababababababababababababababababababababab"
+          },
+          "storage": {
+            "Balance()": "1000",
+            "Governance()": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G",
+            "Reserved()": "300",
+            "Token()": "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L",
+            "Treasury()": "CABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGCK3"
+          }
+        }
+      },
+      "kind": "bounty",
+      "token_balances": {
+        "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L": {
+          "amount": "1000",
+          "live_until_ledger": 1500000,
+          "status": "live"
+        }
+      },
+      "views": {
+        "assumed_zero": [],
+        "escrow_balance": "1000",
+        "governance": "GAKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRKFIVCUKRL26G",
+        "initialized": true,
+        "open_bounties": {
+          "0x1111111111111111111111111111111111111111111111111111111111111111": {
+            "amount": "300",
+            "approved_at": "1700000000",
+            "payouts": [
+              {
+                "amount": "201",
+                "recipient": "GAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQUG3",
+                "share_bps": 6667
+              },
+              {
+                "amount": "99",
+                "recipient": "GAMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRT36Z",
+                "share_bps": 3333
+              }
+            ],
+            "report_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "settled_at": "0"
+          }
+        },
+        "reserved": "300",
+        "settled_splits": {
+          "0x2222222222222222222222222222222222222222222222222222222222222222": {
+            "amount": "101",
+            "approved_at": "1700000000",
+            "payouts": [
+              {
+                "amount": "51",
+                "recipient": "GAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQUG3",
+                "share_bps": 5000
+              },
+              {
+                "amount": "50",
+                "recipient": "GAMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRSGIZDEMRT36Z",
+                "share_bps": 5000
+              }
+            ],
+            "report_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "settled_at": "1700000100"
+          }
+        },
+        "token": "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L"
+      }
+    },
+    "grants": {
+      "assets": [],
+      "entries": [],
+      "id": "CACAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAINCW",
+      "instance": {
+        "durability": "persistent",
+        "key": "<instance>",
+        "key_xdr": "AAAABgAAAAEEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAAABQAAAAB",
+        "last_modified_ledger": 999990,
+        "live_until_ledger": 1500000,
+        "status": "live",
+        "value": {
+          "executable": {
+            "wasm": "abababababababababababababababababababababababababababababababab"
+          },
+          "storage": {}
+        }
+      },
+      "kind": "grants",
+      "token_balances": {
+        "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L": {
+          "amount": null,
+          "live_until_ledger": null,
+          "status": "missing"
+        }
+      },
+      "views": {
+        "active_grants": null,
+        "initialized": false,
+        "note": "grants has no on-chain storage layout yet; instance storage is dumped untyped"
+      }
+    },
+    "treasury": {
+      "assets": [
+        "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L"
+      ],
+      "entries": [
+        {
+          "durability": "persistent",
+          "key": "SourceCap(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 0)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAwAAAA8AAAAJU291cmNlQ2FwAAAAAAAAEgAAAAEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQAAAAMAAAAAAAAAAQ==",
+          "last_modified_ledger": null,
+          "live_until_ledger": null,
+          "status": "missing",
+          "value": null
+        },
+        {
+          "durability": "persistent",
+          "key": "SourceCap(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 1)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAwAAAA8AAAAJU291cmNlQ2FwAAAAAAAAEgAAAAEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQAAAAMAAAABAAAAAQ==",
+          "last_modified_ledger": null,
+          "live_until_ledger": null,
+          "status": "missing",
+          "value": null
+        },
+        {
+          "durability": "persistent",
+          "key": "SourceCap(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 2)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAwAAAA8AAAAJU291cmNlQ2FwAAAAAAAAEgAAAAEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQAAAAMAAAACAAAAAQ==",
+          "last_modified_ledger": null,
+          "live_until_ledger": null,
+          "status": "missing",
+          "value": null
+        },
+        {
+          "durability": "persistent",
+          "key": "SourceCap(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 3)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAwAAAA8AAAAJU291cmNlQ2FwAAAAAAAAEgAAAAEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQAAAAMAAAADAAAAAQ==",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": "1000"
+        },
+        {
+          "durability": "persistent",
+          "key": "SourceTotal(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 0)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAwAAAA8AAAALU291cmNlVG90YWwAAAAAEgAAAAEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQAAAAMAAAAAAAAAAQ==",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": "400"
+        },
+        {
+          "durability": "persistent",
+          "key": "SourceTotal(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 1)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAwAAAA8AAAALU291cmNlVG90YWwAAAAAEgAAAAEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQAAAAMAAAABAAAAAQ==",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": "250"
+        },
+        {
+          "durability": "persistent",
+          "key": "SourceTotal(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 2)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAwAAAA8AAAALU291cmNlVG90YWwAAAAAEgAAAAEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQAAAAMAAAACAAAAAQ==",
+          "last_modified_ledger": null,
+          "live_until_ledger": null,
+          "status": "missing",
+          "value": null
+        },
+        {
+          "durability": "persistent",
+          "key": "SourceTotal(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 3)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAwAAAA8AAAALU291cmNlVG90YWwAAAAAEgAAAAEJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQAAAAMAAAADAAAAAQ==",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": "25"
+        },
+        {
+          "durability": "persistent",
+          "key": "TotalDeposits(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAgAAAA8AAAANVG90YWxEZXBvc2l0cwAAAAAAABIAAAABCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkAAAAB",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": "675"
+        },
+        {
+          "durability": "persistent",
+          "key": "TotalWithdrawn(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L)",
+          "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABAAAAABAAAAAgAAAA8AAAAOVG90YWxXaXRoZHJhd24AAAAAABIAAAABCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkAAAAB",
+          "last_modified_ledger": 999990,
+          "live_until_ledger": 1500000,
+          "status": "live",
+          "value": "175"
+        }
+      ],
+      "id": "CABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGCK3",
+      "instance": {
+        "durability": "persistent",
+        "key": "<instance>",
+        "key_xdr": "AAAABgAAAAEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwAAABQAAAAB",
+        "last_modified_ledger": 999990,
+        "live_until_ledger": 1500000,
+        "status": "live",
+        "value": {
+          "executable": {
+            "wasm": "abababababababababababababababababababababababababababababababab"
+          },
+          "storage": {
+            "Admin()": "GAKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIVGE",
+            "Paused()": false
+          }
+        }
+      },
+      "kind": "treasury",
+      "token_balances": {
+        "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L": {
+          "amount": "500",
+          "live_until_ledger": 1500000,
+          "status": "live"
+        }
+      },
+      "views": {
+        "admin": "GAKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIFAUCQKBIVGE",
+        "assets": {
+          "CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L": {
+            "source_caps": {
+              "ExternalDonation": "1000"
+            },
+            "total_by_source": {
+              "BountyTopUp": "0",
+              "ExternalDonation": "25",
+              "GrantFunding": "250",
+              "ProtocolFees": "400"
+            },
+            "total_deposits": "675",
+            "total_withdrawn": "175"
+          }
+        },
+        "assumed_zero": [
+          "SourceTotal(CAEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQTD2L, 2)"
+        ],
+        "initialized": true,
+        "paused": false
+      }
+    }
+  },
+  "latest_ledger": 1000000,
+  "network": "fixture://healthy",
+  "schema_version": 1
+}
