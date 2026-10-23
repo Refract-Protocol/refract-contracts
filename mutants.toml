@@ -1,0 +1,36 @@
+# cargo-mutants configuration for the accounting-critical contracts.
+# Run through scripts/mutation.sh, which passes this file with --config.
+#
+# Targets: accounting math, authorization checks, state transitions, payout
+# calculation, caps and timelock gating. Test code and generated code are
+# excluded so that only contract logic is mutated.
+
+exclude_globs = [
+    "**/test.rs",
+    "**/*_test.rs",
+    "**/*_proptest.rs",
+    "**/tests/**",
+]
+
+# Mutate the functions that move funds or change authorization state.
+examine_re = [
+    "withdraw",
+    "award",
+    "fund",
+    "balance",
+    "governance",
+    "require_admin",
+    "approve_payment_request",
+    "reject_payment_request",
+    "cancel_payment_request",
+    "execute_payment_request",
+    "append_evidence",
+    "replace_evidence",
+    "verify_evidence",
+    "writable_manifest",
+    "validate_entry",
+]
+
+# Mutated test runs can hang on a changed loop bound, so allow a multiple of
+# the normal test time before counting a mutant as timed out.
+timeout_multiplier = 3.0

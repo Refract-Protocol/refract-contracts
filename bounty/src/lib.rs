@@ -20,9 +20,19 @@
 
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, InvokeError,
-    IntoVal, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    InvokeError, IntoVal, Symbol, Val, Vec,
 };
+
+pub mod evidence;
+
+use evidence::{EvidenceEntry, ReportManifest, VerificationStatus, MAX_EVIDENCE_ENTRIES};
+
+pub mod disclosure;
+
+pub mod wind_down;
+
+pub mod escrow_refill;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -40,6 +50,18 @@ pub enum DataKey {
     Award(BytesN<32>),
     /// Typed failure record for a transfer that did not reach the researcher.
     PayoutFailure(BytesN<32>),
+    /// Append-only double-entry journal length (persistent).
+    JournalCount,
+    /// Journal entry by sequence number (persistent, never removed).
+    JournalEntry(u64),
+    /// Risk-guardian configuration (instance).
+    Guardian,
+    /// Keeper reward configuration (instance).
+    Keeper,
+    /// Treasury reservation noted by this escrow (instance).
+    Reservation,
+    /// Evidence manifest attached to a report.
+    Manifest(BytesN<32>),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -93,6 +115,52 @@ pub enum BountyError {
     NoFailureRecord     = 7,
     /// The payout associated with this failure was already successfully delivered.
     AlreadyPaid         = 8,
+    AwardsPaused = 9,
+    GuardianStale = 10,
+    InvalidGuardianConfig = 11,
+    KeeperRewardExceeded = 12,
+    InvariantViolation = 13,
+    Overflow = 14,
+    ManifestFull = 15,
+    EvidenceNotFound = 16,
+    AlreadyAdjudicated = 17,
+    InvalidEvidence = 18,
+}
+
+/// Balanced double-entry posting for every escrow movement.
+#[contracttype]
+#[derive(Clone)]
+pub struct JournalEntry {
+    pub seq: u64,
+    pub debit: Symbol,
+    pub credit: Symbol,
+    pub asset: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Guardian breaker watching oracle staleness and depeg bands.
+#[contracttype]
+#[derive(Clone)]
+pub struct GuardianConfig {
+    pub oracle: Option<Address>,
+    pub max_staleness_secs: u64,
+    pub depeg_bps: u32,
+    pub peg_price: i128,
+    pub last_price: i128,
+    pub last_update: u64,
+    pub awards_paused: bool,
+}
+
+/// Capped keeper incentive for permissionless `execute_due`.
+#[contracttype]
+#[derive(Clone)]
+pub struct KeeperConfig {
+    pub reward_per_call: i128,
+    pub reward_cap_per_epoch: i128,
+    pub epoch_len_secs: u64,
+    pub epoch_start: u64,
+    pub epoch_spent: i128,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -132,16 +200,18 @@ impl RefractBountyEscrow {
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
-        let token = Self::token_addr(&env)?;
-        token::Client::new(&env, &token).transfer(
-            &from,
-            &env.current_contract_address(),
-            &amount,
-        );
-        let balance = Self::escrow_balance(&env)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance, &(balance + amount));
+        let token = Self::token(&env)?;
+        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
+        let balance = Self::balance(&env)?;
+        let next = balance.checked_add(amount).ok_or(BountyError::Overflow)?;
+        env.storage().instance().set(&DataKey::Balance, &next);
+        Self::post_balanced(
+            &env,
+            symbol_short!("funder"),
+            symbol_short!("escrow"),
+            token,
+            amount,
+        )?;
         Ok(())
     }
 
@@ -171,6 +241,7 @@ impl RefractBountyEscrow {
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
+        Self::check_guardians(&env)?;
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
@@ -187,6 +258,17 @@ impl RefractBountyEscrow {
         }
 
         let now = env.ledger().timestamp();
+        let token = Self::token(&env)?;
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &researcher, &amount);
+        let next = balance.checked_sub(amount).ok_or(BountyError::Overflow)?;
+        env.storage().instance().set(&DataKey::Balance, &next);
+        Self::post_balanced(
+            &env,
+            symbol_short!("escrow"),
+            symbol_short!("rshcr"),
+            token,
+            amount,
+        )?;
 
         // Write the award record BEFORE the transfer attempt so the
         // commitment is on-chain even if transfer fails.
@@ -413,6 +495,421 @@ impl RefractBountyEscrow {
         env.storage()
             .persistent()
             .get(&DataKey::PayoutFailure(report_hash))
+    }
+
+    // ─── #270 Journal ────────────────────────────────────────────────
+
+    pub fn journal_len(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::JournalCount)
+            .unwrap_or(0u64)
+    }
+
+    pub fn journal_entry(env: Env, seq: u64) -> Option<JournalEntry> {
+        env.storage().persistent().get(&DataKey::JournalEntry(seq))
+    }
+
+    pub fn journal_list(env: Env, start: u64, count: u64) -> Vec<JournalEntry> {
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        let end = start + count;
+        while i < end {
+            if let Some(e) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::JournalEntry(i))
+            {
+                out.push_back(e);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Accounting-identity check: journal balanced by construction, escrow
+    /// balance equals net postings, no negative totals.
+    pub fn check_invariants(env: Env) -> Result<(), BountyError> {
+        let balance = Self::balance(&env)?;
+        if balance < 0 {
+            return Err(BountyError::InvariantViolation);
+        }
+        let len: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::JournalCount)
+            .unwrap_or(0u64);
+        let mut inflow: i128 = 0;
+        let mut outflow: i128 = 0;
+        let mut idx: u64 = 0;
+        while idx < len {
+            let entry: JournalEntry = env
+                .storage()
+                .persistent()
+                .get(&DataKey::JournalEntry(idx))
+                .ok_or(BountyError::InvariantViolation)?;
+            if entry.amount <= 0 {
+                return Err(BountyError::InvariantViolation);
+            }
+            if entry.credit == symbol_short!("escrow") {
+                inflow = inflow
+                    .checked_add(entry.amount)
+                    .ok_or(BountyError::InvariantViolation)?;
+            } else if entry.debit == symbol_short!("escrow") {
+                outflow = outflow
+                    .checked_add(entry.amount)
+                    .ok_or(BountyError::InvariantViolation)?;
+            }
+            idx += 1;
+        }
+        let net = inflow
+            .checked_sub(outflow)
+            .ok_or(BountyError::InvariantViolation)?;
+        if net != balance {
+            return Err(BountyError::InvariantViolation);
+        }
+        Ok(())
+    }
+
+    // ─── #272 Guardian ───────────────────────────────────────────────
+
+    pub fn set_guardian_config(
+        env: Env,
+        caller: Address,
+        oracle: Option<Address>,
+        max_staleness_secs: u64,
+        depeg_bps: u32,
+        peg_price: i128,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let gov = Self::governance(&env)?;
+        if caller != gov {
+            return Err(BountyError::Unauthorized);
+        }
+        if depeg_bps == 0 || depeg_bps > 10_000 || peg_price <= 0 {
+            return Err(BountyError::InvalidGuardianConfig);
+        }
+        let prev: Option<GuardianConfig> = env.storage().instance().get(&DataKey::Guardian);
+        let cfg = GuardianConfig {
+            oracle,
+            max_staleness_secs,
+            depeg_bps,
+            peg_price,
+            last_price: prev.as_ref().map(|p| p.last_price).unwrap_or(peg_price),
+            last_update: prev
+                .as_ref()
+                .map(|p| p.last_update)
+                .unwrap_or(env.ledger().timestamp()),
+            awards_paused: prev.as_ref().map(|p| p.awards_paused).unwrap_or(false),
+        };
+        env.storage().instance().set(&DataKey::Guardian, &cfg);
+        env.events().publish(
+            (symbol_short!("g_cfg"),),
+            (max_staleness_secs, depeg_bps),
+        );
+        Ok(())
+    }
+
+    pub fn note_feed(env: Env, price: i128, timestamp: u64) -> Result<(), BountyError> {
+        if price <= 0 {
+            return Err(BountyError::InvalidAmount);
+        }
+        let mut cfg: GuardianConfig = env.storage().instance().get(&DataKey::Guardian).unwrap_or(
+            GuardianConfig {
+                oracle: None,
+                max_staleness_secs: 1_800,
+                depeg_bps: 500,
+                peg_price: price,
+                last_price: price,
+                last_update: timestamp,
+                awards_paused: false,
+            },
+        );
+        if timestamp > env.ledger().timestamp() + 300 {
+            return Err(BountyError::GuardianStale);
+        }
+        cfg.last_price = price;
+        cfg.last_update = timestamp;
+        env.storage().instance().set(&DataKey::Guardian, &cfg);
+        let _ = Self::check_guardians(&env);
+        Ok(())
+    }
+
+    pub fn check_guardians(env: Env) -> Result<(), BountyError> {
+        let mut cfg: GuardianConfig = match env.storage().instance().get(&DataKey::Guardian) {
+            None => return Ok(()),
+            Some(c) => c,
+        };
+        if cfg.awards_paused {
+            return Err(BountyError::AwardsPaused);
+        }
+        let age = env.ledger().timestamp().saturating_sub(cfg.last_update);
+        if age > cfg.max_staleness_secs {
+            cfg.awards_paused = true;
+            env.storage().instance().set(&DataKey::Guardian, &cfg);
+            env.events()
+                .publish((symbol_short!("g_trip"), symbol_short!("stale")), (age,));
+            return Err(BountyError::AwardsPaused);
+        }
+        let diff = if cfg.last_price >= cfg.peg_price {
+            cfg.last_price - cfg.peg_price
+        } else {
+            cfg.peg_price - cfg.last_price
+        };
+        let band = diff
+            .checked_mul(10_000)
+            .ok_or(BountyError::Overflow)?
+            .checked_div(cfg.peg_price)
+            .ok_or(BountyError::Overflow)?;
+        if band > cfg.depeg_bps as i128 {
+            cfg.awards_paused = true;
+            env.storage().instance().set(&DataKey::Guardian, &cfg);
+            env.events()
+                .publish((symbol_short!("g_trip"), symbol_short!("depeg")), (band,));
+            return Err(BountyError::AwardsPaused);
+        }
+        Ok(())
+    }
+
+    pub fn clear_halt(env: Env, caller: Address) -> Result<(), BountyError> {
+        caller.require_auth();
+        if caller != Self::governance(&env)? {
+            return Err(BountyError::Unauthorized);
+        }
+        let mut cfg: GuardianConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Guardian)
+            .ok_or(BountyError::NotInitialized)?;
+        cfg.awards_paused = false;
+        cfg.last_update = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::Guardian, &cfg);
+        env.events().publish((symbol_short!("g_clr"),), ());
+        Ok(())
+    }
+
+    // ─── #271 Keeper + #269 consumer ─────────────────────────────────
+
+    pub fn set_keeper_config(
+        env: Env,
+        caller: Address,
+        reward_per_call: i128,
+        reward_cap_per_epoch: i128,
+        epoch_len_secs: u64,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        if caller != Self::governance(&env)? {
+            return Err(BountyError::Unauthorized);
+        }
+        if reward_per_call < 0 || reward_cap_per_epoch < 0 || epoch_len_secs == 0 {
+            return Err(BountyError::KeeperRewardExceeded);
+        }
+        env.storage().instance().set(
+            &DataKey::Keeper,
+            &KeeperConfig {
+                reward_per_call,
+                reward_cap_per_epoch,
+                epoch_len_secs,
+                epoch_start: env.ledger().timestamp(),
+                epoch_spent: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Permissionless sweep: currently a liveness heartbeat that pays a capped
+    /// reward from escrow only when the budget allows. Never fails the sweep
+    /// when the budget is exhausted.
+    pub fn execute_due(env: Env, keeper: Address) -> Result<i128, BountyError> {
+        keeper.require_auth();
+        let mut cfg: KeeperConfig = env.storage().instance().get(&DataKey::Keeper).unwrap_or(
+            KeeperConfig {
+                reward_per_call: 0,
+                reward_cap_per_epoch: 0,
+                epoch_len_secs: 86_400,
+                epoch_start: env.ledger().timestamp(),
+                epoch_spent: 0,
+            },
+        );
+        let now = env.ledger().timestamp();
+        if now >= cfg.epoch_start + cfg.epoch_len_secs {
+            cfg.epoch_start = now;
+            cfg.epoch_spent = 0;
+        }
+        let mut reward: i128 = 0;
+        if cfg.reward_per_call > 0
+            && cfg.epoch_spent + cfg.reward_per_call <= cfg.reward_cap_per_epoch
+        {
+            let balance = Self::balance(&env)?;
+            if balance >= cfg.reward_per_call {
+                let token = Self::token(&env)?;
+                token::Client::new(&env, &token).transfer(
+                    &env.current_contract_address(),
+                    &keeper,
+                    &cfg.reward_per_call,
+                );
+                env.storage().instance().set(
+                    &DataKey::Balance,
+                    &(balance - cfg.reward_per_call),
+                );
+                Self::post_balanced(
+                    &env,
+                    symbol_short!("escrow"),
+                    symbol_short!("keeper"),
+                    token,
+                    cfg.reward_per_call,
+                )?;
+                cfg.epoch_spent += cfg.reward_per_call;
+                reward = cfg.reward_per_call;
+            }
+        }
+        env.storage().instance().set(&DataKey::Keeper, &cfg);
+        env.events()
+            .publish((symbol_short!("keeper"),), (keeper, reward));
+        Ok(reward)
+    }
+
+    pub fn note_reservation(
+        env: Env,
+        caller: Address,
+        reservation_id: u64,
+        amount: i128,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        if caller != Self::governance(&env)? {
+            return Err(BountyError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(BountyError::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Reservation, &(reservation_id, amount));
+        env.events()
+            .publish((symbol_short!("reserve"),), (reservation_id, amount));
+        Ok(())
+    }
+
+    pub fn reserved(env: Env) -> (u64, i128) {
+        env.storage()
+            .instance()
+            .get(&DataKey::Reservation)
+            .unwrap_or((0u64, 0i128))
+    }
+
+    /// Add an evidence entry to a report's manifest. Only the reporter may
+    /// add entries, and only before the report is awarded.
+    pub fn append_evidence(
+        env: Env,
+        reporter: Address,
+        report_hash: BytesN<32>,
+        entry: EvidenceEntry,
+    ) -> Result<(), BountyError> {
+        reporter.require_auth();
+        evidence::validate_entry(&entry)?;
+        let mut manifest = Self::writable_manifest(&env, &reporter, &report_hash)?;
+        if manifest.entries.len() >= MAX_EVIDENCE_ENTRIES {
+            return Err(BountyError::ManifestFull);
+        }
+        manifest.entries.push_back(entry);
+        Self::save_manifest(&env, &report_hash, &manifest);
+        Ok(())
+    }
+
+    /// Replace the evidence entry at `index`. Same rules as `append_evidence`.
+    pub fn replace_evidence(
+        env: Env,
+        reporter: Address,
+        report_hash: BytesN<32>,
+        index: u32,
+        entry: EvidenceEntry,
+    ) -> Result<(), BountyError> {
+        reporter.require_auth();
+        evidence::validate_entry(&entry)?;
+        let mut manifest = Self::writable_manifest(&env, &reporter, &report_hash)?;
+        if index >= manifest.entries.len() {
+            return Err(BountyError::EvidenceNotFound);
+        }
+        manifest.entries.set(index, entry);
+        Self::save_manifest(&env, &report_hash, &manifest);
+        Ok(())
+    }
+
+    /// Record a reviewer decision on one evidence entry. Gated by the
+    /// governance/timelock address, which acts as the reviewer. Reporters
+    /// cannot mark their own entries verified.
+    pub fn verify_evidence(
+        env: Env,
+        caller: Address,
+        report_hash: BytesN<32>,
+        index: u32,
+        status: VerificationStatus,
+        reason_hash: Option<BytesN<32>>,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        if caller != Self::governance(&env)? {
+            return Err(BountyError::Unauthorized);
+        }
+        if status == VerificationStatus::Unverified {
+            return Err(BountyError::InvalidEvidence);
+        }
+        let mut manifest = Self::manifest(&env, &report_hash)?;
+        if index >= manifest.entries.len() {
+            return Err(BountyError::EvidenceNotFound);
+        }
+        let mut entry = manifest.entries.get(index).ok_or(BountyError::EvidenceNotFound)?;
+        entry.status = status;
+        entry.reason_hash = reason_hash;
+        manifest.entries.set(index, entry);
+        Self::save_manifest(&env, &report_hash, &manifest);
+        env.events()
+            .publish((symbol_short!("evidence"), report_hash), (index, status));
+        Ok(())
+    }
+
+    /// Read-only evidence manifest for a report, if one exists.
+    pub fn get_manifest(env: Env, report_hash: BytesN<32>) -> Option<ReportManifest> {
+        env.storage().persistent().get(&DataKey::Manifest(report_hash))
+    }
+
+    /// Manifest for a write. Creates it on first use and checks reporter ownership.
+    fn writable_manifest(
+        env: &Env,
+        reporter: &Address,
+        report_hash: &BytesN<32>,
+    ) -> Result<ReportManifest, BountyError> {
+        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+            return Err(BountyError::AlreadyAdjudicated);
+        }
+        match env.storage().persistent().get(&DataKey::Manifest(report_hash.clone())) {
+            Some(manifest) => {
+                if manifest.reporter != *reporter {
+                    return Err(BountyError::Unauthorized);
+                }
+                Ok(manifest)
+            }
+            None => Ok(ReportManifest {
+                reporter: reporter.clone(),
+                entries: Vec::new(env),
+            }),
+        }
+    }
+
+    fn manifest(env: &Env, report_hash: &BytesN<32>) -> Result<ReportManifest, BountyError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Manifest(report_hash.clone()))
+            .ok_or(BountyError::EvidenceNotFound)
+    }
+
+    fn save_manifest(env: &Env, report_hash: &BytesN<32>, manifest: &ReportManifest) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Manifest(report_hash.clone()), manifest);
+        env.events().publish(
+            (symbol_short!("manifest"), report_hash.clone()),
+            manifest.entries.len(),
+        );
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────
@@ -886,7 +1383,45 @@ impl RefractBountyEscrow {
             .get(&DataKey::Balance)
             .ok_or(BountyError::NotInitialized)
     }
+
+    fn post_balanced(
+        env: &Env,
+        debit: Symbol,
+        credit: Symbol,
+        asset: Address,
+        amount: i128,
+    ) -> Result<u64, BountyError> {
+        if amount <= 0 {
+            return Err(BountyError::InvalidAmount);
+        }
+        let seq: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::JournalCount)
+            .unwrap_or(0u64);
+        let entry = JournalEntry {
+            seq,
+            debit: debit.clone(),
+            credit: credit.clone(),
+            asset,
+            amount,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::JournalEntry(seq), &entry);
+        env.storage()
+            .persistent()
+            .set(&DataKey::JournalCount, &(seq + 1));
+        env.events().publish(
+            (symbol_short!("journal"), seq),
+            (debit, credit, amount),
+        );
+        Ok(seq)
+    }
 }
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod evidence_test;

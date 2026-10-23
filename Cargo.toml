@@ -1,6 +1,23 @@
 [workspace]
 resolver = "2"
-members = ["pool", "policy", "oracle", "incident_response", "vetoken", "timelock", "multisig", "governance", "backstop", "bounty", "grants", "registry"]
+members = [
+    "interfaces",
+    "pool",
+    "policy",
+    "oracle",
+    "incident_response",
+    "vetoken",
+    "timelock",
+    "multisig",
+    "governance",
+    "shared",
+    "backstop",
+    "bounty",
+    "grants",
+    "registry",
+    "treasury",
+    "integration",
+]
 
 [workspace.dependencies]
 soroban-sdk = { version = "21.0.0", features = ["alloc"] }
