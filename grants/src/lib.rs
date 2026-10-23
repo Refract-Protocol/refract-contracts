@@ -22,6 +22,20 @@
 //! Proof-of-delivery/attestation for what counts as milestone completion is made
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
+//!
+//! ## Cross-Contract Call Graph & Reentrancy Safety (#241)
+//!
+//! * **Inbound calls**: Governance/timelock invokes `create_grant`,
+//!   `confirm_milestone`, and `set_fee_config`; recipients invoke `claim`;
+//!   permissionless callers invoke `sweep_fees`.
+//! * **Outbound calls**: `ParameterRegistry::fee_bps` (in `quote_payout`) and
+//!   `token::Client::transfer` (in `claim` and `sweep_fees`).
+//! * **CEI & Reentrancy Invariant**: Both `claim` and `sweep_fees` acquire a
+//!   temporary-storage reentrancy lock (`DataKey::ReentrancyLock`), zero
+//!   `grant.claimable` / `AccruedFees(token)` and mark milestones claimed in
+//!   persistent storage *before* invoking `token.transfer`, and release the
+//!   lock afterward. Re-entrant calls during token transfer fail immediately
+//!   with [`ContractGrantsError::ReentrancyDetected`].
 
 #![no_std]
 

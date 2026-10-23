@@ -430,3 +430,151 @@ fn test_backstop_regression_guard_requires_auth() {
     // Regression guard: Unauthenticated call to cover_shortfall must fail
     let _ = client.cover_shortfall(&pool, &500);
 }
+
+// ─── Issue #241: Cross-Contract Reentrancy & Callback Safety Guards ──────────
+
+#[soroban_sdk::contract]
+pub struct HostileBackstopToken;
+
+#[soroban_sdk::contractimpl]
+impl HostileBackstopToken {
+    pub fn set_target(
+        env: Env,
+        backstop: Address,
+        attacker: Address,
+        pool: Address,
+        mode: u32,
+    ) {
+        env.storage().instance().set(&"backstop", &backstop);
+        env.storage().instance().set(&"attacker", &attacker);
+        env.storage().instance().set(&"pool", &pool);
+        env.storage().instance().set(&"mode", &mode);
+    }
+
+    pub fn last_reentry_err(env: Env) -> Option<BackstopError> {
+        env.storage().instance().get(&"last_err")
+    }
+
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        1_000_000
+    }
+
+    pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+        if env.storage().temporary().has(&"in_hook") {
+            return;
+        }
+        env.storage().temporary().set(&"in_hook", &true);
+
+        let backstop: Address = env.storage().instance().get(&"backstop").unwrap();
+        let attacker: Address = env.storage().instance().get(&"attacker").unwrap();
+        let pool: Address = env.storage().instance().get(&"pool").unwrap();
+        let mode: u32 = env.storage().instance().get(&"mode").unwrap_or(0);
+        let client = RefractBackstopClient::new(&env, &backstop);
+
+        let res = match mode {
+            1 => client.try_deposit(&attacker, &500).err(),
+            2 => client.try_withdraw(&attacker, &100).err(),
+            3 => client.try_cover_shortfall(&pool, &200).err(),
+            _ => None,
+        };
+        if let Some(Ok(err)) = res {
+            env.storage().instance().set(&"last_err", &err);
+        }
+
+        env.storage().temporary().remove(&"in_hook");
+    }
+}
+
+#[soroban_sdk::contract]
+pub struct LegitimatePoolCaller;
+
+#[soroban_sdk::contractimpl]
+impl LegitimatePoolCaller {
+    pub fn route_and_draw(
+        env: Env,
+        backstop: Address,
+        premium: i128,
+        shortfall: i128,
+    ) -> (i128, i128) {
+        let client = RefractBackstopClient::new(&env, &backstop);
+        let credited = client.receive_premium(&premium);
+        let covered = client.cover_shortfall(&env.current_contract_address(), &shortfall);
+        (credited, covered)
+    }
+}
+
+#[test]
+fn test_reentrant_token_callbacks_are_blocked_with_reentrancy_detected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let pool = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let token_id = env.register_contract(None, HostileBackstopToken);
+    let token_client = HostileBackstopTokenClient::new(&env, &token_id);
+
+    let backstop_id = env.register_contract(None, RefractBackstop);
+    let client = RefractBackstopClient::new(&env, &backstop_id);
+    client.initialize(&pool, &admin, &token_id, &2_000);
+
+    // 1. Re-entering deposit during deposit's token.transfer is blocked.
+    token_client.set_target(&backstop_id, &attacker, &pool, &1u32);
+    let shares = client.deposit(&attacker, &1_000);
+    assert_eq!(shares, 1_000);
+    assert_eq!(
+        token_client.last_reentry_err(),
+        Some(BackstopError::ReentrancyDetected)
+    );
+    assert_eq!(client.shares_of(&attacker), 1_000);
+
+    // 2. Re-entering withdraw during withdraw's token.transfer is blocked.
+    token_client.set_target(&backstop_id, &attacker, &pool, &2u32);
+    let withdrawn = client.withdraw(&attacker, &400);
+    assert_eq!(withdrawn, 400);
+    assert_eq!(
+        token_client.last_reentry_err(),
+        Some(BackstopError::ReentrancyDetected)
+    );
+    assert_eq!(client.shares_of(&attacker), 600);
+
+    // 3. Re-entering cover_shortfall during cover_shortfall's token.transfer is blocked.
+    token_client.set_target(&backstop_id, &attacker, &pool, &3u32);
+    let covered = client.cover_shortfall(&pool, &300);
+    assert_eq!(covered, 300);
+    assert_eq!(
+        token_client.last_reentry_err(),
+        Some(BackstopError::ReentrancyDetected)
+    );
+    assert_eq!(client.state().total_capital, 300);
+}
+
+#[test]
+fn test_legitimate_pool_to_backstop_nested_calls_succeed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let pool_id = env.register_contract(None, LegitimatePoolCaller);
+    let pool_client = LegitimatePoolCallerClient::new(&env, &pool_id);
+    let admin = Address::generate(&env);
+    let staker = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin);
+    let sac = token::StellarAssetClient::new(&env, &token_id);
+
+    let backstop_id = env.register_contract(None, RefractBackstop);
+    let client = RefractBackstopClient::new(&env, &backstop_id);
+    client.initialize(&pool_id, &admin, &token_id, &2_000);
+
+    sac.mint(&staker, &5_000);
+    sac.mint(&backstop_id, &1_000);
+    client.deposit(&staker, &5_000);
+    client.sync_matured();
+
+    let (credited, covered) = pool_client.route_and_draw(&backstop_id, &1_000, &1_200);
+    assert_eq!(credited, 100);
+    assert_eq!(covered, 1_200);
+}
+
