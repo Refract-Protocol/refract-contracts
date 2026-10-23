@@ -49,21 +49,22 @@ jobs:
       - name: SDK upgrade verification gate
         run: python3 scripts/verify_sdk_upgrade.py
 
-      - name: Script unit tests (contract_state snapshot/reconcile)
-        run: python3 -m unittest discover -s scripts/tests -v
 
-  # Issue #221: Soroban CPU/memory budgets for backstop, bounty, grants and
-  # treasury. Fails if any entrypoint exceeds its ceiling in
-  # resource_budgets.json; the diff table goes to the job summary.
-  resource-budgets:
-    name: resource budgets
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check resource budgets
+        run: cargo xtask budget-check
+
+  # Issue #222: deploy, initialise, wire and verify against a local Soroban
+  # sandbox, then re-run to prove the script is idempotent.
+  # pool, policy, oracle and governance are lef
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
@@ -90,11 +91,32 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
         with:
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Spec tooling unit tests
+        run: python3 -m unittest discover -s scripts/tests -v
+
+      - name: Build optimized wasm
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Check committed specs match the build
+        run: python3 scripts/contract_specs.py check --no-build
+
+      - name: Write fresh specs for review
+
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Spec tooling unit tests
+        run: python3 -m unittest discover -s scripts/tests -v
 
       - name: Install Stellar CLI
         run: |
@@ -112,6 +134,21 @@ jobs:
             stellar contract optimize --wasm "$f" --wasm-out "$f"
           done
           python3 scripts/wasm_manifest.py collect --out dist/wasm --skip-missing
+
+      - name: Check committed specs match the build
+        run: python3 scripts/contract_specs.py check --no-build
+
+      - name: Write fresh specs for review
+        if: failure()
+        run: python3 scripts/contract_specs.py generate --no-build --dir dist/specs
+
+      - name: Upload fresh specs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: contract-specs-${{ github.sha }}
+          path: dist/specs
+          if-no-files-found: ignore
 
       - name: Wait for sandbox and fund deployer
         run: |

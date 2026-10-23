@@ -1,23 +1,3 @@
-    testutils::{Address as _, Ledger as _},
-    token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
-};
-
-// ── Setup helpers ─────────────────────────────────────────────────────────────
-
-struct TestFixture {
-    env: Env,
-    contract_id: Address,
-    governance: Address,
-    token_id: Address,
-}
-
-impl TestFixture {
-    fn setup() -> Self {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let 
 #![cfg(test)]
 
 use super::*;
@@ -530,4 +510,3 @@ fn test_award_regression_guard_requires_auth() {
     client.award(&governance, &researcher, &100, &report_hash);
 }
 
-}
