@@ -23,7 +23,20 @@
 //! off-chain by governance; this contract only enforces the funds-release
 //! mechanics once a milestone is confirmed on-chain.
 
-use std::collections::BTreeMap;
+#![no_std]
+
+extern crate alloc;
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+mod contract;
+
+pub use contract::{
+    BumpKey, OnchainGrant, OnchainMilestone, PayoutQuote, RefractGrants,
+    RefractGrantsClient,
+};
+pub use contract::GrantsError as ContractGrantsError;
 
 /// Identifier for a grant.
 pub type GrantId = u64;
@@ -33,7 +46,7 @@ pub type GrantId = u64;
 /// the integrating runtime.
 pub type Address = u64;
 
-/// Errors returned by [`RefractGrants`].
+/// Errors returned by [`GrantsModel`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantsError {
     /// Caller is not the configured governance/timelock authority.
@@ -108,7 +121,7 @@ pub struct Grant {
 
 /// Milestone-based community grants disbursement contract.
 #[derive(Debug, Clone)]
-pub struct RefractGrants {
+pub struct GrantsModel {
     /// Governance/timelock authority allowed to create grants and confirm
     /// milestones.
     governance: Address,
@@ -118,7 +131,7 @@ pub struct RefractGrants {
     grants: BTreeMap<GrantId, Grant>,
 }
 
-impl RefractGrants {
+impl GrantsModel {
     /// Creates a new grants contract governed by `governance` (the timelock).
     pub fn new(governance: Address) -> Self {
         Self {
@@ -361,13 +374,14 @@ impl RefractGrants {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     const GOVERNANCE: Address = 1;
     const RECIPIENT: Address = 2;
     const STRANGER: Address = 3;
 
-    fn contract() -> RefractGrants {
-        RefractGrants::new(GOVERNANCE)
+    fn contract() -> GrantsModel {
+        GrantsModel::new(GOVERNANCE)
     }
 
     #[test]
