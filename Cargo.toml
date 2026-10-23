@@ -1,9 +1,29 @@
 [workspace]
 resolver = "2"
-members = ["pool", "policy", "oracle", "incident_response", "vetoken", "timelock", "multisig", "governance"]
+members = [
+    "common",
+    "shared",
+    "registry",
+    "backstop",
+    "bounty",
+    "grants",
+    "treasury",
+    "integration",
+    "payout_registry",
+    "pool",
+    "policy",
+    "oracle",
+    "incident_response",
+    "vetoken",
+    "timelock",
+    "multisig",
+    "governance",
+    "snapshot_harness",
+    "xtask",
+]
 
 [workspace.dependencies]
-soroban-sdk = { version = "21.0.0", features = ["alloc"] }
+soroban-sdk = { version = "21.0.0" }
 proptest = "1.5.0"
 
 [profile.release]
