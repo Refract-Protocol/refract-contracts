@@ -1,5 +1,5 @@
 [package]
-name = "refract-integration-tests"
+name = "refract-cross-contract-tests"
 version = "0.1.0"
 edition = "2021"
 publish = false

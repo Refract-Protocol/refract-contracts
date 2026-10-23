@@ -204,7 +204,7 @@ impl<'a> SharedAuthHarness<'a> {
         // Deploy RefractGrants
         let grants_id = env.register_contract(None, RefractGrants);
         let grants = RefractGrantsClient::new(env, &grants_id);
-        grants.initialize(&governance);
+        grants.initialize(&governance, &token_id);
 
         // Deploy CrossContractTreasury test helper
         let cross_treasury_id = env.register_contract(None, CrossContractTreasury);
