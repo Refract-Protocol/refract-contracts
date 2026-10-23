@@ -1282,32 +1282,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "refract-registry"
-version = "0.1.0"
-dependencies = [
- "refract-common",
- "refract-timelock",
  "refract-backstop",
  "refract-interfaces",
- "refract-oracle",
- "refract-policy",
- "soroban-sdk",
-]
-
-[[package]]
-name = "refract-timelock"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
-]
-
-[[package]]
-name = "refract-treasury"
-version = "0.1.0"
-dependencies = [
- "refract-backstop",
- "refract-interfaces",
- "refract-ora
  "refract-oracle",
  "refract-policy",
  "soroban-sdk",
@@ -1324,9 +1300,6 @@ dependencies = [
  "refract-policy",
  "refract-timelock",
  "soroban-sdk",
-]
-
-[[package]]
 name = "refract-timelock"
 version = "0.1.0"
 dependencies = [
@@ -1337,12 +1310,19 @@ dependencies = [
 name = "refract-treasury"
 version = "0.1.0"
 dependencies = [
+name = "refract-registry"
+version = "0.1.0"
+dependencies = [
  "refract-backstop",
  "refract-common",
  "refract-interfaces",
  "refract-oracle",
  "refract-policy",
- "refract-registry",
+ "refract-timelock",
+ "soroban-sdk",
+]
+
+[[package]]
  "soroban-sdk",
 ]
 
@@ -1353,8 +1333,6 @@ dependencies = [
  "refract-backstop",
  "refract-interfaces",
  "refract-testutils",
- "soroban-sdk",
-]
  "soroban-sdk",
 ]
 
@@ -2164,7 +2142,11 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "refract-grants",
+ "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

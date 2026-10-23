@@ -19,6 +19,7 @@ members = [
     "multisig",
     "governance",
     "snapshot_harness",
+    "xtask",
 ]
 
 [workspace.dependencies]
