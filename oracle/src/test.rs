@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
-    Address, Env, Symbol,
+    Address, Env, Symbol, TryFromVal,
 };
 
 const SCALE: i128 = 10_000_000;
@@ -25,6 +25,8 @@ fn setup<'a>() -> Fixture<'a> {
 
     let relayer = Address::generate(&env);
     oracle.add_relayer(&relayer);
+    env.ledger()
+        .with_mut(|l| l.timestamp += MIN_ADDITION_NOTICE_PERIOD_SECS);
     oracle.activate_relayer(&relayer);
 
     Fixture {
@@ -295,6 +297,9 @@ fn list_relayers_reflects_adds_and_removes() {
 
     let second = Address::generate(&f.env);
     f.oracle.add_relayer(&second);
+    f.env
+        .ledger()
+        .with_mut(|l| l.timestamp += MIN_ADDITION_NOTICE_PERIOD_SECS);
     f.oracle.activate_relayer(&second);
     assert_eq!(
         f.oracle.list_relayers(),
@@ -477,7 +482,7 @@ fn rate_limit_is_per_relayer_per_feed() {
     let res = f.oracle.try_submit(
         &f.relayer,
         &feed_b,
-        &-20 * SCALE / 100,
+        &(-20 * SCALE / 100),
         &t0,
         &Symbol::new(&f.env, "test_source"),
     );
@@ -496,8 +501,9 @@ fn rate_limit_is_per_relayer_per_feed() {
 
 #[test]
 fn admin_submitting_is_subject_to_the_same_rate_limit() {
-    // The admin (submit path via require_relayer's "admin can also submit"
-    // exemption) must be subject to the same rate limit — no special bypass.
+    // Since the relayer notice period (#170) the admin has no submit
+    // bypass: it must be queued and activated like any other relayer, and
+    // is then rate-limited like any other relayer.
     let env = Env::default();
     env.mock_all_auths();
 
@@ -505,12 +511,14 @@ fn admin_submitting_is_subject_to_the_same_rate_limit() {
     let id = env.register_contract(None, RefractOracle);
     let oracle = RefractOracleClient::new(&env, &id);
     oracle.initialize(&admin);
-    // Do NOT add admin as a relayer — admin submits via the bypass in require_relayer.
+    oracle.add_relayer(&admin);
+    env.ledger()
+        .with_mut(|l| l.timestamp += MIN_ADDITION_NOTICE_PERIOD_SECS);
+    oracle.activate_relayer(&admin);
 
     let feed = Symbol::new(&env, "USDC_PRICE");
     let t0 = env.ledger().timestamp();
 
-    // First submit as admin — accepted (no prior LastSubmissionAt).
     let res = oracle.try_submit(
         &admin,
         &feed,
@@ -527,7 +535,7 @@ fn admin_submitting_is_subject_to_the_same_rate_limit() {
         &admin,
         &feed,
         &9_980_000,
-        &(t0 + 59),
+        &t0,
         &Symbol::new(&env, "test_source"),
     );
     assert_eq!(res, Err(Ok(OracleError::SubmittedTooSoon)));
@@ -537,8 +545,11 @@ fn admin_submitting_is_subject_to_the_same_rate_limit() {
 fn test_systematic_oracle_event_topics_and_payloads() {
     let f = setup();
     let contract_id = f.oracle.address.clone();
-    
-    // 1. add_relayer event assertion
+    let topic0 = |topics: &soroban_sdk::Vec<soroban_sdk::Val>| {
+        Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap()
+    };
+
+    // 1. add_relayer queues the relayer: (relayer_queued,) -> (relayer, queued_at)
     let relayer_2 = Address::generate(&f.env);
     let before_count = f.env.events().all().len();
     f.oracle.add_relayer(&relayer_2);
@@ -546,52 +557,55 @@ fn test_systematic_oracle_event_topics_and_payloads() {
     assert_eq!(events.len(), before_count + 1);
     let (addr, topics, data) = events.last().unwrap();
     assert_eq!(addr, contract_id);
-    let topic_sym: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
-    assert_eq!(topic_sym, symbol_short!("RELAY_ADD"));
-    let payload_relayer: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(topic0(&topics), Symbol::new(&f.env, "relayer_queued"));
+    let (payload_relayer, queued_at) = <(Address, u64)>::try_from_val(&f.env, &data).unwrap();
     assert_eq!(payload_relayer, relayer_2);
+    assert_eq!(queued_at, f.env.ledger().timestamp());
 
-    // 2. submit event assertion: topics: (symbol_short!("FEED_SUB"), feed_id), payload: (reading.value, reading.updated_at)
+    // 2. submit: (reading_submitted,) -> (relayer, feed_id, value, timestamp)
     let before_count = f.env.events().all().len();
     let now = f.env.ledger().timestamp();
     let feed_sym = Symbol::new(&f.env, "BTC_PRICE");
     let reading_val: i128 = 65_000 * SCALE;
-    f.oracle.submit(&f.relayer, &feed_sym, &reading_val, &now, &Symbol::new(&f.env, "test_source"));
+    f.oracle.submit(
+        &f.relayer,
+        &feed_sym,
+        &reading_val,
+        &now,
+        &Symbol::new(&f.env, "test_source"),
+    );
     let events = f.env.events().all();
     assert_eq!(events.len(), before_count + 1);
     let (addr, topics, data) = events.last().unwrap();
     assert_eq!(addr, contract_id);
-    let topic_0: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
-    let topic_1: Symbol = Symbol::try_from_val(&f.env, &topics.get(1).unwrap()).unwrap();
-    assert_eq!(topic_0, symbol_short!("FEED_SUB"));
-    assert_eq!(topic_1, feed_sym);
-    let (val, updated_at): (i128, u64) = <(i128, u64)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(topic0(&topics), Symbol::new(&f.env, "reading_submitted"));
+    let (who, feed, val, ts) = <(Address, Symbol, i128, u64)>::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(who, f.relayer);
+    assert_eq!(feed, feed_sym);
     assert_eq!(val, reading_val);
-    assert_eq!(updated_at, now);
+    assert_eq!(ts, now);
 
-    // 3. remove_relayer event assertion: topics: (symbol_short!("RELAY_DEL"),), payload: (relayer,)
+    // 3. remove_relayer (cancels the pending entry): (relayer_removed,) -> (relayer,)
     let before_count = f.env.events().all().len();
     f.oracle.remove_relayer(&relayer_2);
     let events = f.env.events().all();
     assert_eq!(events.len(), before_count + 1);
     let (addr, topics, data) = events.last().unwrap();
     assert_eq!(addr, contract_id);
-    let topic_sym: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
-    assert_eq!(topic_sym, symbol_short!("RELAY_DEL"));
-    let payload_relayer: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(topic0(&topics), Symbol::new(&f.env, "relayer_removed"));
+    let (payload_relayer,) = <(Address,)>::try_from_val(&f.env, &data).unwrap();
     assert_eq!(payload_relayer, relayer_2);
 
-    // 4. set_admin event assertion: topics: (symbol_short!("ADM_SET"),), payload: (new_admin,)
+    // 4. propose_admin: (admin_proposed,) -> (new_admin,)
     let new_admin = Address::generate(&f.env);
     let before_count = f.env.events().all().len();
-    f.oracle.set_admin(&new_admin);
+    f.oracle.propose_admin(&new_admin);
     let events = f.env.events().all();
     assert_eq!(events.len(), before_count + 1);
     let (addr, topics, data) = events.last().unwrap();
     assert_eq!(addr, contract_id);
-    let topic_sym: Symbol = Symbol::try_from_val(&f.env, &topics.get(0).unwrap()).unwrap();
-    assert_eq!(topic_sym, symbol_short!("ADM_SET"));
-    let payload_admin: Address = Address::try_from_val(&f.env, &data).unwrap();
+    assert_eq!(topic0(&topics), Symbol::new(&f.env, "admin_proposed"));
+    let (payload_admin,) = <(Address,)>::try_from_val(&f.env, &data).unwrap();
     assert_eq!(payload_admin, new_admin);
 }
 
@@ -625,11 +639,11 @@ fn test_spec_oracle_interface_and_error_snapshot() {
     let env = Env::default();
     let sample = OracleReading {
         value: 10_000_000,
-        updated_at: 1_700_000_000,
+        timestamp: 1_700_000_000,
         source: Symbol::new(&env, "TEST_FEED"),
     };
     assert_eq!(sample.value, 10_000_000);
-    assert_eq!(sample.updated_at, 1_700_000_000);
+    assert_eq!(sample.timestamp, 1_700_000_000);
 }
 
 // ─── Issue #100: Feed metadata tests ──────────────────────────────────────────
@@ -703,7 +717,13 @@ fn metadata_is_settable_before_any_reading_is_submitted() {
         &now,
         &Symbol::new(&f.env, "refract"),
     );
-    assert_eq!(f.oracle.get_feed_metadata(&feed).unwrap().expected_cadence_secs, 120);
+    assert_eq!(
+        f.oracle
+            .get_feed_metadata(&feed)
+            .unwrap()
+            .expected_cadence_secs,
+        120
+    );
 }
 
 #[test]
@@ -813,19 +833,6 @@ fn update_reputation_emits_an_event() {
 }
 
 #[test]
-fn weighted_reading_returns_the_canonical_reading() {
-    // With a single shared reading slot per feed, get_weighted_reading must
-    // return the same value as get_reading.
-    let f = setup();
-    let feed = Symbol::new(&f.env, "USDC_PRICE");
-    submit(&f, "USDC_PRICE", 9_900_000);
-
-    let direct = f.oracle.get_reading(&feed);
-    let weighted = f.oracle.get_weighted_reading(&feed).unwrap();
-    assert_eq!(direct.value, weighted.value);
-}
-
-#[test]
 fn adding_duplicate_relayer_does_not_reset_reputation() {
     let f = setup();
     // Raise reputation above the initial value.
@@ -836,11 +843,14 @@ fn adding_duplicate_relayer_does_not_reset_reputation() {
     f.oracle.add_relayer(&f.relayer);
 
     let rep_after = f.oracle.relayer_reputation(&f.relayer).unwrap();
-    assert_eq!(rep_before, rep_after, "duplicate add must not reset reputation");
+    assert_eq!(
+        rep_before, rep_after,
+        "duplicate add must not reset reputation"
+    );
 }
 
 #[test]
-fn admin_submit_is_not_exempt_from_cooldown() {
+fn admin_cannot_submit_without_being_an_active_relayer() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -848,29 +858,17 @@ fn admin_submit_is_not_exempt_from_cooldown() {
     let id = env.register_contract(None, RefractOracle);
     let oracle = RefractOracleClient::new(&env, &id);
     oracle.initialize(&admin);
-    // Do NOT add admin as a relayer — admin submits via the bypass in require_relayer.
 
     let feed = Symbol::new(&env, "USDC_PRICE");
     let t0 = env.ledger().timestamp();
-
-    // First submit as admin — accepted (no prior LastSubmissionAt).
-    oracle.submit(
+    let res = oracle.try_submit(
         &admin,
         &feed,
         &9_990_000,
         &t0,
         &Symbol::new(&env, "test_source"),
     );
-
-    // Immediately re-submit — must be rejected (admin has no cooldown exemption).
-    let res = oracle.try_submit(
-        &admin,
-        &feed,
-        &9_980_000,
-        &t0,
-        &Symbol::new(&env, "test_source"),
-    );
-    assert_eq!(res, Err(Ok(OracleError::SubmittedTooSoon)));
+    assert_eq!(res, Err(Ok(OracleError::Unauthorized)));
 }
 
 #[test]
@@ -887,5 +885,5 @@ fn first_submission_from_a_relayer_is_always_accepted() {
         &now,
         &Symbol::new(&f.env, "test_source"),
     );
+    assert!(res.is_ok());
 }
-

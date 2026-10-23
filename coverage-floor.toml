@@ -22,3 +22,23 @@ branches = 93.75
 lines = 87.43
 branches = 83.33
 
+
+[backstop]
+lines = 85.00
+branches = 75.00
+
+[bounty]
+lines = 85.00
+branches = 75.00
+
+[grants]
+lines = 88.00
+branches = 78.00
+
+[treasury]
+lines = 90.00
+branches = 80.00
+
+[params]
+lines = 90.00
+branches = 82.00
