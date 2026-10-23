@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "common",
+    "shared",
+    "registry",
+    "backstop",
+    "bounty",
+    "grants",
+    "treasury",
+    "integration",
+    "payout_registry",
     "pool",
     "policy",
     "oracle",
@@ -9,12 +18,14 @@ members = [
     "timelock",
     "multisig",
     "governance",
-    "common",
-    "registry",
+    "shared",
     "backstop",
     "bounty",
     "grants",
+    "registry",
     "treasury",
+    "integration",
+    "payout_registry",
 ]
 
 [workspace.dependencies]

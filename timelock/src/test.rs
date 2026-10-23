@@ -17,7 +17,9 @@ mod stub {
     #[contractimpl]
     impl Stub {
         pub fn set_value(env: Env, _caller: Symbol, value: i128) -> i128 {
-            env.storage().instance().set(&Symbol::new(&env, "v"), &value);
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "v"), &value);
             value
         }
 
@@ -87,8 +89,18 @@ fn queue_returns_incrementing_ids() {
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
     let eta = env.ledger().timestamp() + 7_200;
 
-    let id0 = tl.queue(&target, &Symbol::new(&env, "set_value"), &stub_args(&env, 1), &eta);
-    let id1 = tl.queue(&target, &Symbol::new(&env, "set_value"), &stub_args(&env, 2), &eta);
+    let id0 = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 1),
+        &eta,
+    );
+    let id1 = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 2),
+        &eta,
+    );
     assert_eq!(id0, 0);
     assert_eq!(id1, 1);
 }
@@ -102,7 +114,12 @@ fn execute_before_eta_is_rejected() {
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
     let eta = env.ledger().timestamp() + 7_200;
 
-    let id = tl.queue(&target, &Symbol::new(&env, "set_value"), &stub_args(&env, 99), &eta);
+    let id = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 99),
+        &eta,
+    );
 
     // Only 3600s later — eta requires 7200s.
     env.ledger().with_mut(|l| l.timestamp = 1_003_600);
@@ -119,7 +136,12 @@ fn full_queue_wait_execute_roundtrip() {
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
     let eta = env.ledger().timestamp() + 7_200;
 
-    let id = tl.queue(&target, &Symbol::new(&env, "set_value"), &stub_args(&env, 42), &eta);
+    let id = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 42),
+        &eta,
+    );
 
     // Advance past eta.
     env.ledger().with_mut(|l| l.timestamp = 1_010_000);
@@ -143,7 +165,12 @@ fn cancel_before_execute_succeeds() {
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
     let eta = env.ledger().timestamp() + 7_200;
 
-    let id = tl.queue(&target, &Symbol::new(&env, "set_value"), &stub_args(&env, 7), &eta);
+    let id = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 7),
+        &eta,
+    );
 
     tl.cancel(&id);
     let op = tl.get_operation(&id).unwrap();
@@ -159,7 +186,12 @@ fn cancel_after_execute_is_rejected() {
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
     let eta = env.ledger().timestamp() + 7_200;
 
-    let id = tl.queue(&target, &Symbol::new(&env, "set_value"), &stub_args(&env, 5), &eta);
+    let id = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 5),
+        &eta,
+    );
 
     env.ledger().with_mut(|l| l.timestamp = 1_010_000);
     tl.execute(&id);
