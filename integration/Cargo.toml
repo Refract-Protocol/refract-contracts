@@ -1,0 +1,13 @@
+[package]
+name = "refract-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Cross-contract integration tests for the Refract contract suite"
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+refract-bounty = { path = "../bounty" }
