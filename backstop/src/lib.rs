@@ -62,9 +62,18 @@ pub enum BackstopError {
     InsufficientShares = 5,
     InsufficientCapital = 6,
     InvalidPremiumShare = 7,
-    PendingLossFreeze = 8,
-    InvalidPremiumSplit = 9,
-    DuplicateLossId = 10,
+    NoExcessFunds = 8,
+    TooManyOperations = 9,
+    PendingLossFreeze = 10,
+    InvalidPremiumSplit = 11,
+    DuplicateLossId = 12,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum BackstopOp {
+    SetAdmin(Address),
+    SetPremiumShare(i128),
 }
 
 #[contracttype]
@@ -565,6 +574,67 @@ impl RefractBackstop {
             (loss_id, junior_loss, senior_loss, shortfall),
         );
         Ok(covered)
+    }
+
+    pub fn accounted_liabilities(env: Env) -> Result<i128, BackstopError> {
+        Ok(Self::state(&env)?.total_capital)
+    }
+
+    pub fn rescue(
+        env: Env,
+        caller: Address,
+        token: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<i128, BackstopError> {
+        caller.require_auth();
+        let config = Self::config(&env)?;
+        if caller != config.admin || to != config.admin || token != config.token || amount <= 0 {
+            return Err(BackstopError::Unauthorized);
+        }
+        let balance = token::Client::new(&env, &token).balance(&env.current_contract_address());
+        let excess = balance - Self::state(&env)?.total_capital;
+        if amount > excess {
+            return Err(BackstopError::NoExcessFunds);
+        }
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &to,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "FundsRescued"),),
+            (token, to, amount, excess - amount),
+        );
+        Ok(excess - amount)
+    }
+
+    pub fn batch(env: Env, caller: Address, operations: Vec<BackstopOp>) -> Result<(), BackstopError> {
+        caller.require_auth();
+        let mut config = Self::config(&env)?;
+        if caller != config.admin {
+            return Err(BackstopError::Unauthorized);
+        }
+        if operations.len() > 16 {
+            return Err(BackstopError::TooManyOperations);
+        }
+        for operation in operations.iter() {
+            match operation {
+                BackstopOp::SetAdmin(admin) => config.admin = admin,
+                BackstopOp::SetPremiumShare(share) => {
+                    if !(0..=BPS_DENOM).contains(&share) {
+                        return Err(BackstopError::InvalidPremiumShare);
+                    }
+                    config.premium_share_bps = share;
+                }
+            }
+        }
+        env.storage().instance().set(&"config", &config);
+        env.events().publish(
+            (Symbol::new(&env, "AdminBatch"),),
+            operations.len(),
+        );
+        Ok(())
     }
 
     /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
