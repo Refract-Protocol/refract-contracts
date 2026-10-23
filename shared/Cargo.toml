@@ -1,0 +1,11 @@
+[package]
+name = "refract-shared"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Pure, contract-independent logic shared by the Refract governance-adjacent contracts"
+
+[lib]
+doctest = false
+
+[dependencies]
