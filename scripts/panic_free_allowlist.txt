@@ -1,0 +1,5 @@
+treasury/src/lib.rs: .expect("not initialized")
+treasury/src/lib.rs: .expect("not initialized");
+treasury/src/lib.rs: panic!("already initialized");
+treasury/src/lib.rs: panic!("amount must be positive");
+treasury/src/lib.rs: panic!("unauthorized");
