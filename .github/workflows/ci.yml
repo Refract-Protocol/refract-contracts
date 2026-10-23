@@ -46,6 +46,41 @@ jobs:
       - name: SDK upgrade verification gate
         run: python3 scripts/verify_sdk_upgrade.py
 
+  contract-specs:
+    name: contract spec drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Spec tooling unit tests
+        run: python3 -m unittest discover -s scripts/tests -v
+
+      - name: Build optimized wasm
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Check committed specs match the build
+        run: python3 scripts/contract_specs.py check --no-build
+
+      - name: Write fresh specs for review
+        if: failure()
+        run: python3 scripts/contract_specs.py generate --no-build --dir dist/specs
+
+      - name: Upload fresh specs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: contract-specs-${{ github.sha }}
+          path: dist/specs
+          if-no-files-found: ignore
+
   # Issue #131 (plan): add a `miri` job here:
   #   - dtolnay/rust-toolchain@nightly with components: miri
   #   - cargo miri setup

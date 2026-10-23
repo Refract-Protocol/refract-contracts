@@ -2,6 +2,10 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 
+// Interface version of this contract's public spec. Bump it whenever an
+// entrypoint or contract type changes. See specs/README.md.
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
+
 /// Maximum lock duration in seconds (4 years), used as the veToken decay denominator.
 const MAX_LOCK_TIME: u64 = 4 * 365 * 24 * 60 * 60;
 

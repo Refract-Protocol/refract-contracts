@@ -213,3 +213,24 @@ formal-spec:
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Interface Versioning (issue #248)
+
+Each contract crate embeds an interface version in its wasm:
+
+```rust
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
+```
+
+**Rule:** bump `refract_iface` by one in the same PR as any change to that
+contract's public interface: entrypoints added, removed or renamed, argument
+or return types changed, or `#[contracttype]` / `#[contracterror]` fields,
+variants or discriminants changed. Doc-comment-only edits don't need a bump.
+The version never goes down.
+
+The exported spec for every contract is committed under [`specs/`](specs/README.md).
+`python3 scripts/contract_specs.py check` (run in CI by the `contract-specs`
+job) fails when the committed spec differs from a fresh release build, or when
+the interface changed without a version bump.

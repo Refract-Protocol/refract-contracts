@@ -5,6 +5,10 @@ use soroban_sdk::{
     IntoVal, Symbol, Vec,
 };
 
+// Interface version of this contract's public spec. Bump it whenever an
+// entrypoint or contract type changes. See specs/README.md.
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
+
 const PRECISION: i128 = 10_000_000i128;
 const BPS: i128 = 10_000i128;
 

@@ -209,6 +209,10 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
 };
 
+// Interface version of this contract's public spec. Bump it whenever an
+// entrypoint or contract type changes. See specs/README.md.
+soroban_sdk::contractmeta!(key = "refract_iface", val = "1");
+
 /// Coverage types offered across the protocol (must match RefractPool enum).
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
