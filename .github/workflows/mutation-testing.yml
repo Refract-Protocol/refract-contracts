@@ -1,0 +1,50 @@
+# Scheduled mutation testing for the accounting-critical contracts.
+#
+# Non-blocking for now: it runs weekly and on demand, uploads the reports as
+# an artifact, and lists surviving mutants in the job summary. To make it
+# blocking, add a pull_request trigger and fail the job when missed.txt is
+# not empty for the agreed targets.
+
+name: mutation-testing
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Run mutation tests
+        run: bash scripts/mutation.sh "$RUNNER_TEMP/mutation-reports"
+
+      - name: Summarize surviving mutants
+        if: always()
+        run: |
+          {
+            echo "## Surviving mutants"
+            for f in "$RUNNER_TEMP"/mutation-reports/*/mutants.out/missed.txt; do
+              [ -f "$f" ] || continue
+              echo "### $(basename "$(dirname "$(dirname "$f")")")"
+              cat "$f"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-reports
+          path: ${{ runner.temp }}/mutation-reports
