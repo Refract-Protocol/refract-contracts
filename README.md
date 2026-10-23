@@ -96,7 +96,6 @@ If you rebuild the same commit with the same toolchain (see `toolchain.rustc` in
   ]
 }
 ```
-```
 
 ## Deploy (testnet)
 
@@ -159,3 +158,4 @@ We welcome contributors — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) and our [
 
 <!-- handsoff-issue-118 -->
 - #118: [High] Build a generic governance-executed calldata forwarder with an allowlist of callable contracts
+

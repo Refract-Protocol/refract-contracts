@@ -288,3 +288,36 @@ combined. Quorum is `quorum_bps` of `GovernorConfig::total_voting_supply`.
 - `pool/src/pricing_proptest.rs` — existing proptest baseline
 - `pool/src/lib.rs:972` — `_quote_withdrawal` existing guard comment
 - Kani documentation: https://model-checking.github.io/kani/
+
+---
+
+## 8. Grants lifecycle (`RefractGrants`)
+
+[`grants/src/lib.rs`](./grants/src/lib.rs) records every grant decision
+on-chain, from application to final milestone payment.
+
+### Applications
+
+| Transition | Caller | Notes |
+|---|---|---|
+| `submit_application` → **Pending** | applicant | Stores applicant, amount (> 0), milestone-outline hash and delivery deadline under a new monotonic id |
+| Pending → **Approved** (`approve_application`) | reviewer (the governance/timelock address) | Requires an ordered milestone list summing exactly to the amount; creates the grant |
+| Pending → **Rejected** (`reject_application`) | reviewer | Terminal |
+| Pending → **Withdrawn** (`withdraw_application`) | applicant | Terminal |
+
+* Rejected and withdrawn applications stay in storage for audit and can never
+  be approved.
+* A reviewer can't approve their own application.
+* Approve and reject events carry the application id, the reviewer and the
+  amount.
+* The reviewer is the timelock, so approvals go through the same queued,
+  delayed path as every other privileged call (see the
+  `timelock_driven_approval` test).
+* Records live in persistent storage, and every write extends their TTL.
+
+### Grants
+
+Only approved applications create grants. Governance confirms milestones in
+order with `confirm_milestone`; the recipient pulls confirmed funds with
+`claim`.
+
