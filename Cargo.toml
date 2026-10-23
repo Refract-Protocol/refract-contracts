@@ -30,6 +30,8 @@ exclude = [
     "vetoken",
     "timelock",
     "multisig",
+    "governance",
+    "math",
     "snapshot_harness",
     "xtask",
 ]

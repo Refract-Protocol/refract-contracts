@@ -913,15 +913,7 @@ name = "refract-backstop"
 version = "0.1.0"
 dependencies = [
  "refract-common",
- "refract-registry",
- "soroban-sdk",
-]
-
-[[package]]
-name = "refract-bounty"
-version = "0.1.0"
-dependencies = [
- "refract-common",
+ "refract-math",
  "refract-registry",
  "soroban-sdk",
 ]
@@ -930,6 +922,20 @@ dependencies = [
 name = "refract-common"
 version = "0.1.0"
 dependencies = [
+ "soroban-sdk",
+]
+ "soroban-sdk",
+]
+
+[[package]]
+name = "refract-bounty"
+version = "0.1.0"
+dependencies = [
+ "refract-common",
+ "refract-math",
+ "refract-registry",
+ "refract-treasury",
+ "soroban-sdk",
  "soroban-sdk",
 ]
 
@@ -961,6 +967,12 @@ dependencies = [
 ]
 
 [[package]]
+ "proptest",
+ "refract-common",
+ "refract-math",
+ "refract-registry",
+ "refract-timelock",
+ "soroban-sdk",
 name = "refract-multisig"
 version = "0.1.0"
 dependencies = [
@@ -1207,22 +1219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "refract-timelock"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
-]
-
-[[package]]
-name = "refract-treasury"
-version = "0.1.0"
-dependencies = [
- "refract-backstop",
- "refract-common",
- "refract-interfaces",
- "refract-oracle",
- "refract-policy",
- "refract-registry",
  "soroban-sdk",
 ]
 
