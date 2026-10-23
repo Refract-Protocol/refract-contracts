@@ -1,6 +1,17 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    Vec,
+};
+
+pub mod evidence;
+
+use evidence::{EvidenceEntry, ReportManifest, VerificationStatus, MAX_EVIDENCE_ENTRIES};
+
+pub mod disclosure;
+
+pub mod wind_down;
 
 /// Storage keys for the bounty escrow.
 #[contracttype]
@@ -14,6 +25,8 @@ pub enum DataKey {
     Balance,
     /// Immutable, timestamped record of a rewarded disclosure.
     Award(BytesN<32>),
+    /// Evidence manifest attached to a report.
+    Manifest(BytesN<32>),
 }
 
 /// Immutable, timestamped record that a specific disclosure was rewarded.
@@ -38,6 +51,10 @@ pub enum BountyError {
     InsufficientBalance = 4,
     Unauthorized = 5,
     DuplicateReport = 6,
+    ManifestFull = 7,
+    EvidenceNotFound = 8,
+    AlreadyAdjudicated = 9,
+    InvalidEvidence = 10,
 }
 
 /// Governance-controlled bug bounty escrow.
@@ -132,6 +149,121 @@ impl RefractBountyEscrow {
         env.storage().persistent().get(&DataKey::Award(report_hash))
     }
 
+    /// Add an evidence entry to a report's manifest. Only the reporter may
+    /// add entries, and only before the report is awarded.
+    pub fn append_evidence(
+        env: Env,
+        reporter: Address,
+        report_hash: BytesN<32>,
+        entry: EvidenceEntry,
+    ) -> Result<(), BountyError> {
+        reporter.require_auth();
+        evidence::validate_entry(&entry)?;
+        let mut manifest = Self::writable_manifest(&env, &reporter, &report_hash)?;
+        if manifest.entries.len() >= MAX_EVIDENCE_ENTRIES {
+            return Err(BountyError::ManifestFull);
+        }
+        manifest.entries.push_back(entry);
+        Self::save_manifest(&env, &report_hash, &manifest);
+        Ok(())
+    }
+
+    /// Replace the evidence entry at `index`. Same rules as `append_evidence`.
+    pub fn replace_evidence(
+        env: Env,
+        reporter: Address,
+        report_hash: BytesN<32>,
+        index: u32,
+        entry: EvidenceEntry,
+    ) -> Result<(), BountyError> {
+        reporter.require_auth();
+        evidence::validate_entry(&entry)?;
+        let mut manifest = Self::writable_manifest(&env, &reporter, &report_hash)?;
+        if index >= manifest.entries.len() {
+            return Err(BountyError::EvidenceNotFound);
+        }
+        manifest.entries.set(index, entry);
+        Self::save_manifest(&env, &report_hash, &manifest);
+        Ok(())
+    }
+
+    /// Record a reviewer decision on one evidence entry. Gated by the
+    /// governance/timelock address, which acts as the reviewer. Reporters
+    /// cannot mark their own entries verified.
+    pub fn verify_evidence(
+        env: Env,
+        caller: Address,
+        report_hash: BytesN<32>,
+        index: u32,
+        status: VerificationStatus,
+        reason_hash: Option<BytesN<32>>,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        if caller != Self::governance(&env)? {
+            return Err(BountyError::Unauthorized);
+        }
+        if status == VerificationStatus::Unverified {
+            return Err(BountyError::InvalidEvidence);
+        }
+        let mut manifest = Self::manifest(&env, &report_hash)?;
+        if index >= manifest.entries.len() {
+            return Err(BountyError::EvidenceNotFound);
+        }
+        let mut entry = manifest.entries.get(index).ok_or(BountyError::EvidenceNotFound)?;
+        entry.status = status;
+        entry.reason_hash = reason_hash;
+        manifest.entries.set(index, entry);
+        Self::save_manifest(&env, &report_hash, &manifest);
+        env.events()
+            .publish((symbol_short!("evidence"), report_hash), (index, status));
+        Ok(())
+    }
+
+    /// Read-only evidence manifest for a report, if one exists.
+    pub fn get_manifest(env: Env, report_hash: BytesN<32>) -> Option<ReportManifest> {
+        env.storage().persistent().get(&DataKey::Manifest(report_hash))
+    }
+
+    /// Manifest for a write. Creates it on first use and checks reporter ownership.
+    fn writable_manifest(
+        env: &Env,
+        reporter: &Address,
+        report_hash: &BytesN<32>,
+    ) -> Result<ReportManifest, BountyError> {
+        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+            return Err(BountyError::AlreadyAdjudicated);
+        }
+        match env.storage().persistent().get(&DataKey::Manifest(report_hash.clone())) {
+            Some(manifest) => {
+                if manifest.reporter != *reporter {
+                    return Err(BountyError::Unauthorized);
+                }
+                Ok(manifest)
+            }
+            None => Ok(ReportManifest {
+                reporter: reporter.clone(),
+                entries: Vec::new(env),
+            }),
+        }
+    }
+
+    fn manifest(env: &Env, report_hash: &BytesN<32>) -> Result<ReportManifest, BountyError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Manifest(report_hash.clone()))
+            .ok_or(BountyError::EvidenceNotFound)
+    }
+
+    fn save_manifest(env: &Env, report_hash: &BytesN<32>, manifest: &ReportManifest) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Manifest(report_hash.clone()), manifest);
+        env.events().publish(
+            (symbol_short!("manifest"), report_hash.clone()),
+            manifest.entries.len(),
+        );
+    }
+
     fn governance(env: &Env) -> Result<Address, BountyError> {
         env.storage()
             .instance()
@@ -156,3 +288,5 @@ impl RefractBountyEscrow {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod evidence_test;

@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "_comment": "Declarative deployment plan read by scripts/deploy.py. Values: '@name' = contract id of another contract in this file, '$name' = network param, '$deployer' = address of the signing identity. Never put secret keys here.",
+  "networks": {
+    "local": {
+      "rpc_url": "http://localhost:8000/rpc",
+      "network_passphrase": "Standalone Network ; February 2017",
+      "params": {
+        "timelock_admin": "$deployer",
+        "timelock_min_delay": 60,
+        "multisig_owners": ["$deployer"],
+        "multisig_threshold": 1,
+        "usdc_token": "$native_sac",
+        "protocol_token": "$native_sac",
+        "guardian": "$deployer",
+        "backstop_premium_share_bps": 500,
+        "bounty_approvers": ["$deployer"],
+        "bounty_threshold": 1,
+        "bounty_reward_tiers": {
+          "critical": "500000000000",
+          "high": "100000000000",
+          "medium": "20000000000",
+          "low": "5000000000"
+        }
+      }
+    },
+    "testnet": {
+      "rpc_url": "https://soroban-testnet.stellar.org",
+      "network_passphrase": "Test SDF Network ; September 2015",
+      "params": {
+        "timelock_admin": "$deployer",
+        "timelock_min_delay": 172800,
+        "multisig_owners": ["$deployer"],
+        "multisig_threshold": 1,
+        "usdc_token": "$native_sac",
+        "protocol_token": "$native_sac",
+        "guardian": "$deployer",
+        "backstop_premium_share_bps": 500,
+        "bounty_approvers": ["$deployer"],
+        "bounty_threshold": 1,
+        "bounty_reward_tiers": {
+          "critical": "500000000000",
+          "high": "100000000000",
+          "medium": "20000000000",
+          "low": "5000000000"
+        }
+      }
+    }
+  },
+  "contracts": [
+    {
+      "name": "refract_multisig",
+      "init": { "owners": "$multisig_owners", "threshold": "$multisig_threshold" },
+      "checks": { "threshold": "$multisig_threshold" }
+    },
+    {
+      "name": "refract_timelock",
+      "init": { "admin": "$timelock_admin", "min_delay": "$timelock_min_delay" },
+      "checks": { "admin": "$timelock_admin", "min_delay": "$timelock_min_delay" }
+    },
+    {
+      "name": "refract_oracle",
+      "init": { "admin": "@refract_timelock" },
+      "checks": { "admin": "@refract_timelock" }
+    },
+    {
+      "name": "refract_policy",
+      "init": { "admin": "@refract_timelock", "pool_contract": "@refract_pool" }
+    },
+    {
+      "name": "refract_pool",
+      "init": { "admin": "$deployer", "usdc_token": "$usdc_token", "policy_registry": "@refract_policy" },
+      "checks": { "admin": "@refract_timelock" }
+    },
+    {
+      "name": "refract_treasury",
+      "init": { "admin": "@refract_timelock" },
+      "checks": { "admin": "@refract_timelock" }
+    },
+    {
+      "name": "refract_vetoken",
+      "init": { "token": "$protocol_token", "treasury": "@refract_treasury" }
+    },
+    {
+      "name": "refract_governance",
+      "init": { "admin": "@refract_timelock", "token": "@refract_vetoken" },
+      "checks": { "admin": "@refract_timelock" }
+    },
+    {
+      "name": "refract_incident_response",
+      "init": { "admin": "@refract_timelock", "guardian": "$guardian" },
+      "checks": { "admin": "@refract_timelock", "guardian": "$guardian" }
+    },
+    {
+      "name": "refract_backstop",
+      "init": {
+        "pool": "@refract_pool",
+        "admin": "@refract_timelock",
+        "token": "$usdc_token",
+        "premium_share_bps": "$backstop_premium_share_bps"
+      }
+    },
+    {
+      "name": "refract_bounty",
+      "init": {
+        "governance": "@refract_timelock",
+        "token": "$usdc_token",
+        "approvers": "$bounty_approvers",
+        "approval_threshold": "$bounty_threshold",
+        "reward_tiers": "$bounty_reward_tiers"
+      }
+    },
+    {
+      "name": "refract_grants",
+      "init": { "governance": "@refract_timelock", "token": "$usdc_token" },
+      "checks": { "governance": "@refract_timelock" }
+    }
+  ],
+  "wiring": [
+    {
+      "id": "pool_admin_to_timelock",
+      "contract": "refract_pool",
+      "fn": "set_admin",
+      "args": { "caller": "$deployer", "new_admin": "@refract_timelock" }
+    }
+  ]
+}
