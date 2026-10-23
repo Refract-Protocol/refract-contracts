@@ -1,0 +1,8 @@
+{
+  "toolchain": "1.97.1",
+  "budgets": {
+    "refract-oracle": 25000,
+    "refract-policy": 28750,
+    "refract-pool": 59250
+  }
+}
