@@ -1,0 +1,15 @@
+[package]
+name = "refract-treasury"
+version = "0.1.0"
+edition = "2021"
+description = "RefractTreasury — token custody, NAV snapshots (issue #245), recipient allowlist (issue #244), and backstop seeding (issue #243)"
+license = "MIT"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }

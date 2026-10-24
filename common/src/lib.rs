@@ -11,6 +11,9 @@
 //! * [`registry`] is the client-side interface to the `RefractRegistry`
 //!   contract plus the allowlist helpers every contract uses at its
 //!   cross-contract boundaries (issue #284).
+//! * [`allowlist`] is the governance-maintained on-chain recipient screening
+//!   list.  Every value-moving entrypoint checks the destination address here
+//!   before transferring funds (issue #244).
 //!
 //! This crate deliberately defines no `#[contract]` (outside of the
 //! `testutils` mock token), so linking it into a contract does not add
@@ -18,6 +21,7 @@
 
 #![no_std]
 
+pub mod allowlist;
 pub mod payout;
 pub mod registry;
 

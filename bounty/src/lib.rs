@@ -33,6 +33,24 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
 
+// ── Allowlist helpers ─────────────────────────────────────────────────────────
+//
+// The bounty contract stores its own recipient-status entries rather than
+// calling a separate allowlist contract, keeping the dependency graph simple.
+// The `common::allowlist` module is designed to live inside the host contract's
+// persistent storage; we use it directly here.
+
+/// Screening status for a payout recipient (issue #244).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ScreeningStatus {
+    /// Governance-approved; may receive funds.
+    Allowed = 0,
+    /// Explicitly blocked; may NOT receive funds.
+    Blocked = 1,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -53,6 +71,9 @@ pub enum DataKey {
     Award(BytesN<32>),
     /// Pull-based payout escrow record.
     Payout(u64),
+    /// Screening status for a recipient address (issue #244).
+    /// Maps `Address → ScreeningStatus` — see `common::allowlist`.
+    RecipientStatus(Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -120,6 +141,9 @@ pub enum BountyError {
     DeadlineNotReached = 10,
     /// Payout deadline must be in the future.
     InvalidDeadline = 11,
+    /// The destination address has not been screened and allowlisted by
+    /// governance (issue #244).
+    RecipientNotAllowed = 12,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -184,6 +208,11 @@ impl RefractBountyEscrow {
         if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
             return Err(BountyError::DuplicateReport);
         }
+        // Reject payouts to addresses that have not been screened by governance
+        // (issue #244).
+        if !Self::is_recipient_allowed_inner(&env, &researcher) {
+            return Err(BountyError::RecipientNotAllowed);
+        }
         // Must not exceed available (unreserved) balance.
         if amount > Self::available_balance_inner(&env)? {
             return Err(BountyError::InsufficientBalance);
@@ -241,8 +270,13 @@ impl RefractBountyEscrow {
         if deadline <= now {
             return Err(BountyError::InvalidDeadline);
         }
+        // Reject payouts to addresses that have not been screened (issue #244).
+        if !Self::is_recipient_allowed_inner(&env, &recipient) {
+            return Err(BountyError::RecipientNotAllowed);
+        }
         if amount > Self::available_balance_inner(&env)? {
             return Err(BountyError::InsufficientBalance);
+        }
         }
 
         // Reserve the funds.
@@ -413,6 +447,95 @@ impl RefractBountyEscrow {
     /// Pull-payout record by id.
     pub fn get_payout(env: Env, payout_id: u64) -> Option<PayoutRecord> {
         env.storage().persistent().get(&DataKey::Payout(payout_id))
+    }
+
+    // ─── Recipient allowlist (issue #244) ─────────────────────────────────
+
+    /// Allow `recipient` to receive bounty payouts.
+    ///
+    /// Governance/timelock-gated. Overwrites any previous status.
+    pub fn allow_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage().persistent().set(
+            &DataKey::RecipientStatus(recipient.clone()),
+            &ScreeningStatus::Allowed,
+        );
+        env.events()
+            .publish((symbol_short!("al_allow"),), recipient);
+        Ok(())
+    }
+
+    /// Block `recipient` from receiving bounty payouts.
+    ///
+    /// Governance/timelock-gated. Overwrites any previous status.
+    pub fn block_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage().persistent().set(
+            &DataKey::RecipientStatus(recipient.clone()),
+            &ScreeningStatus::Blocked,
+        );
+        env.events()
+            .publish((symbol_short!("al_block"),), recipient);
+        Ok(())
+    }
+
+    /// Remove the screening record for `recipient`.
+    ///
+    /// Governance/timelock-gated. After removal the address is treated as
+    /// unscreened and payouts to it will be rejected.
+    pub fn remove_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RecipientStatus(recipient.clone()));
+        env.events()
+            .publish((symbol_short!("al_remove"),), recipient);
+        Ok(())
+    }
+
+    /// Return the screening status of `recipient`, if any record exists.
+    pub fn recipient_status(env: Env, recipient: Address) -> Option<ScreeningStatus> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecipientStatus(recipient))
+    }
+
+    /// Return `true` iff `recipient` is currently `Allowed`.
+    pub fn is_recipient_allowed(env: Env, recipient: Address) -> bool {
+        Self::is_recipient_allowed_inner(&env, &recipient)
+    }
+
+    fn is_recipient_allowed_inner(env: &Env, recipient: &Address) -> bool {
+        matches!(
+            env.storage()
+                .persistent()
+                .get::<DataKey, ScreeningStatus>(&DataKey::RecipientStatus(recipient.clone())),
+            Some(ScreeningStatus::Allowed)
+        )
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────

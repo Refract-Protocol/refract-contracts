@@ -215,6 +215,10 @@ pub enum TimelockError {
     InvalidKeeperConfig = 8,
     KeeperRewardExceeded = 9,
     Overflow = 10,
+    /// The operation is not in `Failed` status; cannot retry.
+    NotFailed = 11,
+    /// `retry` was called on an operation whose `eta` still lies in the future.
+    RetryTooSoon = 12,
 }
 
 /// Capped keeper incentive for permissionless `execute_due`.
@@ -237,6 +241,12 @@ pub enum OperationStatus {
     Pending = 0,
     Executed = 1,
     Cancelled = 2,
+    /// The callee reverted on the most-recent attempt.  The operation can be
+    /// retried via `retry(id)` once the underlying precondition is fixed.
+    Failed = 3,
+    /// `eta` has passed and the operation was never executed.  Governance may
+    /// cancel it; it cannot be executed.
+    Expired = 4,
 }
 
 /// A queued cross-contract call.
@@ -252,6 +262,14 @@ pub struct TimelockOperation {
     /// Earliest ledger timestamp at which `execute` may be called.
     pub eta: u64,
     pub status: OperationStatus,
+    /// Non-zero when `status == Failed`. Stores the raw `InvokeError` code
+    /// from the most-recent failed attempt (0 for a host `Abort`).
+    pub failure_code: u32,
+    /// How many times `execute` (or `retry`) was attempted and the callee
+    /// reverted.  Starts at 0, incremented on each failure.
+    pub attempt_count: u32,
+    /// Ledger timestamp of the most-recent failed attempt (0 if never tried).
+    pub last_failed_at: u64,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -338,6 +356,9 @@ impl RefractTimelock {
             args,
             eta,
             status: OperationStatus::Pending,
+            failure_code: 0,
+            attempt_count: 0,
+            last_failed_at: 0,
         };
         env.storage().persistent().set(&DataKey::Operation(id), &op);
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
@@ -392,10 +413,23 @@ impl RefractTimelock {
                     .publish((Symbol::new(&env, "tl_executed"), id), ());
                 Ok(())
             }
-            Err(_) => {
-                // Reset so the op can be retried.
-                op.status = OperationStatus::Pending;
+            Err(e) => {
+                // Transition to Failed so the op is observable with a
+                // failure code. Governance can cancel it; the op can be
+                // retried via `retry(id)` after the precondition is fixed.
+                let failure_code = match &e {
+                    Err(soroban_sdk::InvokeError::Contract(c)) => *c,
+                    _ => 0u32,
+                };
+                op.status = OperationStatus::Failed;
+                op.failure_code = failure_code;
+                op.attempt_count = op.attempt_count.saturating_add(1);
+                op.last_failed_at = env.ledger().timestamp();
                 env.storage().persistent().set(&DataKey::Operation(id), &op);
+                env.events().publish(
+                    (Symbol::new(&env, "tl_failed"), id),
+                    (failure_code, op.attempt_count),
+                );
                 Err(TimelockError::NotFound) // surface as a generic failure
             }
         }
@@ -421,6 +455,116 @@ impl RefractTimelock {
 
         env.events()
             .publish((Symbol::new(&env, "tl_cancelled"), id), ());
+        Ok(())
+    }
+
+    /// Retry a `Failed` operation once its `eta` has passed and the callee's
+    /// precondition has been fixed.
+    ///
+    /// Permissionless — anyone may retry, mirroring `execute`. The `eta`
+    /// must still have passed; a retry before `eta` is rejected with
+    /// `RetryTooSoon`.  On success the status becomes `Executed`.  On a
+    /// second failure the status stays `Failed` with updated `failure_code`,
+    /// `attempt_count`, and `last_failed_at`.
+    pub fn retry(env: Env, id: u64) -> Result<(), TimelockError> {
+        let mut op: TimelockOperation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Operation(id))
+            .ok_or(TimelockError::NotFound)?;
+
+        if op.status != OperationStatus::Failed {
+            return Err(TimelockError::NotFailed);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < op.eta {
+            return Err(TimelockError::RetryTooSoon);
+        }
+
+        // Optimistically mark Executed before the cross-contract call.
+        op.status = OperationStatus::Executed;
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
+
+        let result = env.try_invoke_contract::<Val, soroban_sdk::InvokeError>(
+            &op.target,
+            &op.function,
+            op.args.clone(),
+        );
+
+        match result {
+            Ok(_) => {
+                env.events()
+                    .publish((Symbol::new(&env, "tl_executed"), id), ());
+                Ok(())
+            }
+            Err(e) => {
+                let failure_code = match &e {
+                    Err(soroban_sdk::InvokeError::Contract(c)) => *c,
+                    _ => 0u32,
+                };
+                op.status = OperationStatus::Failed;
+                op.failure_code = failure_code;
+                op.attempt_count = op.attempt_count.saturating_add(1);
+                op.last_failed_at = env.ledger().timestamp();
+                env.storage().persistent().set(&DataKey::Operation(id), &op);
+                env.events().publish(
+                    (Symbol::new(&env, "tl_failed"), id),
+                    (failure_code, op.attempt_count),
+                );
+                Err(TimelockError::NotFound)
+            }
+        }
+    }
+
+    /// Cancel a `Failed` operation.  Admin-only.  Governance may cancel any
+    /// failed operation after examining why it failed repeatedly, rather than
+    /// leaving it in storage indefinitely.
+    pub fn cancel_failed(env: Env, id: u64) -> Result<(), TimelockError> {
+        Self::require_admin(&env)?;
+
+        let mut op: TimelockOperation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Operation(id))
+            .ok_or(TimelockError::NotFound)?;
+
+        if op.status != OperationStatus::Failed {
+            return Err(TimelockError::NotFailed);
+        }
+
+        op.status = OperationStatus::Cancelled;
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
+
+        env.events()
+            .publish((Symbol::new(&env, "tl_cancelled"), id), ());
+        Ok(())
+    }
+
+    /// Mark a `Pending` operation whose `eta` is past as `Expired`.
+    ///
+    /// Admin-only.  An expired operation can no longer be executed.  This
+    /// provides an on-chain record for operations that were queued but never
+    /// run (e.g. because the precondition changed and the action became
+    /// irrelevant).
+    pub fn expire(env: Env, id: u64) -> Result<(), TimelockError> {
+        Self::require_admin(&env)?;
+
+        let mut op: TimelockOperation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Operation(id))
+            .ok_or(TimelockError::NotFound)?;
+
+        if op.status != OperationStatus::Pending {
+            return Err(TimelockError::AlreadyDone);
+        }
+
+        op.status = OperationStatus::Expired;
+        env.storage().persistent().set(&DataKey::Operation(id), &op);
+
+        env.events()
+            .publish((Symbol::new(&env, "tl_expired"), id), ());
         Ok(())
     }
 
@@ -523,11 +667,23 @@ impl RefractTimelock {
                                 (),
                             );
                         }
-                        Err(_) => {
-                            op.status = OperationStatus::Pending;
+                        Err(e) => {
+                            // Persist as Failed so it is observable and retryable.
+                            let failure_code = match &e {
+                                Err(soroban_sdk::InvokeError::Contract(c)) => *c,
+                                _ => 0u32,
+                            };
+                            op.status = OperationStatus::Failed;
+                            op.failure_code = failure_code;
+                            op.attempt_count = op.attempt_count.saturating_add(1);
+                            op.last_failed_at = env.ledger().timestamp();
                             env.storage()
                                 .persistent()
                                 .set(&DataKey::Operation(id), &op);
+                            env.events().publish(
+                                (Symbol::new(&env, "tl_failed"), id),
+                                (failure_code, op.attempt_count),
+                            );
                             failed += 1;
                         }
                     }

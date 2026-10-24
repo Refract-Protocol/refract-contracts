@@ -1,0 +1,15 @@
+[package]
+name = "refract-bounty"
+version = "0.1.0"
+edition = "2021"
+description = "RefractBountyEscrow — governance-controlled bug bounty with recipient allowlist (issue #244)"
+license = "MIT"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
