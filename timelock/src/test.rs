@@ -199,3 +199,144 @@ fn cancel_after_execute_is_rejected() {
     let res = tl.try_cancel(&id);
     assert_eq!(res, Err(Ok(TimelockError::AlreadyDone)));
 }
+
+// ── Issue #242 — observable failed status and retry ──────────────────────────
+
+mod failing_stub {
+    use soroban_sdk::{contract, contractimpl, Env};
+
+    #[contract]
+    pub struct FailingStub;
+
+    #[contractimpl]
+    impl FailingStub {
+        /// Always panics to simulate a failing cross-contract call.
+        pub fn always_fail(_env: Env) {
+            panic!("intentional failure");
+        }
+    }
+}
+
+#[test]
+fn execute_failing_target_sets_failed_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let tl_id = env.register_contract(None, RefractTimelock);
+    let failing_id = env.register_contract(None, failing_stub::FailingStub);
+    let tl = RefractTimelockClient::new(&env, &tl_id);
+    tl.initialize(&admin, &3600u64);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    let eta = env.ledger().timestamp() + 7_200;
+
+    let id = tl.queue(
+        &failing_id,
+        &Symbol::new(&env, "always_fail"),
+        &Vec::new(&env),
+        &eta,
+    );
+
+    env.ledger().with_mut(|l| l.timestamp = 1_010_000);
+    // execute returns an error but does NOT panic
+    let _ = tl.try_execute(&id);
+
+    let op = tl.get_operation(&id).unwrap();
+    assert_eq!(op.status, OperationStatus::Failed);
+    assert_eq!(op.attempt_count, 1);
+    assert!(op.last_failed_at > 0);
+}
+
+#[test]
+fn retry_non_failed_op_is_rejected() {
+    let (env, admin, tl_id, target) = make_env();
+    let tl = RefractTimelockClient::new(&env, &tl_id);
+    tl.initialize(&admin, &3600u64);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    let eta = env.ledger().timestamp() + 7_200;
+
+    let id = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 1),
+        &eta,
+    );
+
+    // Op is still Pending — retry should be rejected.
+    let res = tl.try_retry(&id);
+    assert_eq!(res, Err(Ok(TimelockError::NotFailed)));
+}
+
+#[test]
+fn cancel_failed_op_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let tl_id = env.register_contract(None, RefractTimelock);
+    let failing_id = env.register_contract(None, failing_stub::FailingStub);
+    let tl = RefractTimelockClient::new(&env, &tl_id);
+    tl.initialize(&admin, &3600u64);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    let eta = env.ledger().timestamp() + 7_200;
+
+    let id = tl.queue(
+        &failing_id,
+        &Symbol::new(&env, "always_fail"),
+        &Vec::new(&env),
+        &eta,
+    );
+
+    env.ledger().with_mut(|l| l.timestamp = 1_010_000);
+    let _ = tl.try_execute(&id);
+
+    // Now cancel the failed op.
+    tl.cancel_failed(&id);
+    let op = tl.get_operation(&id).unwrap();
+    assert_eq!(op.status, OperationStatus::Cancelled);
+}
+
+#[test]
+fn expire_pending_op_succeeds() {
+    let (env, admin, tl_id, target) = make_env();
+    let tl = RefractTimelockClient::new(&env, &tl_id);
+    tl.initialize(&admin, &3600u64);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    let eta = env.ledger().timestamp() + 7_200;
+
+    let id = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 99),
+        &eta,
+    );
+
+    tl.expire(&id);
+    let op = tl.get_operation(&id).unwrap();
+    assert_eq!(op.status, OperationStatus::Expired);
+}
+
+#[test]
+fn expire_executed_op_is_rejected() {
+    let (env, admin, tl_id, target) = make_env();
+    let tl = RefractTimelockClient::new(&env, &tl_id);
+    tl.initialize(&admin, &3600u64);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    let eta = env.ledger().timestamp() + 7_200;
+
+    let id = tl.queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 55),
+        &eta,
+    );
+
+    env.ledger().with_mut(|l| l.timestamp = 1_010_000);
+    tl.execute(&id);
+
+    let res = tl.try_expire(&id);
+    assert_eq!(res, Err(Ok(TimelockError::AlreadyDone)));
+}

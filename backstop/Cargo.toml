@@ -2,11 +2,11 @@
 name = "refract-backstop"
 version = "0.1.0"
 edition = "2021"
-description = "Refract second-loss reinsurance/backstop capital tranche"
+description = "RefractBackstop — second-loss capital with pro-rata share model and protocol-owned seed accounting (issue #243)"
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["lib", "cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }

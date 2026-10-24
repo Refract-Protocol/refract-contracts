@@ -2,12 +2,12 @@
 name = "refract-bounty"
 version = "0.1.0"
 edition = "2021"
-description = "Governance-controlled on-chain bug bounty escrow for Refract"
+description = "RefractBountyEscrow — governance-controlled bug bounty with recipient allowlist (issue #244)"
 license = "MIT"
 
 [lib]
 name = "refract_bounty"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["lib", "cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
