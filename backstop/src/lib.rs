@@ -68,10 +68,36 @@ enum DataKey {
     NextLotId,
     NextLossId,
     UnabsorbedShortfall,
-    CachedCoverage,
+    FeedCap(Symbol),
     FeedExposure(Symbol),
+    HolderFeedExposure(Address, Symbol),
+    PolicyExposure(u64),
+    AggregateFeedExposure,
+    TrackedFeeds,
+    CachedCoverage,
     HealthThresholds,
     HealthAlertState,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedCapConfig {
+    /// Maximum absolute active coverage allowed on this feed (`0` = unlimited).
+    pub max_feed_coverage: i128,
+    /// Maximum active coverage on this feed in basis points of `total_capital` (`0` = unlimited).
+    pub max_feed_coverage_bps: i128,
+    /// Maximum active coverage a single policyholder may hold on this feed (`0` = unlimited).
+    pub max_holder_feed_coverage: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyExposureRecord {
+    pub policy_id: u64,
+    pub holder: Address,
+    pub feed: Symbol,
+    pub amount: i128,
+    pub active: bool,
 }
 
 #[contracttype]
@@ -112,7 +138,11 @@ pub enum BackstopError {
     PendingLossFreeze = 10,
     InvalidPremiumSplit = 11,
     DuplicateLossId = 12,
-    InvalidThreshold = 13,
+    InvalidFeedCap = 13,
+    FeedCapExceeded = 14,
+    HolderFeedCapExceeded = 15,
+    DuplicatePolicyExposure = 16,
+    InvalidThreshold = 17,
 }
 
 /// Admin-configured health thresholds and hysteresis band (in basis points).
@@ -216,6 +246,8 @@ impl RefractBackstop {
         env.storage().instance().set(&DataKey::AllLots, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::NextLossId, &1u64);
         env.storage().instance().set(&DataKey::UnabsorbedShortfall, &0i128);
+        env.storage().instance().set(&DataKey::AggregateFeedExposure, &0i128);
+        env.storage().instance().set(&DataKey::TrackedFeeds, &Vec::<Symbol>::new(&env));
         env.storage().instance().set(&DataKey::CachedCoverage, &0i128);
         env.storage().instance().set(
             &DataKey::HealthThresholds,
@@ -803,36 +835,12 @@ impl RefractBackstop {
         Ok(())
     }
 
-    // ─── Issue #239: Solvency & Coverage-Ratio Health Views ──────────────
+    // ─── Issue #240: Per-Feed Underwriting Exposure Limits & Concentration Caps ──
 
-    /// Pure read-only view returning total staked capital across all tranches.
-    pub fn total_staked_capital(env: Env) -> Result<i128, BackstopError> {
-        Ok(Self::get_state(&env)?.total_capital)
-    }
-
-    /// Pure read-only view returning aggregate in-force coverage pulled from
-    /// `RefractPool::aggregate_in_force_coverage`. Degrades gracefully to the
-    /// cached coverage counter (`DataKey::CachedCoverage`) when the pool
-    /// cross-contract read is unavailable or returns an error.
-    pub fn aggregate_in_force_coverage(env: Env) -> Result<i128, BackstopError> {
-        Self::_read_pool_coverage(&env)
-    }
-
-    /// Pure read-only view returning capital encumbered by in-force coverage
-    /// (`min(total_capital, aggregate_in_force_coverage)`).
-    pub fn encumbered_capital(env: Env) -> Result<i128, BackstopError> {
-        let capital = Self::get_state(&env)?.total_capital.max(0);
-        let coverage = Self::_read_pool_coverage(&env)?.max(0);
-        Ok(capital.min(coverage))
-    }
-
-    /// Pure read-only view returning idle (unencumbered) capital
-    /// (`max(0, total_capital - encumbered_capital)`).
-    pub fn idle_capital(env: Env) -> Result<i128, BackstopError> {
-        let capital = Self::get_state(&env)?.total_capital.max(0);
-        let encumbered = Self::encumbered_capital(env)?;
-        Ok((capital - encumbered).max(0))
-    }
-
-    /// Pure read-only view returning the backstop solvency ratio
-    /// (`
+    /// Configure absolute, relative (bps of `total_capital`), and per-holder
+    /// underwriting exposure caps for `feed`. Admin-gated.
+    ///
+    /// Lowering a cap below the feed's current active exposure is permitted and
+    /// does not invalidate existing in-force policies; it only blocks new policy
+    /// sales on that feed until exposure decays below the new cap.
+    pub fn set_feed

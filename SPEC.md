@@ -555,3 +555,36 @@ Only approved applications create grants. Governance confirms milestones in
 order with `confirm_milestone`; the recipient pulls confirmed funds with
 `claim`.
 
+## 9. Backstop Per-Feed Underwriting Exposure & Concentration Caps (`RefractBackstop`)
+
+[`backstop/src/lib.rs`](./backstop/src/lib.rs) enforces per-feed and per-policyholder
+concentration limits so that no single oracle feed or correlated risk bucket can
+monopolize the backstop's underwriting capacity:
+
+* **Per-Feed & Per-Holder Exposure Ledger:**
+  * `feed_exposure(feed)` tracks active in-force coverage underwritten on a given
+    feed symbol (`depeg`, `crash`, `liq`, `sc_risk`, `flight`, or custom feeds).
+  * `holder_feed_exposure(holder, feed)` tracks active coverage held by a single
+    policyholder on `feed`.
+  * `aggregate_feed_exposure()` maintains the sum of active exposures across all
+    tracked feeds ($\sum_{f \in \text{TrackedFeeds}} \text{feed\_exposure}(f) = \text{aggregate\_feed\_exposure}()$).
+* **Configurable Concentration Caps (`set_feed_cap`):**
+  * `max_feed_coverage`: absolute maximum active coverage on `feed` (`0` = unlimited).
+  * `max_feed_coverage_bps`: relative maximum active coverage on `feed` in basis
+    points of `total_capital` (`0..=10_000`, `0` = unlimited).
+  * `max_holder_feed_coverage`: maximum active coverage a single policyholder may
+    hold on `feed` (`0` = unlimited).
+  * Lowering a cap below current active exposure does **not** invalidate existing
+    in-force policies; it only blocks new policy sales on that feed until active
+    exposure decays below the updated cap.
+* **Policy Lifecycle Enforcement & Idempotent Release:**
+  * `check_exposure_caps` and `record_policy_exposure` reject policy sales that
+    would exceed `max_feed_coverage` or `max_feed_coverage_bps` with
+    `BackstopError::FeedCapExceeded`, or `max_holder_feed_coverage` with
+    `BackstopError::HolderFeedCapExceeded`.
+  * `release_policy_exposure(caller, policy_id)` is idempotent per `policy_id`:
+    once a policy's `PolicyExposureRecord` transitions `active: true -> false`
+    upon claim settlement or expiry, any subsequent release call for the same
+    `policy_id` is a no-op returning `Ok(0)` and never double-decrements exposure.
+
+
