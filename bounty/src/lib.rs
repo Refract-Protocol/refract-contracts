@@ -11,7 +11,7 @@
 //!
 //! ## Issue 276 — Pull-Based Claim Payouts with Per-Recipient Escrow
 //!
-//! In addition to the immediate `award` (push) path, the contract now supports
+//! In addition to the immediate `award` (push) path, the contract supports
 //! a pull-based payout flow:
 //!
 //! 1. `create_payout(...)` — governance creates a per-recipient escrow record
@@ -28,10 +28,53 @@
 //!
 //! Reserve accounting: `available_balance()` returns the pool balance minus
 //! all pending payout records so the same funds cannot be double-committed.
+//!
+//! ## Issue 238 — Payout-Address Indirection for Anonymity-Preserving Claims
+//!
+//! Reporters can claim a bounty without permanently linking their disclosure
+//! submission account to the address that receives the reward:
+//!
+//! 1. `submit_disclosure(submitter, report_hash, commitment)` — binds a
+//!    disclosure `report_hash` to a `commitment = SHA-256(preimage)` rather
+//!    than the submitter's address. Commitments cannot be reused across
+//!    reports.
+//! 2. `register_payout_address(owner, preimage, payout_address)` — proves
+//!    knowledge of `preimage` (preventing registration front-running) and
+//!    binds `commitment = SHA-256(preimage)` to `payout_address` with a
+//!    bounded TTL (`DEFAULT_BINDING_TTL_SECS`).
+//! 3. `award_commitment(caller, report_hash, commitment, amount)` — governance
+//!    adjudicates and reserves `amount` in the `Awarded` ledger state against
+//!    `commitment`, without knowing or revealing the payout address.
+//! 4. `rotate_payout_address(owner, preimage, new_payout_address)` — rotates
+//!    the destination address before claim, atomically revoking the prior
+//!    binding so two addresses can never claim the same award.
+//! 5. `claim_by_commitment(caller, preimage)` — reveals `preimage`, transitions
+//!    the commitment award from `Awarded` to `Claimed`, and transfers the
+//!    reward to the currently bound `payout_address`.
+//! 6. `freeze_payout_address(caller, address, frozen)` — governance can freeze
+//!    a payout address flagged as compromised without altering the awarded
+//!    reward amount; the binding owner can rotate to an uncompromised address
+//!    before claiming.
+//!
+//! **Lost-key policy:** A lost `preimage` or `owner` key is a permanent,
+//! unrecoverable loss of the ability to claim or rotate that commitment. There
+//! is intentionally no admin override capable of redirecting an awarded
+//! commitment payout.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Default lifetime of a payout-address binding (30 days in ledger seconds).
+pub const DEFAULT_BINDING_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Persistent storage TTL threshold in ledgers (~1 day at 5s/ledger).
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
+
+/// Persistent storage TTL extension in ledgers (~30 days at 5s/ledger).
+pub const PERSISTENT_TTL_EXTEND: u32 = 518_400;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -43,9 +86,10 @@ pub enum DataKey {
     /// The token used to fund and pay out bounties.
     Token,
     /// Running total of funds currently held in escrow (includes pending
-    /// pull-payout reserves).
+    /// pull-payout and commitment-award reserves).
     Balance,
-    /// Total amount currently reserved in pending pull-payout records.
+    /// Total amount currently reserved in pending pull-payout and
+    /// commitment-award records.
     Reserved,
     /// Monotonic counter for payout ids.
     NextPayoutId,
@@ -53,6 +97,16 @@ pub enum DataKey {
     Award(BytesN<32>),
     /// Pull-based payout escrow record.
     Payout(u64),
+    /// Payout-address binding keyed by `commitment = SHA-256(preimage)`.
+    PayoutBinding(BytesN<32>),
+    /// Disclosure commitment keyed by `report_hash`.
+    DisclosureCommitment(BytesN<32>),
+    /// Awarded commitment record keyed by `commitment`.
+    CommitmentAward(BytesN<32>),
+    /// Tracks whether a `commitment` has already been bound to a disclosure or award.
+    UsedCommitment(BytesN<32>),
+    /// Tracks whether a payout address is frozen as compromised.
+    FrozenAddress(Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -98,6 +152,47 @@ pub struct PayoutRecord {
     pub status: PayoutStatus,
 }
 
+/// Ledger state of an anonymity-preserving commitment award (Issue 238).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CommitmentAwardStatus {
+    /// Adjudicated and reserved against the commitment; preimage not yet revealed.
+    Awarded = 0,
+    /// Preimage verified and reward paid to the bound payout address.
+    Claimed = 1,
+}
+
+/// Binding between a commitment (`SHA-256(preimage)`) and a rotatable payout address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutBindingRecord {
+    /// Controller authorized to rotate the payout address or trigger a claim.
+    pub owner: Address,
+    /// Current destination address that receives funds when claimed.
+    pub payout_address: Address,
+    /// Ledger timestamp when the binding was created or last rotated.
+    pub registered_at: u64,
+    /// Ledger timestamp after which the binding is considered expired until refreshed/rotated.
+    pub expires_at: u64,
+}
+
+/// Escrow record for a reward adjudicated against a disclosure commitment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitmentAwardRecord {
+    /// SHA-256 commitment to the vulnerability report.
+    pub report_hash: BytesN<32>,
+    /// Payout commitment (`SHA-256(preimage)`) bound at disclosure/award time.
+    pub commitment: BytesN<32>,
+    /// Reserved reward amount.
+    pub amount: i128,
+    /// Ledger timestamp when the award was approved.
+    pub awarded_at: u64,
+    /// Current state (`Awarded` vs `Claimed`).
+    pub status: CommitmentAwardStatus,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -114,12 +209,26 @@ pub enum BountyError {
     PayoutNotFound = 7,
     /// Caller is not the payout recipient.
     NotRecipient = 8,
-    /// Payout is not in Pending status.
+    /// Payout is not in Pending/Awarded status.
     PayoutAlreadySettled = 9,
     /// Sweep called before the deadline.
     DeadlineNotReached = 10,
     /// Payout deadline must be in the future.
     InvalidDeadline = 11,
+    /// Commitment was already registered or bound to another report.
+    CommitmentAlreadyUsed = 12,
+    /// No payout-address binding found for the commitment.
+    BindingNotFound = 13,
+    /// Payout-address binding TTL has expired.
+    BindingExpired = 14,
+    /// Caller is not the owner of the payout-address binding.
+    NotBindingOwner = 15,
+    /// Preimage does not match any awarded commitment.
+    InvalidPreimage = 16,
+    /// Payout address is currently frozen by governance as compromised.
+    AddressFrozen = 17,
+    /// Commitment does not match the commitment recorded at disclosure time.
+    CommitmentMismatch = 18,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -129,7 +238,7 @@ pub struct RefractBountyEscrow;
 
 #[contractimpl]
 impl RefractBountyEscrow {
-    // ─── Initialization ───────────────────────────────────────────────────
+    // ─── Initialization & Governance ──────────────────────────────────────
 
     /// One-time initialization wiring the governance/timelock address and the
     /// token used for funding and payouts.
@@ -142,6 +251,23 @@ impl RefractBountyEscrow {
         env.storage().instance().set(&DataKey::Balance, &0i128);
         env.storage().instance().set(&DataKey::Reserved, &0i128);
         env.storage().instance().set(&DataKey::NextPayoutId, &0u64);
+        Ok(())
+    }
+
+    /// Rotate the governance/timelock address. Callable strictly by current governance.
+    pub fn set_governance(
+        env: Env,
+        caller: Address,
+        new_governance: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &new_governance);
         Ok(())
     }
 
@@ -207,9 +333,9 @@ impl RefractBountyEscrow {
             report_hash: report_hash.clone(),
             timestamp: env.ledger().timestamp(),
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Award(report_hash), &record);
+        let award_key = DataKey::Award(report_hash);
+        env.storage().persistent().set(&award_key, &record);
+        Self::bump_persistent(&env, &award_key);
         Ok(())
     }
 
@@ -268,9 +394,9 @@ impl RefractBountyEscrow {
             deadline,
             status: PayoutStatus::Pending,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payout(payout_id), &record);
+        let payout_key = DataKey::Payout(payout_id);
+        env.storage().persistent().set(&payout_key, &record);
+        Self::bump_persistent(&env, &payout_key);
 
         env.events().publish(
             (symbol_short!("p_created"), payout_id),
@@ -287,10 +413,11 @@ impl RefractBountyEscrow {
     pub fn claim(env: Env, recipient: Address, payout_id: u64) -> Result<i128, BountyError> {
         recipient.require_auth();
 
+        let payout_key = DataKey::Payout(payout_id);
         let mut record: PayoutRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::Payout(payout_id))
+            .get(&payout_key)
             .ok_or(BountyError::PayoutNotFound)?;
 
         if record.recipient != recipient {
@@ -304,9 +431,8 @@ impl RefractBountyEscrow {
 
         // Update state before transfer (reentrancy guard).
         record.status = PayoutStatus::Claimed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payout(payout_id), &record);
+        env.storage().persistent().set(&payout_key, &record);
+        Self::bump_persistent(&env, &payout_key);
 
         // Release reservation.
         let reserved = Self::raw_reserved(&env)?;
@@ -339,10 +465,11 @@ impl RefractBountyEscrow {
     /// `PayoutAlreadySettled`. A second sweep call also returns
     /// `PayoutAlreadySettled` (idempotent guard).
     pub fn sweep_expired(env: Env, payout_id: u64) -> Result<i128, BountyError> {
+        let payout_key = DataKey::Payout(payout_id);
         let mut record: PayoutRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::Payout(payout_id))
+            .get(&payout_key)
             .ok_or(BountyError::PayoutNotFound)?;
 
         let now = env.ledger().timestamp();
@@ -358,9 +485,8 @@ impl RefractBountyEscrow {
 
         // Update state before transfer.
         record.status = PayoutStatus::Swept;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payout(payout_id), &record);
+        env.storage().persistent().set(&payout_key, &record);
+        Self::bump_persistent(&env, &payout_key);
 
         // Release reservation.
         let reserved = Self::raw_reserved(&env)?;
@@ -386,6 +512,322 @@ impl RefractBountyEscrow {
             (governance, amount),
         );
         Ok(amount)
+    }
+
+    // ─── Payout-Address Indirection (Issue 238) ───────────────────────────
+
+    /// Compute the SHA-256 payout commitment for a 32-byte secret `preimage`.
+    pub fn compute_commitment(env: Env, preimage: BytesN<32>) -> BytesN<32> {
+        Self::hash_preimage(&env, &preimage)
+    }
+
+    /// File a vulnerability disclosure commitment bound to a payout `commitment`
+    /// rather than the submitter's funding address.
+    ///
+    /// Rejects duplicate `report_hash` submissions and rejects any `commitment`
+    /// already used for another disclosure or award.
+    pub fn submit_disclosure(
+        env: Env,
+        submitter: Address,
+        report_hash: BytesN<32>,
+        commitment: BytesN<32>,
+    ) -> Result<(), BountyError> {
+        submitter.require_auth();
+        let _ = Self::governance_addr(&env)?;
+
+        let disc_key = DataKey::DisclosureCommitment(report_hash.clone());
+        if env.storage().persistent().has(&disc_key)
+            || env.storage().persistent().has(&DataKey::Award(report_hash.clone()))
+        {
+            return Err(BountyError::DuplicateReport);
+        }
+
+        let used_key = DataKey::UsedCommitment(commitment.clone());
+        if env.storage().persistent().has(&used_key) {
+            return Err(BountyError::CommitmentAlreadyUsed);
+        }
+
+        env.storage().persistent().set(&disc_key, &commitment);
+        Self::bump_persistent(&env, &disc_key);
+
+        env.storage().persistent().set(&used_key, &true);
+        Self::bump_persistent(&env, &used_key);
+
+        env.events()
+            .publish((symbol_short!("d_submit"), report_hash), commitment);
+        Ok(())
+    }
+
+    /// Register a payout address against a secret `preimage`, binding
+    /// `commitment = SHA-256(preimage)` to `payout_address`.
+    ///
+    /// Requiring `preimage` at registration prevents front-running even if
+    /// `commitment` has already appeared on-chain in a disclosure or award.
+    pub fn register_payout_address(
+        env: Env,
+        owner: Address,
+        preimage: BytesN<32>,
+        payout_address: Address,
+    ) -> Result<BytesN<32>, BountyError> {
+        owner.require_auth();
+        let _ = Self::governance_addr(&env)?;
+
+        if Self::is_address_frozen(&env, &payout_address) {
+            return Err(BountyError::AddressFrozen);
+        }
+
+        let commitment = Self::hash_preimage(&env, &preimage);
+        let binding_key = DataKey::PayoutBinding(commitment.clone());
+        if env.storage().persistent().has(&binding_key) {
+            return Err(BountyError::CommitmentAlreadyUsed);
+        }
+
+        let now = env.ledger().timestamp();
+        let record = PayoutBindingRecord {
+            owner: owner.clone(),
+            payout_address: payout_address.clone(),
+            registered_at: now,
+            expires_at: now.saturating_add(DEFAULT_BINDING_TTL_SECS),
+        };
+        env.storage().persistent().set(&binding_key, &record);
+        Self::bump_persistent(&env, &binding_key);
+
+        env.events().publish(
+            (symbol_short!("p_reg"), commitment.clone()),
+            (owner, payout_address),
+        );
+        Ok(commitment)
+    }
+
+    /// Rotate the payout address bound to `commitment = SHA-256(preimage)` before
+    /// the award is claimed, atomically revoking the previous payout address.
+    pub fn rotate_payout_address(
+        env: Env,
+        owner: Address,
+        preimage: BytesN<32>,
+        new_payout_address: Address,
+    ) -> Result<(), BountyError> {
+        owner.require_auth();
+        let _ = Self::governance_addr(&env)?;
+
+        if Self::is_address_frozen(&env, &new_payout_address) {
+            return Err(BountyError::AddressFrozen);
+        }
+
+        let commitment = Self::hash_preimage(&env, &preimage);
+        let binding_key = DataKey::PayoutBinding(commitment.clone());
+        let mut binding: PayoutBindingRecord = env
+            .storage()
+            .persistent()
+            .get(&binding_key)
+            .ok_or(BountyError::BindingNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now > binding.expires_at {
+            return Err(BountyError::BindingExpired);
+        }
+        if binding.owner != owner {
+            return Err(BountyError::NotBindingOwner);
+        }
+
+        let award_key = DataKey::CommitmentAward(commitment.clone());
+        if let Some(award) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, CommitmentAwardRecord>(&award_key)
+        {
+            if award.status != CommitmentAwardStatus::Awarded {
+                return Err(BountyError::PayoutAlreadySettled);
+            }
+        }
+
+        let old_payout = binding.payout_address.clone();
+        binding.payout_address = new_payout_address.clone();
+        binding.registered_at = now;
+        binding.expires_at = now.saturating_add(DEFAULT_BINDING_TTL_SECS);
+
+        env.storage().persistent().set(&binding_key, &binding);
+        Self::bump_persistent(&env, &binding_key);
+
+        env.events().publish(
+            (symbol_short!("p_rotate"), commitment),
+            (old_payout, new_payout_address),
+        );
+        Ok(())
+    }
+
+    /// Adjudicate a disclosure and reserve `amount` in the `Awarded` state
+    /// against `commitment` rather than the submitter's identity.
+    pub fn award_commitment(
+        env: Env,
+        caller: Address,
+        report_hash: BytesN<32>,
+        commitment: BytesN<32>,
+        amount: i128,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(BountyError::InvalidAmount);
+        }
+        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+            return Err(BountyError::DuplicateReport);
+        }
+
+        let award_key = DataKey::CommitmentAward(commitment.clone());
+        if env.storage().persistent().has(&award_key) {
+            return Err(BountyError::DuplicateReport);
+        }
+
+        let disc_key = DataKey::DisclosureCommitment(report_hash.clone());
+        if let Some(recorded_commitment) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BytesN<32>>(&disc_key)
+        {
+            if recorded_commitment != commitment {
+                return Err(BountyError::CommitmentMismatch);
+            }
+            Self::bump_persistent(&env, &disc_key);
+        } else {
+            let used_key = DataKey::UsedCommitment(commitment.clone());
+            if env.storage().persistent().has(&used_key) {
+                return Err(BountyError::CommitmentAlreadyUsed);
+            }
+            env.storage().persistent().set(&disc_key, &commitment);
+            Self::bump_persistent(&env, &disc_key);
+            env.storage().persistent().set(&used_key, &true);
+            Self::bump_persistent(&env, &used_key);
+        }
+
+        if amount > Self::available_balance_inner(&env)? {
+            return Err(BountyError::InsufficientBalance);
+        }
+
+        let reserved = Self::raw_reserved(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Reserved, &(reserved + amount));
+
+        let record = CommitmentAwardRecord {
+            report_hash: report_hash.clone(),
+            commitment: commitment.clone(),
+            amount,
+            awarded_at: env.ledger().timestamp(),
+            status: CommitmentAwardStatus::Awarded,
+        };
+        env.storage().persistent().set(&award_key, &record);
+        Self::bump_persistent(&env, &award_key);
+
+        env.events()
+            .publish((symbol_short!("c_award"), commitment), (report_hash, amount));
+        Ok(())
+    }
+
+    /// Claim an awarded bounty by presenting the secret `preimage` for the
+    /// commitment and paying the currently registered (and non-frozen) payout
+    /// address.
+    pub fn claim_by_commitment(
+        env: Env,
+        caller: Address,
+        preimage: BytesN<32>,
+    ) -> Result<i128, BountyError> {
+        caller.require_auth();
+        let _ = Self::governance_addr(&env)?;
+
+        let commitment = Self::hash_preimage(&env, &preimage);
+        let award_key = DataKey::CommitmentAward(commitment.clone());
+        let mut award: CommitmentAwardRecord = env
+            .storage()
+            .persistent()
+            .get(&award_key)
+            .ok_or(BountyError::InvalidPreimage)?;
+
+        if award.status != CommitmentAwardStatus::Awarded {
+            return Err(BountyError::PayoutAlreadySettled);
+        }
+
+        let binding_key = DataKey::PayoutBinding(commitment.clone());
+        let binding: PayoutBindingRecord = env
+            .storage()
+            .persistent()
+            .get(&binding_key)
+            .ok_or(BountyError::BindingNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now > binding.expires_at {
+            return Err(BountyError::BindingExpired);
+        }
+        if caller != binding.owner && caller != binding.payout_address {
+            return Err(BountyError::Unauthorized);
+        }
+        if Self::is_address_frozen(&env, &binding.payout_address) {
+            return Err(BountyError::AddressFrozen);
+        }
+
+        let amount = award.amount;
+        award.status = CommitmentAwardStatus::Claimed;
+        env.storage().persistent().set(&award_key, &award);
+        Self::bump_persistent(&env, &award_key);
+
+        let reserved = Self::raw_reserved(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Reserved, &(reserved - amount));
+
+        let balance = Self::raw_balance(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance, &(balance - amount));
+
+        let settled_record = AwardRecord {
+            researcher: binding.payout_address.clone(),
+            amount,
+            report_hash: award.report_hash.clone(),
+            timestamp: now,
+        };
+        let settled_key = DataKey::Award(award.report_hash);
+        env.storage().persistent().set(&settled_key, &settled_record);
+        Self::bump_persistent(&env, &settled_key);
+
+        let token = Self::token_addr(&env)?;
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &binding.payout_address,
+            &amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("c_claim"), commitment),
+            (binding.payout_address, amount),
+        );
+        Ok(amount)
+    }
+
+    /// Freeze or unfreeze a payout address flagged as compromised without
+    /// altering any awarded reward amount. Governance-gated.
+    pub fn freeze_payout_address(
+        env: Env,
+        caller: Address,
+        address: Address,
+        frozen: bool,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+
+        let freeze_key = DataKey::FrozenAddress(address.clone());
+        env.storage().persistent().set(&freeze_key, &frozen);
+        Self::bump_persistent(&env, &freeze_key);
+
+        env.events()
+            .publish((symbol_short!("p_freeze"), address), frozen);
+        Ok(())
     }
 
     // ─── Read-only views ──────────────────────────────────────────────────
@@ -415,7 +857,50 @@ impl RefractBountyEscrow {
         env.storage().persistent().get(&DataKey::Payout(payout_id))
     }
 
+    /// Registered payout-address binding for a commitment, if any.
+    pub fn get_payout_binding(env: Env, commitment: BytesN<32>) -> Option<PayoutBindingRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayoutBinding(commitment))
+    }
+
+    /// Commitment-award record for a commitment, if any.
+    pub fn get_commitment_award(env: Env, commitment: BytesN<32>) -> Option<CommitmentAwardRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CommitmentAward(commitment))
+    }
+
+    /// Commitment bound to a disclosure `report_hash`, if any.
+    pub fn get_disclosure_commitment(env: Env, report_hash: BytesN<32>) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisclosureCommitment(report_hash))
+    }
+
+    /// Returns whether a payout address is currently frozen as compromised.
+    pub fn is_payout_address_frozen(env: Env, address: Address) -> bool {
+        Self::is_address_frozen(&env, &address)
+    }
+
     // ─── Private helpers ──────────────────────────────────────────────────
+
+    fn hash_preimage(env: &Env, preimage: &BytesN<32>) -> BytesN<32> {
+        env.crypto().sha256(&preimage.clone().into()).into()
+    }
+
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    }
+
+    fn is_address_frozen(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FrozenAddress(address.clone()))
+            .unwrap_or(false)
+    }
 
     fn governance_addr(env: &Env) -> Result<Address, BountyError> {
         env.storage()

@@ -17,13 +17,54 @@
 
 #![no_std]
 
+//! # RefractBackstop
+//!
+//! First-loss insurance backstop tranche for `RefractPool`.
+//!
+//! ## Solvency & Coverage-Ratio Health Views (#239)
+//!
+//! Operators and the monitoring backend can inspect live backstop health via
+//! pure, read-only views and trigger hysteresis-guarded threshold alerts:
+//!
+//! - [`RefractBackstop::total_staked_capital`]: total capital currently staked.
+//! - [`RefractBackstop::encumbered_capital`] & [`RefractBackstop::idle_capital`]:
+//!   capital encumbered by in-force pool coverage vs unencumbered idle capital.
+//! - [`RefractBackstop::aggregate_in_force_coverage`]: pulls aggregate active
+//!   coverage from `RefractPool::aggregate_in_force_coverage` via
+//!   `try_invoke_contract`, degrading gracefully to cached coverage if the
+//!   cross-contract read is unavailable.
+//! - [`RefractBackstop::solvency_ratio_bps`]: `total_capital / coverage` in
+//!   basis points (computed via 1e7 fixed-point helper); returns `None` when
+//!   in-force coverage is zero.
+//! - [`RefractBackstop::coverage_ratio_bps`]: `coverage / total_capital` in
+//!   basis points; returns `None` when staked capital is zero.
+//! - [`RefractBackstop::feed_utilization_bps`]: per-feed coverage utilization
+//!   against backstop capital in basis points; returns `None` when staked
+//!   capital is zero.
+//! - [`RefractBackstop::check_health`]: permissionless entrypoint that compares
+//!   live ratios against admin-configured [`HealthThresholds`] and emits
+//!   `HLTHALRT` / `HLTHRECV` events only on threshold crossings with
+//!   hysteresis.
+
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    IntoVal, Symbol, Vec,
 };
 
-/// Basis-point denominator used for premium-share configuration.
+/// Basis-point denominator used for premium-share and ratio configuration.
 const BPS_DENOM: i128 = 10_000;
+
+/// 1e7 fixed-point scaling factor used for intermediate ratio math.
+const FP_SCALE: i128 = 10_000_000;
+
+/// Default minimum solvency ratio threshold in basis points (100% = 10,000 bps).
+pub const DEFAULT_MIN_SOLVENCY_BPS: i128 = 10_000;
+
+/// Default maximum coverage-to-capital ratio threshold in basis points (100% = 10,000 bps).
+pub const DEFAULT_MAX_COVERAGE_BPS: i128 = 10_000;
+
+/// Default hysteresis band in basis points (5% = 500 bps) required to clear an active alert.
+pub const DEFAULT_HYSTERESIS_BPS: i128 = 500;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +88,10 @@ enum DataKey {
     NextLossId,
     UnabsorbedShortfall,
     ReentrancyLock,
+    CachedCoverage,
+    FeedExposure(Symbol),
+    HealthThresholds,
+    HealthAlertState,
 }
 
 #[contracttype]
@@ -88,6 +133,41 @@ pub enum BackstopError {
     InvalidPremiumSplit = 11,
     DuplicateLossId = 12,
     ReentrancyDetected = 13,
+    InvalidThreshold = 14,
+}
+
+/// Admin-configured health thresholds and hysteresis band (in basis points).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthThresholds {
+    /// Alert triggers when `solvency_ratio_bps < min_solvency_bps` and clears
+    /// when `solvency_ratio_bps >= min_solvency_bps + hysteresis_bps`.
+    pub min_solvency_bps: i128,
+    /// Alert triggers when `coverage_ratio_bps > max_coverage_bps` and clears
+    /// when `coverage_ratio_bps <= max_coverage_bps - hysteresis_bps`.
+    pub max_coverage_bps: i128,
+    /// Hysteresis band (in bps) preventing repeated event spam near the boundary.
+    pub hysteresis_bps: i128,
+}
+
+/// Latched alert state persisted across `check_health` calls.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthAlertState {
+    pub solvency_breached: bool,
+    pub coverage_breached: bool,
+}
+
+/// Pure read-only health snapshot of the backstop tranche.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopHealthSnapshot {
+    pub total_capital: i128,
+    pub encumbered_capital: i128,
+    pub idle_capital: i128,
+    pub aggregate_coverage: i128,
+    pub solvency_ratio_bps: Option<i128>,
+    pub coverage_ratio_bps: Option<i128>,
 }
 
 #[contracttype]
@@ -157,6 +237,22 @@ impl RefractBackstop {
         env.storage().instance().set(&DataKey::AllLots, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::NextLossId, &1u64);
         env.storage().instance().set(&DataKey::UnabsorbedShortfall, &0i128);
+        env.storage().instance().set(&DataKey::CachedCoverage, &0i128);
+        env.storage().instance().set(
+            &DataKey::HealthThresholds,
+            &HealthThresholds {
+                min_solvency_bps: DEFAULT_MIN_SOLVENCY_BPS,
+                max_coverage_bps: DEFAULT_MAX_COVERAGE_BPS,
+                hysteresis_bps: DEFAULT_HYSTERESIS_BPS,
+            },
+        );
+        env.storage().instance().set(
+            &DataKey::HealthAlertState,
+            &HealthAlertState {
+                solvency_breached: false,
+                coverage_breached: false,
+            },
+        );
         for tranche in [Tranche::Junior, Tranche::Senior] {
             env.storage().instance().set(
                 &DataKey::TrancheState(tranche),
@@ -727,27 +823,4 @@ impl RefractBackstop {
     /// Update the contract administrator. Admin-gated.
     pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), BackstopError> {
         caller.require_auth();
-        let mut config = Self::get_config(&env)?;
-        if caller != config.admin {
-            return Err(BackstopError::Unauthorized);
-        }
-        config.admin = new_admin;
-        env.storage().instance().set(&"config", &config);
-        Ok(())
-    }
-
-    /// Update the authorized pool address. Admin-gated.
-    pub fn set_pool(env: Env, caller: Address, new_pool: Address) -> Result<(), BackstopError> {
-        caller.require_auth();
-        let mut config = Self::get_config(&env)?;
-        if caller != config.admin {
-            return Err(BackstopError::Unauthorized);
-        }
-        config.pool = new_pool;
-        env.storage().instance().set(&"config", &config);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod test;
+        let mut
