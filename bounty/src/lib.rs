@@ -76,6 +76,24 @@ pub const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
 /// Persistent storage TTL extension in ledgers (~30 days at 5s/ledger).
 pub const PERSISTENT_TTL_EXTEND: u32 = 518_400;
 
+// ── Allowlist helpers ─────────────────────────────────────────────────────────
+//
+// The bounty contract stores its own recipient-status entries rather than
+// calling a separate allowlist contract, keeping the dependency graph simple.
+// The `common::allowlist` module is designed to live inside the host contract's
+// persistent storage; we use it directly here.
+
+/// Screening status for a payout recipient (issue #244).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ScreeningStatus {
+    /// Governance-approved; may receive funds.
+    Allowed = 0,
+    /// Explicitly blocked; may NOT receive funds.
+    Blocked = 1,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -97,6 +115,9 @@ pub enum DataKey {
     Award(BytesN<32>),
     /// Pull-based payout escrow record.
     Payout(u64),
+    /// Screening status for a recipient address (issue #244).
+    /// Maps `Address → ScreeningStatus` — see `common::allowlist`.
+    RecipientStatus(Address),
     /// Payout-address binding keyed by `commitment = SHA-256(preimage)`.
     PayoutBinding(BytesN<32>),
     /// Disclosure commitment keyed by `report_hash`.
@@ -215,20 +236,23 @@ pub enum BountyError {
     DeadlineNotReached = 10,
     /// Payout deadline must be in the future.
     InvalidDeadline = 11,
+    /// The destination address has not been screened and allowlisted by
+    /// governance (issue #244).
+    RecipientNotAllowed = 12,
     /// Commitment was already registered or bound to another report.
-    CommitmentAlreadyUsed = 12,
+    CommitmentAlreadyUsed = 13,
     /// No payout-address binding found for the commitment.
-    BindingNotFound = 13,
+    BindingNotFound = 14,
     /// Payout-address binding TTL has expired.
-    BindingExpired = 14,
+    BindingExpired = 15,
     /// Caller is not the owner of the payout-address binding.
-    NotBindingOwner = 15,
+    NotBindingOwner = 16,
     /// Preimage does not match any awarded commitment.
-    InvalidPreimage = 16,
+    InvalidPreimage = 17,
     /// Payout address is currently frozen by governance as compromised.
-    AddressFrozen = 17,
+    AddressFrozen = 18,
     /// Commitment does not match the commitment recorded at disclosure time.
-    CommitmentMismatch = 18,
+    CommitmentMismatch = 19,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -310,6 +334,11 @@ impl RefractBountyEscrow {
         if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
             return Err(BountyError::DuplicateReport);
         }
+        // Reject payouts to addresses that have not been screened by governance
+        // (issue #244).
+        if !Self::is_recipient_allowed_inner(&env, &researcher) {
+            return Err(BountyError::RecipientNotAllowed);
+        }
         // Must not exceed available (unreserved) balance.
         if amount > Self::available_balance_inner(&env)? {
             return Err(BountyError::InsufficientBalance);
@@ -366,6 +395,10 @@ impl RefractBountyEscrow {
         let now = env.ledger().timestamp();
         if deadline <= now {
             return Err(BountyError::InvalidDeadline);
+        }
+        // Reject payouts to addresses that have not been screened (issue #244).
+        if !Self::is_recipient_allowed_inner(&env, &recipient) {
+            return Err(BountyError::RecipientNotAllowed);
         }
         if amount > Self::available_balance_inner(&env)? {
             return Err(BountyError::InsufficientBalance);
@@ -865,78 +898,4 @@ impl RefractBountyEscrow {
     }
 
     /// Commitment-award record for a commitment, if any.
-    pub fn get_commitment_award(env: Env, commitment: BytesN<32>) -> Option<CommitmentAwardRecord> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::CommitmentAward(commitment))
-    }
-
-    /// Commitment bound to a disclosure `report_hash`, if any.
-    pub fn get_disclosure_commitment(env: Env, report_hash: BytesN<32>) -> Option<BytesN<32>> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::DisclosureCommitment(report_hash))
-    }
-
-    /// Returns whether a payout address is currently frozen as compromised.
-    pub fn is_payout_address_frozen(env: Env, address: Address) -> bool {
-        Self::is_address_frozen(&env, &address)
-    }
-
-    // ─── Private helpers ──────────────────────────────────────────────────
-
-    fn hash_preimage(env: &Env, preimage: &BytesN<32>) -> BytesN<32> {
-        env.crypto().sha256(&preimage.clone().into()).into()
-    }
-
-    fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage()
-            .persistent()
-            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
-    }
-
-    fn is_address_frozen(env: &Env, address: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::FrozenAddress(address.clone()))
-            .unwrap_or(false)
-    }
-
-    fn governance_addr(env: &Env) -> Result<Address, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Governance)
-            .ok_or(BountyError::NotInitialized)
-    }
-
-    fn token_addr(env: &Env) -> Result<Address, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Token)
-            .ok_or(BountyError::NotInitialized)
-    }
-
-    fn raw_balance(env: &Env) -> Result<i128, BountyError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Balance)
-            .ok_or(BountyError::NotInitialized)
-    }
-
-    fn raw_reserved(env: &Env) -> Result<i128, BountyError> {
-        Ok(env
-            .storage()
-            .instance()
-            .get(&DataKey::Reserved)
-            .unwrap_or(0i128))
-    }
-
-    fn available_balance_inner(env: &Env) -> Result<i128, BountyError> {
-        let balance = Self::raw_balance(env)?;
-        let reserved = Self::raw_reserved(env)?;
-        Ok(balance - reserved)
-    }
-}
-
-#[cfg(test)]
-mod test;
+    pub fn get_commitment_award(env: Env, commitment: BytesN<

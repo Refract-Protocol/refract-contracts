@@ -4,8 +4,19 @@ mod fee;
 mod ttl;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec,
 };
+
+/// Screening status for a grant recipient (issue #244).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ScreeningStatus {
+    /// Governance-approved; may receive grant funds.
+    Allowed = 0,
+    /// Explicitly blocked; may NOT receive grant funds.
+    Blocked = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +53,8 @@ pub enum DataKey {
     Treasury,
     Grant(u64),
     AccruedFees(Address),
+    /// Screening status for a grant recipient (issue #244).
+    RecipientStatus(Address),
     ReentrancyLock,
 }
 
@@ -76,7 +89,10 @@ pub enum GrantsError {
     ArithmeticError = 17,
     BatchTooLarge = 18,
     KeyNotBumpable = 19,
-    ReentrancyDetected = 20,
+    /// The grant recipient has not been screened and allowlisted by governance
+    /// (issue #244).
+    RecipientNotAllowed = 20,
+    ReentrancyDetected = 21,
 }
 
 #[contract]
@@ -132,6 +148,10 @@ impl RefractGrants {
         }
         if milestone_amounts.is_empty() {
             return Err(GrantsError::NoMilestones);
+        }
+        // Reject grants to recipients not screened by governance (issue #244).
+        if !Self::is_recipient_allowed_inner(&env, &recipient) {
+            return Err(GrantsError::RecipientNotAllowed);
         }
 
         let mut sum = 0i128;
@@ -410,6 +430,76 @@ impl RefractGrants {
 
     pub fn get_grant(env: Env, grant_id: u64) -> Option<OnchainGrant> {
         env.storage().persistent().get(&DataKey::Grant(grant_id))
+    }
+
+    // ─── Recipient allowlist (issue #244) ─────────────────────────────────
+
+    /// Allow `recipient` to receive grants. Governance/timelock-gated.
+    pub fn allow_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), GrantsError> {
+        Self::require_governance(&env, &caller)?;
+        env.storage().persistent().set(
+            &DataKey::RecipientStatus(recipient.clone()),
+            &ScreeningStatus::Allowed,
+        );
+        env.events()
+            .publish((symbol_short!("al_allow"),), recipient);
+        Ok(())
+    }
+
+    /// Block `recipient` from receiving grants. Governance/timelock-gated.
+    pub fn block_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), GrantsError> {
+        Self::require_governance(&env, &caller)?;
+        env.storage().persistent().set(
+            &DataKey::RecipientStatus(recipient.clone()),
+            &ScreeningStatus::Blocked,
+        );
+        env.events()
+            .publish((symbol_short!("al_block"),), recipient);
+        Ok(())
+    }
+
+    /// Remove the screening record for `recipient`. Governance/timelock-gated.
+    pub fn remove_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), GrantsError> {
+        Self::require_governance(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RecipientStatus(recipient.clone()));
+        env.events()
+            .publish((symbol_short!("al_remove"),), recipient);
+        Ok(())
+    }
+
+    /// Return the screening status of `recipient`, if any.
+    pub fn recipient_status(env: Env, recipient: Address) -> Option<ScreeningStatus> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecipientStatus(recipient))
+    }
+
+    /// Return `true` iff `recipient` is currently `Allowed`.
+    pub fn is_recipient_allowed(env: Env, recipient: Address) -> bool {
+        Self::is_recipient_allowed_inner(&env, &recipient)
+    }
+
+    fn is_recipient_allowed_inner(env: &Env, recipient: &Address) -> bool {
+        matches!(
+            env.storage()
+                .persistent()
+                .get::<DataKey, ScreeningStatus>(&DataKey::RecipientStatus(recipient.clone())),
+            Some(ScreeningStatus::Allowed)
+        )
     }
 
     fn governance(env: &Env) -> Result<Address, GrantsError> {

@@ -2,14 +2,17 @@
 name = "refract-grants"
 version = "0.1.0"
 edition = "2021"
+description = "RefractGrants — milestone-based grants with recipient allowlist (issue #244)"
+license = "MIT"
 
 [lib]
 name = "refract_grants"
 path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
-soroban-sdk = "21.0.0"
+soroban-sdk = { workspace = true }
 sha2 = "0.10"
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
