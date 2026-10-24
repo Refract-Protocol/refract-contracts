@@ -144,6 +144,8 @@
 // tool where panicking on a malformed budget file is the right behaviour.
 #![allow(clippy::disallowed_methods)]
 
+pub mod operator;
+
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -163,11 +165,26 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("authz-matrix") => authz_matrix(),
         Some("budget-check") => budget_check(args.iter().any(|a| a == "--update")),
+        Some("operator" | "backstop" | "bounty" | "grants" | "treasury") => run_operator(&args),
         _ => {
-            eprintln!("usage: cargo xtask <authz-matrix | budget-check [--update]>");
+            eprintln!(
+                "usage: cargo xtask <authz-matrix | budget-check [--update] | \
+                 backstop|bounty|grants|treasury <subcommand> [options]>"
+            );
             process::exit(2);
         }
     }
+}
+
+fn run_operator(args: &[String]) {
+    let (cmd, custom_dir, json_output) =
+        operator::parse_operator_args(args).unwrap_or_else(|e| fatal(&e.to_string()));
+    let deployments_dir = custom_dir.unwrap_or_else(|| repo_root().join("deployments"));
+    let plan = operator::build_plan(&cmd, &deployments_dir)
+        .unwrap_or_else(|e| fatal(&e.to_string()));
+    let output =
+        operator::execute_plan(&plan, json_output).unwrap_or_else(|e| fatal(&e.to_string()));
+    print!("{output}");
 }
 
 fn authz_matrix() {
