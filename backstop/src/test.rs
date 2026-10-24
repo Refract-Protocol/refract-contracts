@@ -503,6 +503,237 @@ impl LegitimatePoolCaller {
     }
 }
 
+// ─── Issue #240: Per-Feed Underwriting Exposure Limits & Concentration Caps ──
+
+#[test]
+fn test_feed_cap_boundary_rejection_and_acceptance() {
+    let env = Env::default();
+    let (pool, admin, client, contract_id, token_id, _, sac, token_admin) = setup_backstop(&env);
+    let staker = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    mint_and_deposit(
+        &env,
+        &staker,
+        10_000,
+        &client,
+        &contract_id,
+        &token_id,
+        &sac,
+        &token_admin,
+    );
+
+    let feed = soroban_sdk::symbol_short!("depeg");
+    env.mock_all_auths();
+
+    // Configure an absolute feed cap of 4,000 USDC and relative cap of 5,000 bps (50% = 5,000).
+    client.set_feed_cap(&admin, &feed, &4_000, &5_000, &0);
+    assert_eq!(
+        client.feed_cap(&feed),
+        Some(FeedCapConfig {
+            max_feed_coverage: 4_000,
+            max_feed_coverage_bps: 5_000,
+            max_holder_feed_coverage: 0,
+        })
+    );
+
+    // 1 unit above cap (4,001) is rejected.
+    let over_res = client.try_record_policy_exposure(&pool, &1u64, &holder, &feed, &4_001);
+    assert_eq!(over_res, Err(Ok(BackstopError::FeedCapExceeded)));
+    assert_eq!(client.feed_exposure(&feed), 0);
+
+    // 1 unit below cap (3,999) is accepted.
+    client.record_policy_exposure(&pool, &1u64, &holder, &feed, &3_999);
+    assert_eq!(client.feed_exposure(&feed), 3_999);
+    assert_eq!(client.aggregate_feed_exposure(), 3_999);
+
+    // Exact remaining 1 unit to reach 4,000 is accepted.
+    client.record_policy_exposure(&pool, &2u64, &holder, &feed, &1);
+    assert_eq!(client.feed_exposure(&feed), 4_000);
+
+    // 1 additional unit now exceeds cap -> rejected.
+    let over_res_2 = client.try_record_policy_exposure(&pool, &3u64, &holder, &feed, &1);
+    assert_eq!(over_res_2, Err(Ok(BackstopError::FeedCapExceeded)));
+}
+
+#[test]
+fn test_relative_bps_cap_and_holder_feed_cap_enforced() {
+    let env = Env::default();
+    let (pool, admin, client, contract_id, token_id, _, sac, token_admin) = setup_backstop(&env);
+    let staker = Address::generate(&env);
+    let holder_a = Address::generate(&env);
+    let holder_b = Address::generate(&env);
+
+    mint_and_deposit(
+        &env,
+        &staker,
+        10_000,
+        &client,
+        &contract_id,
+        &token_id,
+        &sac,
+        &token_admin,
+    );
+
+    let feed = soroban_sdk::symbol_short!("crash");
+    env.mock_all_auths();
+
+    // Relative cap = 3,000 bps (30% of 10,000 = 3,000), per-holder cap = 2,000.
+    client.set_feed_cap(&admin, &feed, &0, &3_000, &2_000);
+
+    // Holder A attempting 2,001 breaches per-holder cap.
+    assert_eq!(
+        client.try_record_policy_exposure(&pool, &10u64, &holder_a, &feed, &2_001),
+        Err(Ok(BackstopError::HolderFeedCapExceeded))
+    );
+
+    // Holder A takes 2,000 (allowed).
+    client.record_policy_exposure(&pool, &10u64, &holder_a, &feed, &2_000);
+    assert_eq!(client.holder_feed_exposure(&holder_a, &feed), 2_000);
+
+    // Holder B attempting 1,001 breaches the 30% relative feed cap (2,000 + 1,001 > 3,000).
+    assert_eq!(
+        client.try_record_policy_exposure(&pool, &11u64, &holder_b, &feed, &1_001),
+        Err(Ok(BackstopError::FeedCapExceeded))
+    );
+
+    // Holder B taking 1,000 fits within both per-holder (1,000 <= 2,000) and relative cap (3,000 <= 3,000).
+    client.record_policy_exposure(&pool, &11u64, &holder_b, &feed, &1_000);
+    assert_eq!(client.feed_exposure(&feed), 3_000);
+}
+
+#[test]
+fn test_exposure_release_is_idempotent_and_prevents_double_decrement() {
+    let env = Env::default();
+    let (pool, admin, client, contract_id, token_id, _, sac, token_admin) = setup_backstop(&env);
+    let staker = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    mint_and_deposit(
+        &env,
+        &staker,
+        10_000,
+        &client,
+        &contract_id,
+        &token_id,
+        &sac,
+        &token_admin,
+    );
+
+    let feed = soroban_sdk::symbol_short!("depeg");
+    env.mock_all_auths();
+
+    client.set_feed_cap(&admin, &feed, &8_000, &8_000, &8_000);
+    client.record_policy_exposure(&pool, &101u64, &holder, &feed, &3_000);
+    client.record_policy_exposure(&pool, &102u64, &holder, &feed, &2_500);
+    assert_eq!(client.feed_exposure(&feed), 5_500);
+    assert_eq!(client.holder_feed_exposure(&holder, &feed), 5_500);
+    assert_eq!(client.aggregate_feed_exposure(), 5_500);
+
+    // First release (e.g. claim settlement) decrements 3,000.
+    let released = client.release_policy_exposure(&pool, &101u64);
+    assert_eq!(released, 3_000);
+    assert_eq!(client.feed_exposure(&feed), 2_500);
+    assert_eq!(client.holder_feed_exposure(&holder, &feed), 2_500);
+    assert_eq!(client.aggregate_feed_exposure(), 2_500);
+
+    // Second release on the same policy_id (e.g. concurrent expiry sweep) is a no-op!
+    let released_again = client.release_policy_exposure(&pool, &101u64);
+    assert_eq!(released_again, 0);
+    assert_eq!(client.feed_exposure(&feed), 2_500);
+    assert_eq!(client.holder_feed_exposure(&holder, &feed), 2_500);
+    assert_eq!(client.aggregate_feed_exposure(), 2_500);
+}
+
+#[test]
+fn test_lowering_cap_below_active_exposure_preserves_existing_policies_and_blocks_new_sales() {
+    let env = Env::default();
+    let (pool, admin, client, contract_id, token_id, _, sac, token_admin) = setup_backstop(&env);
+    let staker = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    mint_and_deposit(
+        &env,
+        &staker,
+        10_000,
+        &client,
+        &contract_id,
+        &token_id,
+        &sac,
+        &token_admin,
+    );
+
+    let feed = soroban_sdk::symbol_short!("liq");
+    env.mock_all_auths();
+
+    client.set_feed_cap(&admin, &feed, &6_000, &0, &0);
+    client.record_policy_exposure(&pool, &201u64, &holder, &feed, &3_000);
+    client.record_policy_exposure(&pool, &202u64, &holder, &feed, &2_000);
+    assert_eq!(client.feed_exposure(&feed), 5_000);
+
+    // Admin lowers cap to 2,500 (below the active 5,000 exposure).
+    client.set_feed_cap(&admin, &feed, &2_500, &0, &0);
+
+    // Existing policies remain active and intact.
+    assert_eq!(client.feed_exposure(&feed), 5_000);
+    assert!(client.policy_exposure(&201u64).unwrap().active);
+    assert!(client.policy_exposure(&202u64).unwrap().active);
+
+    // New policy sales on this feed are blocked while active exposure >= 2,500.
+    assert_eq!(
+        client.try_record_policy_exposure(&pool, &203u64, &holder, &feed, &100),
+        Err(Ok(BackstopError::FeedCapExceeded))
+    );
+
+    // Once policy 201 (3,000) settles/expires, active exposure drops to 2,000,
+    // allowing a new 500 policy to succeed.
+    client.release_policy_exposure(&pool, &201u64);
+    assert_eq!(client.feed_exposure(&feed), 2_000);
+    client.record_policy_exposure(&pool, &203u64, &holder, &feed, &500);
+    assert_eq!(client.feed_exposure(&feed), 2_500);
+}
+
+#[test]
+fn test_multi_feed_exposure_sum_invariant() {
+    let env = Env::default();
+    let (pool, admin, client, contract_id, token_id, _, sac, token_admin) = setup_backstop(&env);
+    let staker = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    mint_and_deposit(
+        &env,
+        &staker,
+        20_000,
+        &client,
+        &contract_id,
+        &token_id,
+        &sac,
+        &token_admin,
+    );
+
+    let f_depeg = soroban_sdk::symbol_short!("depeg");
+    let f_crash = soroban_sdk::symbol_short!("crash");
+    let f_flight = soroban_sdk::symbol_short!("flight");
+    env.mock_all_auths();
+
+    client.set_feed_cap(&admin, &f_depeg, &5_000, &0, &0);
+    client.set_feed_cap(&admin, &f_crash, &5_000, &0, &0);
+    client.set_feed_cap(&admin, &f_flight, &5_000, &0, &0);
+
+    client.record_policy_exposure(&pool, &301u64, &holder, &f_depeg, &2_100);
+    client.record_policy_exposure(&pool, &302u64, &holder, &f_crash, &3_400);
+    client.record_policy_exposure(&pool, &303u64, &holder, &f_flight, &1_500);
+    client.release_policy_exposure(&pool, &302u64);
+
+    let feeds = client.tracked_feeds();
+    let mut sum = 0i128;
+    for f in feeds.iter() {
+        sum += client.feed_exposure(&f);
+    }
+    assert_eq!(sum, client.aggregate_feed_exposure());
+    assert_eq!(sum, 3_600);
+}
+
 // ── Issue #239: Solvency & Coverage-Ratio Health Views tests ─────────────────
 
 #[contract]
@@ -628,135 +859,4 @@ fn test_health_views_zero_one_and_extreme_balances() {
     assert_eq!(client.coverage_ratio_bps(), None);
     assert_eq!(client.feed_utilization_bps(&symbol_short!("USDC")), None);
 
-    // 2. Unit balance (1) and unit coverage (1) -> 10_000 bps (100%).
-    let staker = Address::generate(&env);
-    sac.mint(&staker, &1_000_000_000_000_000_000i128);
-    client.deposit(&staker, &1);
-    mock_pool.set_coverage(&1);
-    mock_pool.set_feed(&symbol_short!("USDC"), &1);
-
-    assert_eq!(client.total_staked_capital(), 1);
-    assert_eq!(client.encumbered_capital(), 1);
-    assert_eq!(client.idle_capital(), 0);
-    assert_eq!(client.solvency_ratio_bps(), Some(10_000));
-    assert_eq!(client.coverage_ratio_bps(), Some(10_000));
-    assert_eq!(
-        client.feed_utilization_bps(&symbol_short!("USDC")),
-        Some(10_000)
-    );
-
-    // 3. Extreme balance: 500_000_000_000_000_000 capital vs 250_000_000_000_000_000 coverage.
-    let extreme_add = 500_000_000_000_000_000i128 - 1;
-    client.deposit(&staker, &extreme_add);
-    mock_pool.set_coverage(&250_000_000_000_000_000i128);
-    mock_pool.set_feed(&symbol_short!("USDC"), &125_000_000_000_000_000i128);
-
-    let snap = client.health_snapshot();
-    assert_eq!(snap.total_capital, 500_000_000_000_000_000i128);
-    assert_eq!(snap.encumbered_capital, 250_000_000_000_000_000i128);
-    assert_eq!(snap.idle_capital, 250_000_000_000_000_000i128);
-    assert_eq!(snap.solvency_ratio_bps, Some(20_000)); // 200%
-    assert_eq!(snap.coverage_ratio_bps, Some(5_000)); // 50%
-    assert_eq!(
-        client.feed_utilization_bps(&symbol_short!("USDC")),
-        Some(2_500)
-    );
-}
-
-#[test]
-fn test_check_health_threshold_crossing_and_hysteresis() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let mock_pool_id = env.register_contract(None, MockCoveragePool);
-    let mock_pool = MockCoveragePoolClient::new(&env, &mock_pool_id);
-
-    let admin = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin);
-    let sac = token::StellarAssetClient::new(&env, &token_id.address());
-
-    let contract_id = env.register_contract(None, RefractBackstop);
-    let client = RefractBackstopClient::new(&env, &contract_id);
-    client.initialize(&mock_pool_id, &admin, &token_id.address(), &2_000);
-
-    // Configure min_solvency_bps = 10_000 (100%), max_coverage_bps = 10_000 (100%), hysteresis = 1_000 (10%).
-    client.set_health_thresholds(&admin, &10_000, &10_000, &1_000);
-    assert_eq!(
-        client.health_thresholds(),
-        HealthThresholds {
-            min_solvency_bps: 10_000,
-            max_coverage_bps: 10_000,
-            hysteresis_bps: 1_000,
-        }
-    );
-
-    let staker = Address::generate(&env);
-    sac.mint(&staker, &100_000);
-    client.deposit(&staker, &10_000);
-
-    // Coverage = 8_000 -> solvency = 12_500 bps, coverage = 8_000 bps (healthy).
-    mock_pool.set_coverage(&8_000);
-    let state = client.check_health();
-    assert!(!state.solvency_breached);
-    assert!(!state.coverage_breached);
-
-    // Coverage rises to 12_500 -> solvency = 8_000 bps (< 10_000), coverage = 12_500 bps (> 10_000).
-    // Crosses threshold -> both alerts latch.
-    mock_pool.set_coverage(&12_500);
-    let state = client.check_health();
-    assert!(state.solvency_breached);
-    assert!(state.coverage_breached);
-
-    // Coverage improves slightly to 9_500 -> solvency = 10_526 bps (< 11_000 required by hysteresis),
-    // coverage = 9_500 bps (> 9_000 required by hysteresis). Remains latched!
-    mock_pool.set_coverage(&9_500);
-    let state = client.check_health();
-    assert!(state.solvency_breached);
-    assert!(state.coverage_breached);
-
-    // Coverage drops to 8_000 -> solvency = 12_500 bps (>= 11_000), coverage = 8_000 bps (<= 9_000).
-    // Clears hysteresis band -> both alerts recover!
-    mock_pool.set_coverage(&8_000);
-    let state = client.check_health();
-    assert!(!state.solvency_breached);
-    assert!(!state.coverage_breached);
-}
-
-#[test]
-fn test_graceful_fallback_when_pool_is_not_deployed_contract() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    // setup_backstop uses a plain generated Address for `pool` (not a deployed contract).
-    let (pool, _, client, contract_id, token_id, _, sac, token_admin) = setup_backstop(&env);
-    let staker = Address::generate(&env);
-    deposit_capital(
-        &env,
-        &staker,
-        10_000,
-        &client,
-        &contract_id,
-        &token_id,
-        &sac,
-        &token_admin,
-    );
-
-    // Cross-contract call fails gracefully and falls back to cached coverage (0).
-    env.mock_all_auths();
-    assert_eq!(client.aggregate_in_force_coverage(), 0);
-    assert_eq!(client.solvency_ratio_bps(), None);
-    assert_eq!(client.coverage_ratio_bps(), Some(0));
-
-    // Push cached coverage from pool and verify views reflect it.
-    let mut feeds = Vec::new(&env);
-    feeds.push_back((symbol_short!("DEPEG"), 4_000i128));
-    client.sync_cached_coverage(&pool, &5_000, &feeds);
-    assert_eq!(client.aggregate_in_force_coverage(), 5_000);
-    assert_eq!(client.solvency_ratio_bps(), Some(20_000));
-    assert_eq!(client.coverage_ratio_bps(), Some(5_000));
-    assert_eq!(
-        client.feed_utilization_bps(&symbol_short!("DEPEG")),
-        Some(4_000)
-    );
-}
+    // 2. Unit balance (1) and unit coverage (1) -> 10_000 bps (

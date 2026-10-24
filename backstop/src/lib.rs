@@ -88,10 +88,36 @@ enum DataKey {
     NextLossId,
     UnabsorbedShortfall,
     ReentrancyLock,
-    CachedCoverage,
+    FeedCap(Symbol),
     FeedExposure(Symbol),
+    HolderFeedExposure(Address, Symbol),
+    PolicyExposure(u64),
+    AggregateFeedExposure,
+    TrackedFeeds,
+    CachedCoverage,
     HealthThresholds,
     HealthAlertState,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedCapConfig {
+    /// Maximum absolute active coverage allowed on this feed (`0` = unlimited).
+    pub max_feed_coverage: i128,
+    /// Maximum active coverage on this feed in basis points of `total_capital` (`0` = unlimited).
+    pub max_feed_coverage_bps: i128,
+    /// Maximum active coverage a single policyholder may hold on this feed (`0` = unlimited).
+    pub max_holder_feed_coverage: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyExposureRecord {
+    pub policy_id: u64,
+    pub holder: Address,
+    pub feed: Symbol,
+    pub amount: i128,
+    pub active: bool,
 }
 
 #[contracttype]
@@ -133,7 +159,11 @@ pub enum BackstopError {
     InvalidPremiumSplit = 11,
     DuplicateLossId = 12,
     ReentrancyDetected = 13,
-    InvalidThreshold = 14,
+    InvalidFeedCap = 14,
+    FeedCapExceeded = 15,
+    HolderFeedCapExceeded = 16,
+    DuplicatePolicyExposure = 17,
+    InvalidThreshold = 18,
 }
 
 /// Admin-configured health thresholds and hysteresis band (in basis points).
@@ -237,6 +267,8 @@ impl RefractBackstop {
         env.storage().instance().set(&DataKey::AllLots, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::NextLossId, &1u64);
         env.storage().instance().set(&DataKey::UnabsorbedShortfall, &0i128);
+        env.storage().instance().set(&DataKey::AggregateFeedExposure, &0i128);
+        env.storage().instance().set(&DataKey::TrackedFeeds, &Vec::<Symbol>::new(&env));
         env.storage().instance().set(&DataKey::CachedCoverage, &0i128);
         env.storage().instance().set(
             &DataKey::HealthThresholds,
@@ -788,39 +820,4 @@ impl RefractBackstop {
 
     /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
     /// subsequent depositors get shares proportional to the current share price.
-    fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
-        if total_shares == 0 || total_capital == 0 {
-            amount
-        } else {
-            amount * total_shares / total_capital
-        }
-    }
-
-    /// Mirror of `RefractPool::_quote_withdrawal`: value of `shares` at the
-    /// current share price.
-    fn quote_withdrawal(shares: i128, total_shares: i128, total_capital: i128) -> i128 {
-        if total_shares == 0 {
-            0
-        } else {
-            shares * total_capital / total_shares
-        }
-    }
-
-    fn get_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
-        env.storage()
-            .instance()
-            .get(&"config")
-            .ok_or(BackstopError::NotInitialized)
-    }
-
-    fn get_state(env: &Env) -> Result<BackstopState, BackstopError> {
-        env.storage()
-            .instance()
-            .get(&"state")
-            .ok_or(BackstopError::NotInitialized)
-    }
-
-    /// Update the contract administrator. Admin-gated.
-    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), BackstopError> {
-        caller.require_auth();
-        let mut
+    fn calc_shares(amount: i128, total
