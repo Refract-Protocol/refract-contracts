@@ -1,12 +1,10 @@
 #![no_std]
 
+use refract_math::{mul_div_floor, saturating_add, saturating_sub, split_bps, BPS_DENOM, SCALE_1E7};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
     Vec,
 };
-
-/// Basis-point denominator used for premium-share configuration.
-const BPS_DENOM: i128 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -424,13 +422,17 @@ impl RefractBackstop {
 
     pub fn tranche_share_price(env: Env, tranche: Tranche) -> Result<i128, BackstopError> {
         let state = Self::_tranche_state(&env, tranche)?;
-        Ok(Self::quote_withdrawal(10_000_000, state.total_shares, state.total_assets))
+        Ok(Self::quote_withdrawal(SCALE_1E7, state.total_shares, state.total_assets))
     }
 
     pub fn senior_coverage_ratio(env: Env) -> Result<i128, BackstopError> {
         let junior = Self::_tranche_state(&env, Tranche::Junior)?.total_assets;
         let senior = Self::_tranche_state(&env, Tranche::Senior)?.total_assets;
-        Ok(if senior == 0 { 0 } else { junior * BPS_DENOM / senior })
+        Ok(if senior == 0 {
+            0
+        } else {
+            mul_div_floor(junior, BPS_DENOM, senior).unwrap_or(i128::MAX)
+        })
     }
 
     pub fn unabsorbed_shortfall(env: Env) -> i128 {
@@ -447,13 +449,21 @@ impl RefractBackstop {
         let config = Self::get_config(&env)?;
         let mut state = Self::get_state(&env)?;
 
-        let cut = amount * config.premium_share_bps / BPS_DENOM;
-        let junior_bps: i128 = env.storage().instance().get(&DataKey::JuniorPremiumBps).unwrap_or(BPS_DENOM / 2);
-        let junior_credit = Self::_credit_mature_premium(&env, Tranche::Junior, cut * junior_bps / BPS_DENOM)?;
-        let senior_credit = Self::_credit_mature_premium(&env, Tranche::Senior, cut - cut * junior_bps / BPS_DENOM)?;
-        let credited = junior_credit + senior_credit;
-        state.premium_income += credited;
-        state.total_capital += credited;
+        let cut = split_bps(amount, config.premium_share_bps)
+            .map_err(|_| BackstopError::InvalidPremiumShare)?
+            .cut;
+        let junior_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::JuniorPremiumBps)
+            .unwrap_or(BPS_DENOM / 2);
+        let tranche_split = split_bps(cut, junior_bps)
+            .map_err(|_| BackstopError::InvalidPremiumSplit)?;
+        let junior_credit = Self::_credit_mature_premium(&env, Tranche::Junior, tranche_split.cut)?;
+        let senior_credit = Self::_credit_mature_premium(&env, Tranche::Senior, tranche_split.rest)?;
+        let credited = saturating_add(junior_credit, senior_credit);
+        state.premium_income = saturating_add(state.premium_income, credited);
+        state.total_capital = saturating_add(state.total_capital, credited);
         env.storage().instance().set(&"state", &state);
 
         Ok(credited)
@@ -595,7 +605,7 @@ impl RefractBackstop {
             return Err(BackstopError::Unauthorized);
         }
         let balance = token::Client::new(&env, &token).balance(&env.current_contract_address());
-        let excess = balance - Self::get_state(&env)?.total_capital;
+        let excess = saturating_sub(balance, Self::get_state(&env)?.total_capital);
         if amount > excess {
             return Err(BackstopError::NoExcessFunds);
         }
@@ -645,7 +655,7 @@ impl RefractBackstop {
         if total_shares == 0 || total_capital == 0 {
             amount
         } else {
-            amount * total_shares / total_capital
+            mul_div_floor(amount, total_shares, total_capital).unwrap_or(0)
         }
     }
 
@@ -655,7 +665,7 @@ impl RefractBackstop {
         if total_shares == 0 {
             0
         } else {
-            shares * total_capital / total_shares
+            mul_div_floor(shares, total_capital, total_shares).unwrap_or(0)
         }
     }
 

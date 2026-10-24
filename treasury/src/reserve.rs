@@ -6,8 +6,10 @@
 //! operations. Only governance can draw on the reserve, and a draw cannot take
 //! it below zero.
 
+use refract_math::{apply_bps_floor, saturating_add, saturating_sub, MAX_BPS};
+
 /// Basis points in a whole.
-pub const FULL_BPS: u32 = 10_000;
+pub const FULL_BPS: u32 = MAX_BPS;
 
 /// How an inflow was split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +60,7 @@ impl Reserve {
         if obligations <= 0 {
             return 0;
         }
-        obligations.saturating_mul(i128::from(self.target_bps)) / i128::from(FULL_BPS)
+        apply_bps_floor(obligations, self.target_bps).unwrap_or(0)
     }
 
     /// Routes an inflow. The reserve is topped up toward its target first, and
@@ -67,12 +69,12 @@ impl Reserve {
         if amount <= 0 {
             return Err(ReserveError::InvalidAmount);
         }
-        let shortfall = (self.target(obligations) - self.balance).max(0);
+        let shortfall = saturating_sub(self.target(obligations), self.balance).max(0);
         let to_reserve = amount.min(shortfall);
-        self.balance += to_reserve;
+        self.balance = saturating_add(self.balance, to_reserve);
         Ok(Split {
             to_reserve,
-            to_operating: amount - to_reserve,
+            to_operating: saturating_sub(amount, to_reserve),
         })
     }
 
@@ -88,7 +90,7 @@ impl Reserve {
         if amount > self.balance {
             return Err(ReserveError::InsufficientReserve);
         }
-        self.balance -= amount;
+        self.balance = saturating_sub(self.balance, amount);
         Ok(())
     }
 }

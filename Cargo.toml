@@ -11,6 +11,7 @@ members = [
     "bounty",
     "grants",
     "treasury",
+    "math",
     "governance",
     "vetoken",
     "pool",
@@ -31,7 +32,6 @@ exclude = [
     "timelock",
     "multisig",
     "governance",
-    "math",
     "snapshot_harness",
     "xtask",
 ]

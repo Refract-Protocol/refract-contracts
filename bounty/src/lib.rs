@@ -29,6 +29,7 @@
 //! Reserve accounting: `available_balance()` returns the pool balance minus
 //! all pending payout records so the same funds cannot be double-committed.
 
+use refract_math::{checked_add, checked_sub};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
@@ -154,9 +155,10 @@ impl RefractBountyEscrow {
             return Err(BountyError::InvalidAmount);
         }
         let token = Self::token_addr(&env)?;
-        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
         let balance = Self::raw_balance(&env)?;
-        env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+        let new_balance = checked_add(balance, amount).map_err(|_| BountyError::InvalidAmount)?;
+        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
+        env.storage().instance().set(&DataKey::Balance, &new_balance);
         Ok(())
     }
 
@@ -191,6 +193,8 @@ impl RefractBountyEscrow {
 
         // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
+        let new_balance =
+            checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
         // Transfer before updating state to surface transfer errors early,
         // but the balance is updated after so a revert leaves state consistent.
         let token = Self::token_addr(&env)?;
@@ -199,7 +203,7 @@ impl RefractBountyEscrow {
             &researcher,
             &amount,
         );
-        env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+        env.storage().instance().set(&DataKey::Balance, &new_balance);
 
         let record = AwardRecord {
             researcher,
@@ -247,9 +251,11 @@ impl RefractBountyEscrow {
 
         // Reserve the funds.
         let reserved = Self::raw_reserved(&env)?;
+        let new_reserved =
+            checked_add(reserved, amount).map_err(|_| BountyError::InvalidAmount)?;
         env.storage()
             .instance()
-            .set(&DataKey::Reserved, &(reserved + amount));
+            .set(&DataKey::Reserved, &new_reserved);
 
         let payout_id: u64 = env
             .storage()
@@ -310,15 +316,19 @@ impl RefractBountyEscrow {
 
         // Release reservation.
         let reserved = Self::raw_reserved(&env)?;
+        let new_reserved =
+            checked_sub(reserved, amount).map_err(|_| BountyError::InsufficientBalance)?;
         env.storage()
             .instance()
-            .set(&DataKey::Reserved, &(reserved - amount));
+            .set(&DataKey::Reserved, &new_reserved);
 
         // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
+        let new_balance =
+            checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
         env.storage()
             .instance()
-            .set(&DataKey::Balance, &(balance - amount));
+            .set(&DataKey::Balance, &new_balance);
 
         // Transfer last — if it fails the state update above will revert with
         // it (Soroban's atomic transaction model), leaving the record Pending.
@@ -364,15 +374,19 @@ impl RefractBountyEscrow {
 
         // Release reservation.
         let reserved = Self::raw_reserved(&env)?;
+        let new_reserved =
+            checked_sub(reserved, amount).map_err(|_| BountyError::InsufficientBalance)?;
         env.storage()
             .instance()
-            .set(&DataKey::Reserved, &(reserved - amount));
+            .set(&DataKey::Reserved, &new_reserved);
 
         // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
+        let new_balance =
+            checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
         env.storage()
             .instance()
-            .set(&DataKey::Balance, &(balance - amount));
+            .set(&DataKey::Balance, &new_balance);
 
         // Transfer swept funds back to governance.
         token::Client::new(&env, &record.token).transfer(
@@ -449,7 +463,7 @@ impl RefractBountyEscrow {
     fn available_balance_inner(env: &Env) -> Result<i128, BountyError> {
         let balance = Self::raw_balance(env)?;
         let reserved = Self::raw_reserved(env)?;
-        Ok(balance - reserved)
+        checked_sub(balance, reserved).map_err(|_| BountyError::InsufficientBalance)
     }
 }
 

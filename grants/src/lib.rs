@@ -162,15 +162,16 @@ impl GrantsModel {
     pub fn accounted_liabilities(&self) -> i128 {
         self.grants
             .values()
-            .map(|grant| {
-                grant
+            .fold(0i128, |acc, grant| {
+                let grant_owed = grant
                     .milestones
                     .iter()
                     .filter(|milestone| !milestone.claimed)
-                    .map(|milestone| milestone.amount)
-                    .sum::<i128>()
+                    .fold(0i128, |m_acc, milestone| {
+                        refract_math::saturating_add(m_acc, milestone.amount)
+                    });
+                refract_math::saturating_add(acc, grant_owed)
             })
-            .sum()
     }
 
     /// Approves a new grant with `total_amount` split across `milestones`.
@@ -198,7 +199,8 @@ impl GrantsModel {
             if *amount <= 0 {
                 return Err(GrantsError::InvalidMilestoneAmount);
             }
-            sum = sum.checked_add(*amount).ok_or(GrantsError::MilestoneSumMismatch)?;
+            sum = refract_math::checked_add(sum, *amount)
+                .map_err(|_| GrantsError::MilestoneSumMismatch)?;
         }
         if sum != total_amount {
             return Err(GrantsError::MilestoneSumMismatch);
@@ -265,10 +267,8 @@ impl GrantsModel {
         }
 
         milestone.confirmed = true;
-        grant.claimable = grant
-            .claimable
-            .checked_add(milestone.amount)
-            .ok_or(GrantsError::MilestoneSumMismatch)?;
+        grant.claimable = refract_math::checked_add(grant.claimable, milestone.amount)
+            .map_err(|_| GrantsError::MilestoneSumMismatch)?;
 
         Ok(())
     }
@@ -357,11 +357,11 @@ impl GrantsModel {
         if amount <= 0 {
             return Err(GrantsError::InvalidRescueAmount);
         }
-        let excess = live_balance - self.accounted_liabilities();
+        let excess = refract_math::saturating_sub(live_balance, self.accounted_liabilities());
         if amount > excess {
             return Err(GrantsError::NoExcessFunds);
         }
-        Ok(excess - amount)
+        refract_math::checked_sub(excess, amount).map_err(|_| GrantsError::NoExcessFunds)
     }
 
     fn require_governance(&self, caller: Address) -> Result<(), GrantsError> {
