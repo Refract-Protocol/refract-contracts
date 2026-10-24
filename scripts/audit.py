@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run `cargo audit` on Cargo.lock and apply this repo's advisory policy.
+"""Run `cargo audit` and `cargo deny` on Cargo.lock and apply this repo's advisory & supply-chain policy.
 
-    python3 scripts/audit.py            # needs cargo-audit on PATH
+    python3 scripts/audit.py            # needs cargo-audit (and optionally cargo-deny) on PATH
 
 CI runs exactly this command (.github/workflows/audit.yml), and so can
 anyone locally. The policy is described in SECURITY.md, under
-"Dependency advisories". In short:
+"Dependency advisories", and in `deny.toml` (#236). In short:
 
 * Every crate in Cargo.lock gets one of three scopes:
     runtime  compiled into a deployed contract wasm: reached from a
@@ -23,27 +23,34 @@ anyone locally. The policy is described in SECURITY.md, under
 * Findings accepted in audit.toml are reported but don't fail the job,
   until the entry's `expires` date. After that, the entry itself fails
   the job.
+* `deny.toml` enforces our MIT-compatible license allow-list, crates.io-only
+  source policy, yanked-crate ban, and wildcard-version ban across the
+  workspace (including `backstop`, `bounty`, `grants`, and `treasury`).
 
 Exit codes: 0 = policy satisfied, 1 = policy violation (unaccepted
-advisory, expired or malformed acceptance), 2 = tooling failure (cargo
-audit or cargo tree could not run or gave unparsable output). The
-workflow uses the difference between 1 and 2 so that an infrastructure
-flake doesn't look like an advisory.
+advisory, expired or malformed acceptance, or deny.toml violation), 2 =
+tooling failure (cargo audit or cargo tree could not run or gave
+unparsable output). The workflow uses the difference between 1 and 2 so
+that an infrastructure flake doesn't look like an advisory.
 """
 
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POLICY_FILE = os.path.join(ROOT, "audit.toml")
+DENY_FILE = os.path.join(ROOT, "deny.toml")
+CARGO_TOML = os.path.join(ROOT, "Cargo.toml")
 WASM_TARGET = "wasm32-unknown-unknown"
 FAILING_SCOPES = ("runtime", "build")
 REQUIRED_FIELDS = ("id", "crate", "justification", "expires")
 MAX_ACCEPTANCE_DAYS = 90
+GOVERNANCE_CRATES = ("backstop", "bounty", "grants", "treasury")
 
 
 class ToolingError(Exception):
@@ -123,6 +130,40 @@ def load_policy(today):
     return active, errors
 
 
+def validate_deny_policy():
+    """Validate `deny.toml` policy structure, workspace crate coverage, and run `cargo deny` if installed."""
+    errors = []
+    if not os.path.exists(DENY_FILE):
+        return ["deny.toml is missing"]
+    try:
+        with open(DENY_FILE, "rb") as f:
+            deny = tomllib.load(f)
+        with open(CARGO_TOML, "rb") as f:
+            ws = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return [f"cannot read deny.toml or Cargo.toml: {e}"]
+
+    members = set(ws.get("workspace", {}).get("members", []))
+    excludes = set(ws.get("workspace", {}).get("exclude", []))
+    for crate in GOVERNANCE_CRATES:
+        if crate not in members or crate in excludes:
+            errors.append(f"governance-adjacent crate `{crate}` must be an active member of [workspace].members")
+
+    if deny.get("advisories", {}).get("yanked") != "deny":
+        errors.append("deny.toml [advisories].yanked must be 'deny'")
+    if deny.get("bans", {}).get("wildcards") != "deny":
+        errors.append("deny.toml [bans].wildcards must be 'deny'")
+    sources = deny.get("sources", {})
+    if sources.get("unknown-registry") != "deny" or sources.get("unknown-git") != "deny":
+        errors.append("deny.toml [sources] must deny unknown-registry and unknown-git")
+
+    if shutil.which("cargo-deny") is not None:
+        res = run(["cargo", "deny", "--workspace", "check", "advisories", "licenses", "bans", "sources"])
+        if res.returncode != 0:
+            errors.append(f"`cargo deny --workspace check` failed:\n{res.stderr or res.stdout}")
+    return errors
+
+
 def cargo_audit():
     res = run(["cargo", "audit", "--json"])
     # cargo audit exits 1 both when it finds vulnerabilities and when it
@@ -168,6 +209,7 @@ def main():
     except (OSError, tomllib.TOMLDecodeError) as e:
         gh("error", f"cannot read audit.toml: {e}")
         return 1
+    policy_errors.extend(validate_deny_policy())
     try:
         scope = classify()
         report = cargo_audit()

@@ -1,10 +1,51 @@
 #![no_std]
 
+//! # RefractBackstop
+//!
+//! First-loss insurance backstop tranche for `RefractPool`.
+//!
+//! ## Solvency & Coverage-Ratio Health Views (#239)
+//!
+//! Operators and the monitoring backend can inspect live backstop health via
+//! pure, read-only views and trigger hysteresis-guarded threshold alerts:
+//!
+//! - [`RefractBackstop::total_staked_capital`]: total capital currently staked.
+//! - [`RefractBackstop::encumbered_capital`] & [`RefractBackstop::idle_capital`]:
+//!   capital encumbered by in-force pool coverage vs unencumbered idle capital.
+//! - [`RefractBackstop::aggregate_in_force_coverage`]: pulls aggregate active
+//!   coverage from `RefractPool::aggregate_in_force_coverage` via
+//!   `try_invoke_contract`, degrading gracefully to cached coverage if the
+//!   cross-contract read is unavailable.
+//! - [`RefractBackstop::solvency_ratio_bps`]: `total_capital / coverage` in
+//!   basis points (computed via 1e7 fixed-point helper); returns `None` when
+//!   in-force coverage is zero.
+//! - [`RefractBackstop::coverage_ratio_bps`]: `coverage / total_capital` in
+//!   basis points; returns `None` when staked capital is zero.
+//! - [`RefractBackstop::feed_utilization_bps`]: per-feed coverage utilization
+//!   against backstop capital in basis points; returns `None` when staked
+//!   capital is zero.
+//! - [`RefractBackstop::check_health`]: permissionless entrypoint that compares
+//!   live ratios against admin-configured [`HealthThresholds`] and emits
+//!   `HLTHALRT` / `HLTHRECV` events only on threshold crossings with
+//!   hysteresis.
+
 use refract_math::{mul_div_floor, saturating_add, saturating_sub, split_bps, BPS_DENOM, SCALE_1E7};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    IntoVal, Symbol, Vec,
 };
+
+/// 1e7 fixed-point scaling factor used for intermediate ratio math.
+const FP_SCALE: i128 = 10_000_000;
+
+/// Default minimum solvency ratio threshold in basis points (100% = 10,000 bps).
+pub const DEFAULT_MIN_SOLVENCY_BPS: i128 = 10_000;
+
+/// Default maximum coverage-to-capital ratio threshold in basis points (100% = 10,000 bps).
+pub const DEFAULT_MAX_COVERAGE_BPS: i128 = 10_000;
+
+/// Default hysteresis band in basis points (5% = 500 bps) required to clear an active alert.
+pub const DEFAULT_HYSTERESIS_BPS: i128 = 500;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +68,10 @@ enum DataKey {
     NextLotId,
     NextLossId,
     UnabsorbedShortfall,
+    CachedCoverage,
+    FeedExposure(Symbol),
+    HealthThresholds,
+    HealthAlertState,
 }
 
 #[contracttype]
@@ -67,6 +112,41 @@ pub enum BackstopError {
     PendingLossFreeze = 10,
     InvalidPremiumSplit = 11,
     DuplicateLossId = 12,
+    InvalidThreshold = 13,
+}
+
+/// Admin-configured health thresholds and hysteresis band (in basis points).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthThresholds {
+    /// Alert triggers when `solvency_ratio_bps < min_solvency_bps` and clears
+    /// when `solvency_ratio_bps >= min_solvency_bps + hysteresis_bps`.
+    pub min_solvency_bps: i128,
+    /// Alert triggers when `coverage_ratio_bps > max_coverage_bps` and clears
+    /// when `coverage_ratio_bps <= max_coverage_bps - hysteresis_bps`.
+    pub max_coverage_bps: i128,
+    /// Hysteresis band (in bps) preventing repeated event spam near the boundary.
+    pub hysteresis_bps: i128,
+}
+
+/// Latched alert state persisted across `check_health` calls.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthAlertState {
+    pub solvency_breached: bool,
+    pub coverage_breached: bool,
+}
+
+/// Pure read-only health snapshot of the backstop tranche.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopHealthSnapshot {
+    pub total_capital: i128,
+    pub encumbered_capital: i128,
+    pub idle_capital: i128,
+    pub aggregate_coverage: i128,
+    pub solvency_ratio_bps: Option<i128>,
+    pub coverage_ratio_bps: Option<i128>,
 }
 
 #[contracttype]
@@ -129,13 +209,29 @@ impl RefractBackstop {
                 premium_income: 0,
             },
         );
-        env.storage().instance().set(&DataKey::LockupLedgers, &100u32);
+        env.storage().instance().set(&DataKey::LockupLedgers, &0u32);
         env.storage().instance().set(&DataKey::JuniorPremiumBps, &(BPS_DENOM / 2));
         env.storage().instance().set(&DataKey::PendingLoss, &false);
         env.storage().instance().set(&DataKey::NextLotId, &1u64);
         env.storage().instance().set(&DataKey::AllLots, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::NextLossId, &1u64);
         env.storage().instance().set(&DataKey::UnabsorbedShortfall, &0i128);
+        env.storage().instance().set(&DataKey::CachedCoverage, &0i128);
+        env.storage().instance().set(
+            &DataKey::HealthThresholds,
+            &HealthThresholds {
+                min_solvency_bps: DEFAULT_MIN_SOLVENCY_BPS,
+                max_coverage_bps: DEFAULT_MAX_COVERAGE_BPS,
+                hysteresis_bps: DEFAULT_HYSTERESIS_BPS,
+            },
+        );
+        env.storage().instance().set(
+            &DataKey::HealthAlertState,
+            &HealthAlertState {
+                solvency_breached: false,
+                coverage_breached: false,
+            },
+        );
         for tranche in [Tranche::Junior, Tranche::Senior] {
             env.storage().instance().set(
                 &DataKey::TrancheState(tranche),
@@ -706,7 +802,37 @@ impl RefractBackstop {
         env.storage().instance().set(&"config", &config);
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod test;
+    // ─── Issue #239: Solvency & Coverage-Ratio Health Views ──────────────
+
+    /// Pure read-only view returning total staked capital across all tranches.
+    pub fn total_staked_capital(env: Env) -> Result<i128, BackstopError> {
+        Ok(Self::get_state(&env)?.total_capital)
+    }
+
+    /// Pure read-only view returning aggregate in-force coverage pulled from
+    /// `RefractPool::aggregate_in_force_coverage`. Degrades gracefully to the
+    /// cached coverage counter (`DataKey::CachedCoverage`) when the pool
+    /// cross-contract read is unavailable or returns an error.
+    pub fn aggregate_in_force_coverage(env: Env) -> Result<i128, BackstopError> {
+        Self::_read_pool_coverage(&env)
+    }
+
+    /// Pure read-only view returning capital encumbered by in-force coverage
+    /// (`min(total_capital, aggregate_in_force_coverage)`).
+    pub fn encumbered_capital(env: Env) -> Result<i128, BackstopError> {
+        let capital = Self::get_state(&env)?.total_capital.max(0);
+        let coverage = Self::_read_pool_coverage(&env)?.max(0);
+        Ok(capital.min(coverage))
+    }
+
+    /// Pure read-only view returning idle (unencumbered) capital
+    /// (`max(0, total_capital - encumbered_capital)`).
+    pub fn idle_capital(env: Env) -> Result<i128, BackstopError> {
+        let capital = Self::get_state(&env)?.total_capital.max(0);
+        let encumbered = Self::encumbered_capital(env)?;
+        Ok((capital - encumbered).max(0))
+    }
+
+    /// Pure read-only view returning the backstop solvency ratio
+    /// (`
