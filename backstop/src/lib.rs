@@ -118,6 +118,10 @@ pub enum BackstopError {
     InvalidPremiumSplit = 20,
     DuplicateLossId = 21,
     InvalidThreshold = 22,
+    InvalidFeedCap = 23,
+    FeedCapExceeded = 24,
+    HolderFeedCapExceeded = 25,
+    DuplicatePolicyExposure = 26,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -161,6 +165,27 @@ pub struct BackstopConfig {
 pub enum Tranche {
     Junior,
     Senior,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedCapConfig {
+    /// Maximum absolute active coverage allowed on this feed (`0` = unlimited).
+    pub max_feed_coverage: i128,
+    /// Maximum active coverage on this feed in basis points of `total_capital` (`0` = unlimited).
+    pub max_feed_coverage_bps: i128,
+    /// Maximum active coverage a single policyholder may hold on this feed (`0` = unlimited).
+    pub max_holder_feed_coverage: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyExposureRecord {
+    pub policy_id: u64,
+    pub holder: Address,
+    pub feed: Symbol,
+    pub amount: i128,
+    pub active: bool,
 }
 
 #[contracttype]
@@ -253,8 +278,13 @@ pub enum DataKey {
     NextLotId,
     NextLossId,
     UnabsorbedShortfall,
-    CachedCoverage,
+    FeedCap(Symbol),
     FeedExposure(Symbol),
+    HolderFeedExposure(Address, Symbol),
+    PolicyExposure(u64),
+    AggregateFeedExposure,
+    TrackedFeeds,
+    CachedCoverage,
     HealthThresholds,
     HealthAlertState,
 }
@@ -312,6 +342,8 @@ impl RefractBackstop {
         env.storage().instance().set(&DataKey::AllLots, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::NextLossId, &1u64);
         env.storage().instance().set(&DataKey::UnabsorbedShortfall, &0i128);
+        env.storage().instance().set(&DataKey::AggregateFeedExposure, &0i128);
+        env.storage().instance().set(&DataKey::TrackedFeeds, &Vec::<Symbol>::new(&env));
         env.storage().instance().set(&DataKey::CachedCoverage, &0i128);
         env.storage().instance().set(
             &DataKey::HealthThresholds,
@@ -805,41 +837,4 @@ impl RefractBackstop {
     /// Only callable by the treasury that originally seeded. The amount is
     /// converted to shares at the current price; if the converted shares
     /// exceed `SeedShares` the recall is rejected (`RecallExceedsSeed`).
-    /// This ensures the treasury cannot recall capital that has been absorbed
-    /// by drawdowns (losses are reflected in the lower share price).
-    pub fn recall_seed(
-        env: Env,
-        caller: Address,
-        amount: i128,
-    ) -> Result<i128, BackstopError> {
-        caller.require_auth();
-        if amount <= 0 {
-            return Err(BackstopError::InvalidAmount);
-        }
-        // Only the original treasury seeder may recall.
-        let treasury: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::SeedTreasury)
-            .ok_or(BackstopError::Unauthorized)?;
-        if caller != treasury {
-            return Err(BackstopError::NotTreasury);
-        }
-        let cfg = Self::config(&env)?;
-        let mut state = Self::state(&env)?;
-
-        // Convert amount to shares at current price, then verify.
-        let shares_needed = Self::calc_shares(&state, amount)?;
-        let seed_shares: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SeedShares)
-            .unwrap_or(0);
-        if shares_needed > seed_shares {
-            return Err(BackstopError::RecallExceedsSeed);
-        }
-        if amount > state.total_capital {
-            return Err(BackstopError::InsufficientCapital);
-        }
-
-        state.total_shares -=
+    /// This ensures the treasury cannot recall capital that has
