@@ -48,4 +48,5 @@ pub enum TreasuryError {
     SelfApproval = 4,
     NotRequester = 5,
     NotAdmin = 6,
+    ReentrancyDetected = 7,
 }

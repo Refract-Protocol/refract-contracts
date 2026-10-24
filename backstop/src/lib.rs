@@ -1,3 +1,20 @@
+//! # RefractBackstop
+//!
+//! Second-loss underwriting reserve with Junior and Senior tranches.
+//!
+//! ## Cross-Contract Call Graph & Reentrancy Safety (#241)
+//!
+//! - **Inbound calls**: `RefractPool` (or admin/timelock) invokes `cover_shortfall`,
+//!   `absorb_loss`, `receive_premium`, and `set_pending_loss`; stakers invoke
+//!   `deposit` / `deposit_tranche` and `withdraw` / `withdraw_tranche`.
+//! - **Outbound calls**: `token::Client::transfer` on the configured reserve token.
+//! - **CEI & Reentrancy Invariant**: Every state-mutating entrypoint that performs
+//!   an outbound token call acquires a temporary-storage reentrancy lock
+//!   (`DataKey::ReentrancyLock`), commits all share, asset, tranche, and lot state
+//!   mutations *before* invoking `token.transfer`, and releases the lock upon
+//!   completion. Any re-entrant callback into `RefractBackstop` while the lock is
+//!   held fails immediately with [`BackstopError::ReentrancyDetected`].
+
 #![no_std]
 
 //! # RefractBackstop
@@ -68,6 +85,7 @@ enum DataKey {
     NextLotId,
     NextLossId,
     UnabsorbedShortfall,
+    ReentrancyLock,
     FeedCap(Symbol),
     FeedExposure(Symbol),
     HolderFeedExposure(Address, Symbol),
@@ -138,11 +156,12 @@ pub enum BackstopError {
     PendingLossFreeze = 10,
     InvalidPremiumSplit = 11,
     DuplicateLossId = 12,
-    InvalidFeedCap = 13,
-    FeedCapExceeded = 14,
-    HolderFeedCapExceeded = 15,
-    DuplicatePolicyExposure = 16,
-    InvalidThreshold = 17,
+    ReentrancyDetected = 13,
+    InvalidFeedCap = 14,
+    FeedCapExceeded = 15,
+    HolderFeedCapExceeded = 16,
+    DuplicatePolicyExposure = 17,
+    InvalidThreshold = 18,
 }
 
 /// Admin-configured health thresholds and hysteresis band (in basis points).
@@ -297,8 +316,10 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        Self::sync_matured(env.clone())?;
+        Self::acquire_reentrancy_guard(&env)?;
+        Self::_sync_matured(&env)?;
         if Self::pending_loss(env.clone()) {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::PendingLossFreeze);
         }
         let config = Self::get_config(&env)?;
@@ -311,15 +332,11 @@ impl RefractBackstop {
             tranche_state.total_assets,
         );
         if shares <= 0 {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::InvalidAmount);
         }
 
-        token::Client::new(&env, &config.token).transfer(
-            &staker,
-            &env.current_contract_address(),
-            &amount,
-        );
-
+        // Effects: commit all share, asset, and lot state prior to outbound token transfer (CEI).
         let key = DataKey::Shares(staker.clone(), tranche, false);
         let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(prev + shares));
@@ -351,6 +368,14 @@ impl RefractBackstop {
         env.storage().instance().set(&"state", &state);
         Self::_save_tranche_state(&env, tranche, &tranche_state);
 
+        // Interactions: outbound token transfer while reentrancy lock is held.
+        token::Client::new(&env, &config.token).transfer(
+            &staker,
+            &env.current_contract_address(),
+            &amount,
+        );
+        Self::release_reentrancy_guard(&env);
+
         Ok(shares)
     }
 
@@ -370,7 +395,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        Self::sync_matured(env.clone())?;
+        Self::acquire_reentrancy_guard(&env)?;
+        Self::_sync_matured(&env)?;
         let config = Self::get_config(&env)?;
         let mut state = Self::get_state(&env)?;
         let mut tranche_state = Self::_tranche_state(&env, tranche)?;
@@ -378,6 +404,7 @@ impl RefractBackstop {
         let key = DataKey::Shares(staker.clone(), tranche, true);
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         if shares > held {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::InsufficientShares);
         }
 
@@ -387,6 +414,7 @@ impl RefractBackstop {
             tranche_state.mature_assets,
         );
         if amount > state.total_capital {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::InsufficientCapital);
         }
 
@@ -407,6 +435,7 @@ impl RefractBackstop {
                 &amount,
             );
         }
+        Self::release_reentrancy_guard(&env);
 
         Ok(amount)
     }
@@ -425,7 +454,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        Self::sync_matured(env.clone())?;
+        Self::acquire_reentrancy_guard(&env)?;
+        Self::_sync_matured(&env)?;
         let state = Self::get_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
@@ -437,6 +467,7 @@ impl RefractBackstop {
         let covered = Self::_apply_loss(&env, loss_id, covered)?;
         if covered <= 0 {
             env.storage().instance().set(&DataKey::PendingLoss, &false);
+            Self::release_reentrancy_guard(&env);
             return Ok(0);
         }
 
@@ -445,6 +476,7 @@ impl RefractBackstop {
             &config.pool,
             &covered,
         );
+        Self::release_reentrancy_guard(&env);
 
         Ok(covered)
     }
@@ -464,8 +496,10 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        Self::sync_matured(env.clone())?;
+        Self::acquire_reentrancy_guard(&env)?;
+        Self::_sync_matured(&env)?;
         let covered = Self::_apply_loss(&env, loss_id, amount)?;
+        env.storage().instance().set(&DataKey::PendingLoss, &false);
         if covered > 0 {
             token::Client::new(&env, &config.token).transfer(
                 &env.current_contract_address(),
@@ -473,7 +507,7 @@ impl RefractBackstop {
                 &covered,
             );
         }
-        env.storage().instance().set(&DataKey::PendingLoss, &false);
+        Self::release_reentrancy_guard(&env);
         Ok(covered)
     }
 
@@ -574,6 +608,7 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
+        Self::acquire_reentrancy_guard(&env)?;
         let config = Self::get_config(&env)?;
         let mut state = Self::get_state(&env)?;
 
@@ -593,6 +628,7 @@ impl RefractBackstop {
         state.premium_income = saturating_add(state.premium_income, credited);
         state.total_capital = saturating_add(state.total_capital, credited);
         env.storage().instance().set(&"state", &state);
+        Self::release_reentrancy_guard(&env);
 
         Ok(credited)
     }
@@ -732,9 +768,11 @@ impl RefractBackstop {
         if caller != config.admin || to != config.admin || token != config.token || amount <= 0 {
             return Err(BackstopError::Unauthorized);
         }
+        Self::acquire_reentrancy_guard(&env)?;
         let balance = token::Client::new(&env, &token).balance(&env.current_contract_address());
         let excess = saturating_sub(balance, Self::get_state(&env)?.total_capital);
         if amount > excess {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::NoExcessFunds);
         }
         token::Client::new(&env, &token).transfer(
@@ -742,11 +780,24 @@ impl RefractBackstop {
             &to,
             &amount,
         );
+        Self::release_reentrancy_guard(&env);
         env.events().publish(
             (Symbol::new(&env, "FundsRescued"),),
             (token, to, amount, excess - amount),
         );
         Ok(excess - amount)
+    }
+
+    fn acquire_reentrancy_guard(env: &Env) -> Result<(), BackstopError> {
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(BackstopError::ReentrancyDetected);
+        }
+        env.storage().temporary().set(&DataKey::ReentrancyLock, &true);
+        Ok(())
+    }
+
+    fn release_reentrancy_guard(env: &Env) {
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
     }
 
     pub fn batch(env: Env, caller: Address, operations: Vec<BackstopOp>) -> Result<(), BackstopError> {
@@ -767,80 +818,4 @@ impl RefractBackstop {
                     }
                     config.premium_share_bps = share;
                 }
-            }
-        }
-        env.storage().instance().set(&"config", &config);
-        env.events().publish(
-            (Symbol::new(&env, "AdminBatch"),),
-            operations.len(),
-        );
-        Ok(())
-    }
-
-    /// Mirror of `RefractPool::_calc_shares`: first depositor gets 1:1 shares,
-    /// subsequent depositors get shares proportional to the current share price.
-    fn calc_shares(amount: i128, total_shares: i128, total_capital: i128) -> i128 {
-        if total_shares == 0 || total_capital == 0 {
-            amount
-        } else {
-            mul_div_floor(amount, total_shares, total_capital).unwrap_or(0)
-        }
-    }
-
-    /// Mirror of `RefractPool::_quote_withdrawal`: value of `shares` at the
-    /// current share price.
-    fn quote_withdrawal(shares: i128, total_shares: i128, total_capital: i128) -> i128 {
-        if total_shares == 0 {
-            0
-        } else {
-            mul_div_floor(shares, total_capital, total_shares).unwrap_or(0)
-        }
-    }
-
-    fn get_config(env: &Env) -> Result<BackstopConfig, BackstopError> {
-        env.storage()
-            .instance()
-            .get(&"config")
-            .ok_or(BackstopError::NotInitialized)
-    }
-
-    fn get_state(env: &Env) -> Result<BackstopState, BackstopError> {
-        env.storage()
-            .instance()
-            .get(&"state")
-            .ok_or(BackstopError::NotInitialized)
-    }
-
-    /// Update the contract administrator. Admin-gated.
-    pub fn set_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), BackstopError> {
-        caller.require_auth();
-        let mut config = Self::get_config(&env)?;
-        if caller != config.admin {
-            return Err(BackstopError::Unauthorized);
-        }
-        config.admin = new_admin;
-        env.storage().instance().set(&"config", &config);
-        Ok(())
-    }
-
-    /// Update the authorized pool address. Admin-gated.
-    pub fn set_pool(env: Env, caller: Address, new_pool: Address) -> Result<(), BackstopError> {
-        caller.require_auth();
-        let mut config = Self::get_config(&env)?;
-        if caller != config.admin {
-            return Err(BackstopError::Unauthorized);
-        }
-        config.pool = new_pool;
-        env.storage().instance().set(&"config", &config);
-        Ok(())
-    }
-
-    // ─── Issue #240: Per-Feed Underwriting Exposure Limits & Concentration Caps ──
-
-    /// Configure absolute, relative (bps of `total_capital`), and per-holder
-    /// underwriting exposure caps for `feed`. Admin-gated.
-    ///
-    /// Lowering a cap below the feed's current active exposure is permitted and
-    /// does not invalidate existing in-force policies; it only blocks new policy
-    /// sales on that feed until exposure decays below the new cap.
-    pub fn set_feed
+           
