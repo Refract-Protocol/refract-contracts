@@ -42,6 +42,7 @@ pub enum DataKey {
     Treasury,
     Grant(u64),
     AccruedFees(Address),
+    ReentrancyLock,
 }
 
 #[contracttype]
@@ -75,6 +76,7 @@ pub enum GrantsError {
     ArithmeticError = 17,
     BatchTooLarge = 18,
     KeyNotBumpable = 19,
+    ReentrancyDetected = 20,
 }
 
 #[contract]
@@ -211,43 +213,67 @@ impl RefractGrants {
 
     pub fn claim(env: Env, recipient: Address, grant_id: u64) -> Result<i128, GrantsError> {
         recipient.require_auth();
-        let mut grant = Self::grant(&env, grant_id)?;
+        Self::acquire_reentrancy_guard(&env)?;
+        let mut grant = match Self::grant(&env, grant_id) {
+            Ok(g) => g,
+            Err(e) => {
+                Self::release_reentrancy_guard(&env);
+                return Err(e);
+            }
+        };
         if grant.recipient != recipient {
+            Self::release_reentrancy_guard(&env);
             return Err(GrantsError::NotRecipient);
         }
         let gross = grant.claimable;
         if gross <= 0 {
+            Self::release_reentrancy_guard(&env);
             return Err(GrantsError::NothingToClaim);
         }
-        let quote = Self::quote_payout(env.clone(), gross)?;
-        let token_address = Self::token(&env)?;
-        if quote.net > 0 {
-            token::Client::new(&env, &token_address).transfer(
-                &env.current_contract_address(),
-                &recipient,
-                &quote.net,
-            );
-        }
+        let quote = match Self::quote_payout(env.clone(), gross) {
+            Ok(q) => q,
+            Err(e) => {
+                Self::release_reentrancy_guard(&env);
+                return Err(e);
+            }
+        };
+        let token_address = match Self::token(&env) {
+            Ok(t) => t,
+            Err(e) => {
+                Self::release_reentrancy_guard(&env);
+                return Err(e);
+            }
+        };
+
+        // Effects: zero claimable, mark milestones claimed, and record accrued fees
+        // BEFORE invoking external token.transfer (strict CEI).
         if quote.fee > 0 {
             let fees: i128 = env
                 .storage()
                 .persistent()
                 .get(&DataKey::AccruedFees(token_address.clone()))
                 .unwrap_or(0);
-            let updated = fees
-                .checked_add(quote.fee)
-                .ok_or(GrantsError::ArithmeticError)?;
+            let updated = match fees.checked_add(quote.fee) {
+                Some(u) => u,
+                None => {
+                    Self::release_reentrancy_guard(&env);
+                    return Err(GrantsError::ArithmeticError);
+                }
+            };
             env.storage()
                 .persistent()
-                .set(&DataKey::AccruedFees(token_address), &updated);
+                .set(&DataKey::AccruedFees(token_address.clone()), &updated);
         }
 
         grant.claimable = 0;
         for index in 0..grant.milestones.len() {
-            let mut milestone = grant
-                .milestones
-                .get(index)
-                .ok_or(GrantsError::InvalidMilestoneIndex)?;
+            let mut milestone = match grant.milestones.get(index) {
+                Some(m) => m,
+                None => {
+                    Self::release_reentrancy_guard(&env);
+                    return Err(GrantsError::InvalidMilestoneIndex);
+                }
+            };
             if milestone.confirmed {
                 milestone.claimed = true;
                 grant.milestones.set(index, milestone);
@@ -256,6 +282,16 @@ impl RefractGrants {
         env.storage()
             .persistent()
             .set(&DataKey::Grant(grant_id), &grant);
+
+        // Interactions: outbound token transfer while reentrancy lock is held.
+        if quote.net > 0 {
+            token::Client::new(&env, &token_address).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &quote.net,
+            );
+        }
+        Self::release_reentrancy_guard(&env);
         Ok(quote.net)
     }
 
@@ -295,26 +331,42 @@ impl RefractGrants {
     }
 
     pub fn sweep_fees(env: Env, token: Address) -> Result<i128, GrantsError> {
-        if token != Self::token(&env)? {
+        Self::acquire_reentrancy_guard(&env)?;
+        let expected_token = match Self::token(&env) {
+            Ok(t) => t,
+            Err(e) => {
+                Self::release_reentrancy_guard(&env);
+                return Err(e);
+            }
+        };
+        if token != expected_token {
+            Self::release_reentrancy_guard(&env);
             return Err(GrantsError::InvalidToken);
         }
         let fees = Self::accrued_fees(env.clone(), token.clone());
         if fees == 0 {
+            Self::release_reentrancy_guard(&env);
             return Ok(0);
         }
-        let treasury: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Treasury)
-            .ok_or(GrantsError::TreasuryNotConfigured)?;
+        let treasury: Address = match env.storage().instance().get(&DataKey::Treasury) {
+            Some(t) => t,
+            None => {
+                Self::release_reentrancy_guard(&env);
+                return Err(GrantsError::TreasuryNotConfigured);
+            }
+        };
+        // Effects: zero accrued fees BEFORE invoking outbound token.transfer (strict CEI).
+        env.storage()
+            .persistent()
+            .set(&DataKey::AccruedFees(token.clone()), &0i128);
+
+        // Interactions: outbound token transfer while reentrancy lock is held.
         token::Client::new(&env, &token).transfer(
             &env.current_contract_address(),
             &treasury,
             &fees,
         );
-        env.storage()
-            .persistent()
-            .set(&DataKey::AccruedFees(token), &0i128);
+        Self::release_reentrancy_guard(&env);
         Ok(fees)
     }
 
@@ -387,5 +439,85 @@ impl RefractGrants {
             .instance()
             .get(&DataKey::Token)
             .ok_or(GrantsError::NotInitialized)
+    }
+
+    fn acquire_reentrancy_guard(env: &Env) -> Result<(), GrantsError> {
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(GrantsError::ReentrancyDetected);
+        }
+        env.storage().temporary().set(&DataKey::ReentrancyLock, &true);
+        Ok(())
+    }
+
+    fn release_reentrancy_guard(env: &Env) {
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
+    }
+}
+
+#[cfg(test)]
+mod reentrancy_test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[contract]
+    pub struct HostileGrantsToken;
+
+    #[contractimpl]
+    impl HostileGrantsToken {
+        pub fn set_target(env: Env, grants: Address, recipient: Address, grant_id: u64) {
+            env.storage().instance().set(&"grants", &grants);
+            env.storage().instance().set(&"recipient", &recipient);
+            env.storage().instance().set(&"grant_id", &grant_id);
+        }
+
+        pub fn last_reentry_err(env: Env) -> Option<GrantsError> {
+            env.storage().instance().get(&"last_err")
+        }
+
+        pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+            if env.storage().temporary().has(&"in_hook") {
+                return;
+            }
+            env.storage().temporary().set(&"in_hook", &true);
+
+            let grants: Address = env.storage().instance().get(&"grants").unwrap();
+            let recipient: Address = env.storage().instance().get(&"recipient").unwrap();
+            let grant_id: u64 = env.storage().instance().get(&"grant_id").unwrap();
+            let client = RefractGrantsClient::new(&env, &grants);
+
+            if let Err(Ok(err)) = client.try_claim(&recipient, &grant_id) {
+                env.storage().instance().set(&"last_err", &err);
+            }
+
+            env.storage().temporary().remove(&"in_hook");
+        }
+    }
+
+    #[test]
+    fn reentrant_grant_claim_during_token_transfer_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let governance = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let hostile_token_id = env.register_contract(None, HostileGrantsToken);
+        let hostile_token = HostileGrantsTokenClient::new(&env, &hostile_token_id);
+
+        let grants_id = env.register_contract(None, RefractGrants);
+        let client = RefractGrantsClient::new(&env, &grants_id);
+        client.initialize(&governance, &hostile_token_id);
+
+        let milestones = Vec::from_array(&env, [200i128, 300i128]);
+        let grant_id = client.create_grant(&governance, &recipient, &500, &milestones);
+        client.confirm_milestone(&governance, &grant_id, &0);
+
+        hostile_token.set_target(&grants_id, &recipient, &grant_id);
+        let claimed = client.claim(&recipient, &grant_id);
+        assert_eq!(claimed, 200);
+        assert_eq!(
+            hostile_token.last_reentry_err(),
+            Some(GrantsError::ReentrancyDetected)
+        );
+        assert_eq!(client.get_grant(&grant_id).unwrap().claimable, 0);
     }
 }
