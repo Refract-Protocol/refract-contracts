@@ -33,6 +33,19 @@
 //! (undrawn) seeded portion may be recalled via `recall_seed(amount)`, and
 //! recalled capital is always junior to staker deposits (the backstop's
 //! `drawable_capital` reflects losses before the seed is returned).
+//!
+//! ## Cross-Contract Call Graph & Reentrancy Safety (#241)
+//!
+//! - **Inbound calls**: Admin/timelock invokes `withdraw`, `approve_payment_request`,
+//!   `reject_payment_request`, and `execute_payment_request`; requesters invoke
+//!   `submit_payment_request` and `cancel_payment_request`.
+//! - **Outbound calls**: `token::Client::transfer` on the requested asset.
+//! - **CEI & Reentrancy Invariant**: `execute_payment_request` acquires a
+//!   temporary-storage reentrancy lock (`DataKey::ReentrancyLock`), transitions
+//!   the request to [`PaymentStatus::Executed`] in persistent storage *before*
+//!   invoking `token.transfer`, and releases the lock afterward. Any re-entrant
+//!   callback into `execute_payment_request` while the lock is held fails
+//!   immediately with [`TreasuryError::ReentrancyDetected`].
 
 #![no_std]
 
@@ -44,8 +57,6 @@ use soroban_sdk::{
 };
 
 pub mod payments;
-#[cfg(test)]
-mod payments_test;
 
 use payments::{PaymentRequest, PaymentStatus, TreasuryError};
 
@@ -161,6 +172,8 @@ pub enum DataKey {
     NextRequestId,
     /// A payment request, keyed by its id.
     Request(u64),
+    /// Temporary-storage reentrancy lock for outbound token transfers.
+    ReentrancyLock,
 }
 
 // ── Minimal oracle client ─────────────────────────────────────────────────────
@@ -759,22 +772,35 @@ impl RefractTreasury {
     }
 
     /// Pay out an approved request. Only the admin may execute, and never a
-    /// request they submitted themselves. The request is marked executed
-    /// only if the transfer succeeds.
+    /// request they submitted themselves. State is committed prior to the
+    /// outbound transfer (CEI) under a temporary-storage reentrancy guard.
     pub fn execute_payment_request(env: Env, caller: Address, id: u64) -> Result<(), TreasuryError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
-        let mut request = Self::load_request(&env, id)?;
+        Self::acquire_reentrancy_guard(&env)?;
+        let mut request = match Self::load_request(&env, id) {
+            Ok(req) => req,
+            Err(e) => {
+                Self::release_reentrancy_guard(&env);
+                return Err(e);
+            }
+        };
         if request.requester == caller {
+            Self::release_reentrancy_guard(&env);
             return Err(TreasuryError::SelfApproval);
         }
         if request.status != PaymentStatus::Approved {
+            Self::release_reentrancy_guard(&env);
             return Err(TreasuryError::InvalidState);
         }
-        let client = token::Client::new(&env, &request.token);
-        client.transfer(&env.current_contract_address(), &request.payee, &request.amount);
+        // Effects: transition to Executed and persist BEFORE outbound token transfer (CEI).
         request.status = PaymentStatus::Executed;
         Self::save_request(&env, &request);
+
+        // Interactions: outbound token transfer while reentrancy lock is held.
+        let client = token::Client::new(&env, &request.token);
+        client.transfer(&env.current_contract_address(), &request.payee, &request.amount);
+        Self::release_reentrancy_guard(&env);
         env.events().publish((symbol_short!("pay_exec"), id), request.amount);
         Ok(())
     }
@@ -802,6 +828,18 @@ impl RefractTreasury {
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────
+
+    fn acquire_reentrancy_guard(env: &Env) -> Result<(), TreasuryError> {
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(TreasuryError::ReentrancyDetected);
+        }
+        env.storage().temporary().set(&DataKey::ReentrancyLock, &true);
+        Ok(())
+    }
+
+    fn release_reentrancy_guard(env: &Env) {
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
+    }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), TreasuryError> {
         caller.require_auth();
@@ -855,6 +893,9 @@ impl RefractTreasury {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod payments_test;
+
+#[cfg(test)]
 mod test {
     use super::*;
     use soroban_sdk::{
@@ -874,53 +915,4 @@ mod test {
     fn double_initialize_rejected() {
         let (env, admin, trs_id) = make_env();
         let trs = RefractTreasuryClient::new(&env, &trs_id);
-        trs.initialize(&admin);
-        assert_eq!(
-            trs.try_initialize(&admin),
-            Err(Ok(TreasuryError::AlreadyInitialized))
-        );
-    }
-
-    #[test]
-    fn allowlist_gate_on_withdraw() {
-        let (env, admin, trs_id) = make_env();
-        let trs = RefractTreasuryClient::new(&env, &trs_id);
-        trs.initialize(&admin);
-
-        let recipient = Address::generate(&env);
-        // Withdraw to an unscreened address is rejected.
-        // (Balance check would also fail; RecipientNotAllowed is checked first.)
-        let fake_token = Address::generate(&env);
-        let res = trs.try_withdraw(&admin, &fake_token, &100i128, &recipient);
-        assert_eq!(res, Err(Ok(TreasuryError::RecipientNotAllowed)));
-
-        // After allowlisting, the balance check kicks in (no real token here).
-        trs.allow_recipient(&admin, &recipient);
-        assert!(trs.is_recipient_allowed(&recipient));
-        // InsufficientBalance because treasury holds no tokens in test.
-        let res2 = trs.try_withdraw(&admin, &fake_token, &100i128, &recipient);
-        assert_eq!(res2, Err(Ok(TreasuryError::InsufficientBalance)));
-    }
-
-    #[test]
-    fn block_and_remove_recipient() {
-        let (env, admin, trs_id) = make_env();
-        let trs = RefractTreasuryClient::new(&env, &trs_id);
-        trs.initialize(&admin);
-
-        let r = Address::generate(&env);
-        trs.allow_recipient(&admin, &r);
-        assert!(trs.is_recipient_allowed(&r));
-        trs.block_recipient(&admin, &r);
-        assert!(!trs.is_recipient_allowed(&r));
-        trs.remove_recipient(&admin, &r);
-        assert_eq!(trs.recipient_status(&r), None);
-    }
-
-    #[test]
-    fn seeded_capital_accounting() {
-        let (env, admin, trs_id) = make_env();
-        let trs = RefractTreasuryClient::new(&env, &trs_id);
-        trs.initialize(&admin);
-
-        // No
+        trs

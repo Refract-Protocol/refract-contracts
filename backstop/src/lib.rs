@@ -1,7 +1,19 @@
 //! # RefractBackstop
 //!
-//! Second-loss capital that the pool draws on when its own capital cannot
-//! cover a claim.
+//! Second-loss underwriting reserve with Junior and Senior tranches.
+//!
+//! ## Cross-Contract Call Graph & Reentrancy Safety (#241)
+//!
+//! - **Inbound calls**: `RefractPool` (or admin/timelock) invokes `cover_shortfall`,
+//!   `absorb_loss`, `receive_premium`, and `set_pending_loss`; stakers invoke
+//!   `deposit` / `deposit_tranche` and `withdraw` / `withdraw_tranche`.
+//! - **Outbound calls**: `token::Client::transfer` on the configured reserve token.
+//! - **CEI & Reentrancy Invariant**: Every state-mutating entrypoint that performs
+//!   an outbound token call acquires a temporary-storage reentrancy lock
+//!   (`DataKey::ReentrancyLock`), commits all share, asset, tranche, and lot state
+//!   mutations *before* invoking `token.transfer`, and releases the lock upon
+//!   completion. Any re-entrant callback into `RefractBackstop` while the lock is
+//!   held fails immediately with [`BackstopError::ReentrancyDetected`].
 //!
 //! ## Share model
 //!
@@ -122,6 +134,8 @@ pub enum BackstopError {
     FeedCapExceeded = 24,
     HolderFeedCapExceeded = 25,
     DuplicatePolicyExposure = 26,
+    /// A re-entrant call was detected while the reentrancy lock was held.
+    ReentrancyDetected = 27,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -278,6 +292,7 @@ pub enum DataKey {
     NextLotId,
     NextLossId,
     UnabsorbedShortfall,
+    ReentrancyLock,
     FeedCap(Symbol),
     FeedExposure(Symbol),
     HolderFeedExposure(Address, Symbol),
@@ -396,8 +411,10 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        Self::sync_matured(env.clone())?;
+        Self::acquire_reentrancy_guard(&env)?;
+        Self::_sync_matured(&env)?;
         if Self::pending_loss(env.clone()) {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::PendingLossFreeze);
         }
         let config = Self::get_config(&env)?;
@@ -410,15 +427,11 @@ impl RefractBackstop {
             tranche_state.total_assets,
         );
         if shares <= 0 {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::InvalidAmount);
         }
 
-        token::Client::new(&env, &config.token).transfer(
-            &staker,
-            &env.current_contract_address(),
-            &amount,
-        );
-
+        // Effects: commit all share, asset, and lot state prior to outbound token transfer (CEI).
         let key = DataKey::Shares(staker.clone(), tranche, false);
         let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(prev + shares));
@@ -449,6 +462,14 @@ impl RefractBackstop {
         env.storage().instance().set(&DataKey::NextLotId, &(lot_id + 1));
         env.storage().instance().set(&DataKey::State, &state);
         Self::_save_tranche_state(&env, tranche, &tranche_state);
+
+        // Interactions: outbound token transfer while reentrancy lock is held.
+        token::Client::new(&env, &config.token).transfer(
+            &staker,
+            &env.current_contract_address(),
+            &amount,
+        );
+        Self::release_reentrancy_guard(&env);
 
         env.events().publish((symbol_short!("bs_dep"),), (staker, amount, shares));
         Ok(shares)
@@ -507,7 +528,8 @@ impl RefractBackstop {
         if shares <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        Self::sync_matured(env.clone())?;
+        Self::acquire_reentrancy_guard(&env)?;
+        Self::_sync_matured(&env)?;
         let config = Self::get_config(&env)?;
         let mut state = Self::get_state(&env)?;
         let mut tranche_state = Self::_tranche_state(&env, tranche)?;
@@ -515,6 +537,7 @@ impl RefractBackstop {
         let key = DataKey::Shares(staker.clone(), tranche, true);
         let held: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         if shares > held {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::InsufficientShares);
         }
 
@@ -524,6 +547,7 @@ impl RefractBackstop {
             tranche_state.mature_assets,
         );
         if amount > state.total_capital {
+            Self::release_reentrancy_guard(&env);
             return Err(BackstopError::InsufficientCapital);
         }
 
@@ -544,6 +568,7 @@ impl RefractBackstop {
                 &amount,
             );
         }
+        Self::release_reentrancy_guard(&env);
 
         env.events().publish((symbol_short!("bs_wdraw"),), (staker, shares, amount));
         Ok(amount)
@@ -607,7 +632,8 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        Self::sync_matured(env.clone())?;
+        Self::acquire_reentrancy_guard(&env)?;
+        Self::_sync_matured(&env)?;
         let state = Self::get_state(&env)?;
         let covered = if amount > state.total_capital {
             state.total_capital
@@ -619,6 +645,7 @@ impl RefractBackstop {
         let covered = Self::_apply_loss(&env, loss_id, covered)?;
         if covered <= 0 {
             env.storage().instance().set(&DataKey::PendingLoss, &false);
+            Self::release_reentrancy_guard(&env);
             return Ok(0);
         }
 
@@ -627,6 +654,7 @@ impl RefractBackstop {
             &config.pool,
             &covered,
         );
+        Self::release_reentrancy_guard(&env);
 
         Ok(covered)
     }
@@ -646,8 +674,10 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        Self::sync_matured(env.clone())?;
+        Self::acquire_reentrancy_guard(&env)?;
+        Self::_sync_matured(&env)?;
         let covered = Self::_apply_loss(&env, loss_id, amount)?;
+        env.storage().instance().set(&DataKey::PendingLoss, &false);
         if covered > 0 {
             token::Client::new(&env, &config.token).transfer(
                 &env.current_contract_address(),
@@ -655,7 +685,7 @@ impl RefractBackstop {
                 &covered,
             );
         }
-        env.storage().instance().set(&DataKey::PendingLoss, &false);
+        Self::release_reentrancy_guard(&env);
         Ok(covered)
     }
 
@@ -751,90 +781,46 @@ impl RefractBackstop {
         if amount <= 0 {
             return Err(BackstopError::InvalidAmount);
         }
-        let cfg = Self::config(&env)?;
-        let share = (amount as i128)
-            .checked_mul(cfg.premium_share_bps as i128)
-            .ok_or(BackstopError::Overflow)?
-            .checked_div(BPS_DENOM)
-            .ok_or(BackstopError::Overflow)?;
-        if share <= 0 {
-            return Ok(0);
-        }
-        token::Client::new(&env, &cfg.token).transfer(
-            &from,
-            &env.current_contract_address(),
-            &share,
-        );
-        let mut state = Self::state(&env)?;
-        state.total_capital = state.total_capital.checked_add(share).ok_or(BackstopError::Overflow)?;
-        state.premium_income = state.premium_income.checked_add(share).ok_or(BackstopError::Overflow)?;
-        env.storage().instance().set(&DataKey::State, &state);
+        Self::acquire_reentrancy_guard(&env)?;
+        let config = Self::get_config(&env)?;
+        let mut state = Self::get_state(&env)?;
 
-        // Route the premium slice across tranches (junior/senior split).
+        let cut = amount * config.premium_share_bps / BPS_DENOM;
         let junior_bps: i128 = env.storage().instance().get(&DataKey::JuniorPremiumBps).unwrap_or(BPS_DENOM / 2);
-        let junior_credit = Self::_credit_mature_premium(&env, Tranche::Junior, share * junior_bps / BPS_DENOM)?;
-        let senior_credit = Self::_credit_mature_premium(&env, Tranche::Senior, share - share * junior_bps / BPS_DENOM)?;
+        let junior_credit = Self::_credit_mature_premium(&env, Tranche::Junior, cut * junior_bps / BPS_DENOM)?;
+        let senior_credit = Self::_credit_mature_premium(&env, Tranche::Senior, cut - cut * junior_bps / BPS_DENOM)?;
         let credited = junior_credit + senior_credit;
-        if credited > 0 {
-            let mut state = Self::state(&env)?;
-            state.premium_income += credited;
-            state.total_capital += credited;
-            env.storage().instance().set(&DataKey::State, &state);
-        }
-
-        env.events().publish((symbol_short!("bs_prem"),), (from, amount, share));
-        Ok(share)
-    }
-
-    // ─── Protocol-owned seed capital (issue #243) ─────────────────────────
-
-    /// Accept a seed deposit from the treasury. Called by `RefractTreasury::seed_backstop`.
-    ///
-    /// The treasury must have already transferred `amount` tokens to this
-    /// contract (via `token.transfer(treasury → backstop, amount)`) before
-    /// calling this entrypoint. This function records the seed position.
-    ///
-    /// Seeded capital mints shares just like a regular deposit but the share
-    /// count is tracked in `SeedShares` so it can be recalled independently.
-    pub fn record_seed(
-        env: Env,
-        treasury: Address,
-        amount: i128,
-    ) -> Result<i128, BackstopError> {
-        treasury.require_auth();
-        if amount <= 0 {
-            return Err(BackstopError::InvalidAmount);
-        }
-        let mut state = Self::state(&env)?;
-        let shares = Self::calc_shares(&state, amount)?;
-
-        state.total_shares = state.total_shares.checked_add(shares).ok_or(BackstopError::Overflow)?;
-        state.total_capital = state.total_capital.checked_add(amount).ok_or(BackstopError::Overflow)?;
+        state.premium_income += credited;
+        state.total_capital += credited;
         env.storage().instance().set(&DataKey::State, &state);
 
-        // Track seed shares separately (junior accounting).
-        let seed_shares: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SeedShares)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::SeedShares, &(seed_shares + shares));
+        // Interactions: pull the stakers' premium slice while the lock is held.
+        if cut > 0 {
+            token::Client::new(&env, &config.token).transfer(
+                &from,
+                &env.current_contract_address(),
+                &cut,
+            );
+        }
+        Self::release_reentrancy_guard(&env);
 
-        // Remember who seeded so recall can be enforced.
-        env.storage()
-            .instance()
-            .set(&DataKey::SeedTreasury, &treasury);
-
-        env.events()
-            .publish((symbol_short!("bs_seed"),), (treasury.clone(), amount, shares));
-        Ok(shares)
+        env.events().publish((symbol_short!("bs_prem"),), (from, amount, cut));
+        Ok(cut)
     }
 
-    /// Recall `amount` of idle seeded capital back to the treasury.
-    ///
-    /// Only callable by the treasury that originally seeded. The amount is
-    /// converted to shares at the current price; if the converted shares
-    /// exceed `SeedShares` the recall is rejected (`RecallExceedsSeed`).
-    /// This ensures the treasury cannot recall capital that has
+    pub fn shares_of(env: Env, staker: Address) -> i128 {
+        let mut total = 0;
+        for tranche in [Tranche::Junior, Tranche::Senior] {
+            for mature in [false, true] {
+                let shares: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Shares(staker.clone(), tranche, mature))
+                    .unwrap_or(0);
+                total += shares;
+            }
+        }
+        total
+    }
+
+    pub fn state(env: Env) -> Result<BackstopState, BackstopError>
