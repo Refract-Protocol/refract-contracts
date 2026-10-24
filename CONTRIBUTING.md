@@ -29,7 +29,14 @@ cargo test          # should pass on a clean checkout
    cargo test --all
    cargo build --target wasm32-unknown-unknown --release
    ```
-4. Open a PR against `main` and fill in the template.
+4. When adding or updating dependencies, run the supply-chain and license checks locally:
+   ```bash
+   cargo install cargo-deny cargo-audit
+   cargo deny --workspace check advisories licenses bans sources
+   python3 scripts/audit.py
+   ```
+   `deny.toml` enforces our MIT-compatible license allow-list, crates.io-only source policy, yanked-crate ban, and wildcard-version ban across the entire workspace (including `backstop`, `bounty`, `grants`, and `treasury`). `audit.toml` tracks any time-bounded RustSec advisory exceptions (enforced by `scripts/audit.py`).
+5. Open a PR against `main` and fill in the template.
 
 ## Coding standards
 

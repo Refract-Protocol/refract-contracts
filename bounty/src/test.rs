@@ -2,9 +2,9 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, BytesN, Env, IntoVal,
 };
 
 // ── Setup helpers ─────────────────────────────────────────────────────────────
@@ -509,4 +509,225 @@ fn test_award_regression_guard_requires_auth() {
     // Regression guard: Unauthenticated invocation must fail
     client.award(&governance, &researcher, &100, &report_hash);
 }
+
+// ── Issue 238: Payout-Address Indirection tests ──────────────────────────────
+
+#[test]
+fn indirection_register_award_rotate_claim_happy_path() {
+    let f = TestFixture::setup();
+    let client = f.client();
+
+    let submitter = Address::generate(&f.env);
+    let binding_owner = Address::generate(&f.env);
+    let initial_payout = Address::generate(&f.env);
+    let rotated_payout = Address::generate(&f.env);
+
+    let report_hash = BytesN::from_array(&f.env, &[10u8; 32]);
+    let preimage = BytesN::from_array(&f.env, &[11u8; 32]);
+    let commitment = client.compute_commitment(&preimage);
+
+    // 1. Submitter files disclosure bound to commitment (separate from payout identity).
+    client.submit_disclosure(&submitter, &report_hash, &commitment);
+    assert_eq!(
+        client.get_disclosure_commitment(&report_hash),
+        Some(commitment.clone())
+    );
+
+    // 2. Owner registers initial payout address against preimage.
+    let registered_commitment =
+        client.register_payout_address(&binding_owner, &preimage, &initial_payout);
+    assert_eq!(registered_commitment, commitment);
+
+    // 3. Governance adjudicates and awards against commitment (not submitter).
+    client.award_commitment(&f.governance, &report_hash, &commitment, &1_500);
+    assert_eq!(client.available_balance(), 10_000 - 1_500);
+    assert_eq!(client.balance(), 10_000);
+    let award_rec = client.get_commitment_award(&commitment).unwrap();
+    assert_eq!(award_rec.status, CommitmentAwardStatus::Awarded);
+    assert_eq!(award_rec.amount, 1_500);
+
+    // 4. Owner rotates payout address before claiming; old binding is revoked.
+    client.rotate_payout_address(&binding_owner, &preimage, &rotated_payout);
+    let binding = client.get_payout_binding(&commitment).unwrap();
+    assert_eq!(binding.payout_address, rotated_payout);
+
+    // Old payout address cannot claim.
+    assert_eq!(
+        client.try_claim_by_commitment(&initial_payout, &preimage),
+        Err(Ok(BountyError::Unauthorized))
+    );
+
+    // 5. Claim pays the rotated payout address and transitions state to Claimed.
+    let paid = client.claim_by_commitment(&rotated_payout, &preimage);
+    assert_eq!(paid, 1_500);
+    assert_eq!(f.token().balance(&initial_payout), 0);
+    assert_eq!(f.token().balance(&submitter), 0);
+    assert_eq!(f.token().balance(&rotated_payout), 1_500);
+    assert_eq!(client.balance(), 10_000 - 1_500);
+    assert_eq!(client.available_balance(), 10_000 - 1_500);
+
+    let settled = client.get_commitment_award(&commitment).unwrap();
+    assert_eq!(settled.status, CommitmentAwardStatus::Claimed);
+}
+
+#[test]
+fn indirection_double_claim_rejected() {
+    let f = TestFixture::setup();
+    let client = f.client();
+
+    let owner = Address::generate(&f.env);
+    let payout = Address::generate(&f.env);
+    let report_hash = BytesN::from_array(&f.env, &[20u8; 32]);
+    let preimage = BytesN::from_array(&f.env, &[21u8; 32]);
+
+    let commitment = client.register_payout_address(&owner, &preimage, &payout);
+    client.award_commitment(&f.governance, &report_hash, &commitment, &800);
+
+    assert_eq!(client.claim_by_commitment(&owner, &preimage), 800);
+    assert_eq!(
+        client.try_claim_by_commitment(&owner, &preimage),
+        Err(Ok(BountyError::PayoutAlreadySettled))
+    );
+}
+
+#[test]
+fn indirection_commitment_reuse_rejected() {
+    let f = TestFixture::setup();
+    let client = f.client();
+
+    let submitter = Address::generate(&f.env);
+    let owner = Address::generate(&f.env);
+    let payout = Address::generate(&f.env);
+
+    let report_a = BytesN::from_array(&f.env, &[30u8; 32]);
+    let report_b = BytesN::from_array(&f.env, &[31u8; 32]);
+    let preimage = BytesN::from_array(&f.env, &[32u8; 32]);
+
+    let commitment = client.register_payout_address(&owner, &preimage, &payout);
+
+    // Duplicate registration of the same commitment is rejected.
+    assert_eq!(
+        client.try_register_payout_address(&owner, &preimage, &payout),
+        Err(Ok(BountyError::CommitmentAlreadyUsed))
+    );
+
+    // Reusing the same commitment across two reports is rejected.
+    client.submit_disclosure(&submitter, &report_a, &commitment);
+    assert_eq!(
+        client.try_submit_disclosure(&submitter, &report_b, &commitment),
+        Err(Ok(BountyError::CommitmentAlreadyUsed))
+    );
+    assert_eq!(
+        client.try_award_commitment(&f.governance, &report_b, &commitment, &500),
+        Err(Ok(BountyError::CommitmentAlreadyUsed))
+    );
+}
+
+#[test]
+fn indirection_claim_with_wrong_preimage_rejected() {
+    let f = TestFixture::setup();
+    let client = f.client();
+
+    let owner = Address::generate(&f.env);
+    let payout = Address::generate(&f.env);
+    let report_hash = BytesN::from_array(&f.env, &[40u8; 32]);
+    let preimage = BytesN::from_array(&f.env, &[41u8; 32]);
+    let wrong_preimage = BytesN::from_array(&f.env, &[42u8; 32]);
+
+    let commitment = client.register_payout_address(&owner, &preimage, &payout);
+    client.award_commitment(&f.governance, &report_hash, &commitment, &600);
+
+    assert_eq!(
+        client.try_claim_by_commitment(&owner, &wrong_preimage),
+        Err(Ok(BountyError::InvalidPreimage))
+    );
+    assert_eq!(f.token().balance(&payout), 0);
+}
+
+#[test]
+fn indirection_rotation_by_non_owner_rejected() {
+    let f = TestFixture::setup();
+    let client = f.client();
+
+    let owner = Address::generate(&f.env);
+    let attacker = Address::generate(&f.env);
+    let payout = Address::generate(&f.env);
+    let attacker_payout = Address::generate(&f.env);
+    let preimage = BytesN::from_array(&f.env, &[50u8; 32]);
+
+    let commitment = client.register_payout_address(&owner, &preimage, &payout);
+
+    assert_eq!(
+        client.try_rotate_payout_address(&attacker, &preimage, &attacker_payout),
+        Err(Ok(BountyError::NotBindingOwner))
+    );
+    assert_eq!(
+        client.get_payout_binding(&commitment).unwrap().payout_address,
+        payout
+    );
+}
+
+#[test]
+fn indirection_binding_ttl_expiry_rejected() {
+    let f = TestFixture::setup();
+    let client = f.client();
+
+    let owner = Address::generate(&f.env);
+    let payout = Address::generate(&f.env);
+    let new_payout = Address::generate(&f.env);
+    let report_hash = BytesN::from_array(&f.env, &[60u8; 32]);
+    let preimage = BytesN::from_array(&f.env, &[61u8; 32]);
+
+    let commitment = client.register_payout_address(&owner, &preimage, &payout);
+    client.award_commitment(&f.governance, &report_hash, &commitment, &900);
+
+    // Advance ledger past the binding's expires_at window.
+    f.advance_time(DEFAULT_BINDING_TTL_SECS + 1);
+
+    assert_eq!(
+        client.try_rotate_payout_address(&owner, &preimage, &new_payout),
+        Err(Ok(BountyError::BindingExpired))
+    );
+    assert_eq!(
+        client.try_claim_by_commitment(&owner, &preimage),
+        Err(Ok(BountyError::BindingExpired))
+    );
+}
+
+#[test]
+fn indirection_freeze_compromised_payout_address_preserves_reward_and_allows_rotation() {
+    let f = TestFixture::setup();
+    let client = f.client();
+
+    let owner = Address::generate(&f.env);
+    let compromised_payout = Address::generate(&f.env);
+    let clean_payout = Address::generate(&f.env);
+    let report_hash = BytesN::from_array(&f.env, &[70u8; 32]);
+    let preimage = BytesN::from_array(&f.env, &[71u8; 32]);
+
+    let commitment = client.register_payout_address(&owner, &preimage, &compromised_payout);
+    client.award_commitment(&f.governance, &report_hash, &commitment, &1_200);
+
+    // Governance flags and freezes the compromised payout address without altering reward amount.
+    client.freeze_payout_address(&f.governance, &compromised_payout, &true);
+    assert!(client.is_payout_address_frozen(&compromised_payout));
+    assert_eq!(
+        client.get_commitment_award(&commitment).unwrap().amount,
+        1_200
+    );
+
+    // Claiming to the frozen payout address is rejected.
+    assert_eq!(
+        client.try_claim_by_commitment(&owner, &preimage),
+        Err(Ok(BountyError::AddressFrozen))
+    );
+
+    // Owner rotates to a clean payout address and claims the full unaltered reward.
+    client.rotate_payout_address(&owner, &preimage, &clean_payout);
+    let claimed = client.claim_by_commitment(&owner, &preimage);
+    assert_eq!(claimed, 1_200);
+    assert_eq!(f.token().balance(&compromised_payout), 0);
+    assert_eq!(f.token().balance(&clean_payout), 1_200);
+}
+
 
