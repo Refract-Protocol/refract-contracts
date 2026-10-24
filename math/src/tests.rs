@@ -197,6 +197,87 @@ fn mul_div_floor_table() {
 }
 
 #[test]
+fn mul_div_ceil_and_rounding_table() {
+    assert_eq!(mul_div_ceil(7, 3, 2), Ok(11));
+    assert_eq!(mul_div_ceil(6, 3, 2), Ok(9));
+    assert_eq!(mul_div_ceil(0, 3, 2), Ok(0));
+    assert_eq!(mul_div_ceil(1, 1, 0), Err(MathError::DivisionByZero));
+    assert_eq!(mul_div_ceil(-1, 1, 1), Err(MathError::Negative));
+    assert_eq!(
+        mul_div(1, 1, SCALE_1E7, Rounding::Floor),
+        Ok(0)
+    );
+    assert_eq!(
+        mul_div(1, 1, SCALE_1E7, Rounding::Ceil),
+        Ok(1)
+    );
+    assert_eq!(
+        mul_div_ceil(i128::MAX, i128::MAX, i128::MAX),
+        Ok(i128::MAX)
+    );
+    assert_eq!(
+        mul_div_ceil(i128::MAX, 2, 2),
+        Ok(i128::MAX)
+    );
+    assert_eq!(
+        mul_div_ceil(i128::MAX, 3, 2),
+        Err(MathError::Overflow)
+    );
+}
+
+#[test]
+fn apply_and_ratio_bps_table() {
+    assert_eq!(apply_bps_floor(1_000, 2_500), Ok(250));
+    assert_eq!(apply_bps_ceil(1_000, 2_500), Ok(250));
+    assert_eq!(apply_bps_floor(1, 1), Ok(0));
+    assert_eq!(apply_bps_ceil(1, 1), Ok(1));
+    assert_eq!(apply_bps_floor(1_000, 0), Ok(0));
+    assert_eq!(apply_bps_floor(1_000, MAX_BPS), Ok(1_000));
+    assert_eq!(apply_bps_floor(1_000, MAX_BPS + 1), Err(MathError::InvalidRatio));
+    assert_eq!(apply_bps_floor(-1, 500), Err(MathError::Negative));
+
+    assert_eq!(ratio_bps(250, 1_000, Rounding::Floor), Ok(2_500));
+    assert_eq!(ratio_bps(1, 3, Rounding::Floor), Ok(3_333));
+    assert_eq!(ratio_bps(1, 3, Rounding::Ceil), Ok(3_334));
+    assert_eq!(ratio_bps(0, 1_000, Rounding::Floor), Ok(0));
+    assert_eq!(ratio_bps(1_000, 1_000, Rounding::Floor), Ok(MAX_BPS));
+    assert_eq!(ratio_bps(1_001, 1_000, Rounding::Floor), Err(MathError::InvalidRatio));
+    assert_eq!(ratio_bps(1, 0, Rounding::Floor), Err(MathError::DivisionByZero));
+    assert_eq!(ratio_bps(-1, 10, Rounding::Floor), Err(MathError::Negative));
+}
+
+#[test]
+fn fixed_point_1e7_and_checked_helpers_table() {
+    assert_eq!(to_1e7(0), Ok(0));
+    assert_eq!(to_1e7(1), Ok(SCALE_1E7));
+    assert_eq!(to_1e7(42), Ok(420_000_000));
+    assert_eq!(to_1e7(-1), Err(MathError::Negative));
+    assert_eq!(to_1e7(i128::MAX), Err(MathError::Overflow));
+
+    assert_eq!(from_1e7(0, Rounding::Floor), Ok(0));
+    assert_eq!(from_1e7(SCALE_1E7, Rounding::Floor), Ok(1));
+    assert_eq!(from_1e7(SCALE_1E7 + 1, Rounding::Floor), Ok(1));
+    assert_eq!(from_1e7(SCALE_1E7 + 1, Rounding::Ceil), Ok(2));
+    assert_eq!(from_1e7(-1, Rounding::Floor), Err(MathError::Negative));
+
+    assert_eq!(checked_add(10, 20), Ok(30));
+    assert_eq!(checked_add(-1, 20), Err(MathError::Negative));
+    assert_eq!(checked_add(i128::MAX, 1), Err(MathError::Overflow));
+
+    assert_eq!(checked_sub(20, 10), Ok(10));
+    assert_eq!(checked_sub(10, 10), Ok(0));
+    assert_eq!(checked_sub(10, 11), Err(MathError::Negative));
+    assert_eq!(checked_sub(-1, 0), Err(MathError::Negative));
+
+    assert_eq!(checked_mul(6, 7), Ok(42));
+    assert_eq!(checked_mul(-1, 7), Err(MathError::Negative));
+    assert_eq!(checked_mul(i128::MAX, 2), Err(MathError::Overflow));
+
+    assert_eq!(saturating_add(i128::MAX, 5), i128::MAX);
+    assert_eq!(saturating_sub(i128::MIN, 5), i128::MIN);
+}
+
+#[test]
 fn route_dust_table() {
     assert_eq!(route_dust(10, 7), Ok((7, 3)));
     assert_eq!(route_dust(10, 10), Ok((10, 0)));
@@ -294,5 +375,39 @@ proptest! {
             let (sum_lo, carry) = ql.overflowing_add(r);
             prop_assert_eq!((qh + carry as u128, sum_lo), (hi, lo));
         }
+    }
+
+    #[test]
+    fn mul_div_ceil_never_below_floor_and_at_most_one_higher(
+        a in 0i128..(1i128 << 62),
+        b in 0i128..(1i128 << 62),
+        c in 1i128..(1i128 << 62),
+    ) {
+        let fl = mul_div_floor(a, b, c).unwrap();
+        let cl = mul_div_ceil(a, b, c).unwrap();
+        prop_assert!(cl >= fl);
+        prop_assert!(cl - fl <= 1);
+        if (a * b) % c == 0 {
+            prop_assert_eq!(cl, fl);
+        } else {
+            prop_assert_eq!(cl, fl + 1);
+        }
+    }
+
+    #[test]
+    fn apply_bps_floor_plus_complement_ceil_equals_amount(
+        amount in 0i128..=i128::MAX,
+        bps in 0u32..=MAX_BPS,
+    ) {
+        let floor_cut = apply_bps_floor(amount, bps).unwrap();
+        let comp_ceil = apply_bps_ceil(amount, MAX_BPS - bps).unwrap();
+        prop_assert_eq!(floor_cut + comp_ceil, amount);
+    }
+
+    #[test]
+    fn to_and_from_1e7_roundtrip(units in 0i128..=(i128::MAX / SCALE_1E7)) {
+        let scaled = to_1e7(units).unwrap();
+        prop_assert_eq!(from_1e7(scaled, Rounding::Floor), Ok(units));
+        prop_assert_eq!(from_1e7(scaled, Rounding::Ceil), Ok(units));
     }
 }

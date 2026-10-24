@@ -42,3 +42,7 @@ branches = 80.00
 [params]
 lines = 90.00
 branches = 82.00
+
+[math]
+lines = 95.00
+branches = 90.00

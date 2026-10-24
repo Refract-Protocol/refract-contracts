@@ -61,6 +61,7 @@
 //! is intentionally no admin override capable of redirecting an awarded
 //! commitment payout.
 
+use refract_math::{checked_add, checked_sub};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
@@ -304,9 +305,10 @@ impl RefractBountyEscrow {
             return Err(BountyError::InvalidAmount);
         }
         let token = Self::token_addr(&env)?;
-        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
         let balance = Self::raw_balance(&env)?;
-        env.storage().instance().set(&DataKey::Balance, &(balance + amount));
+        let new_balance = checked_add(balance, amount).map_err(|_| BountyError::InvalidAmount)?;
+        token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
+        env.storage().instance().set(&DataKey::Balance, &new_balance);
         Ok(())
     }
 
@@ -346,6 +348,8 @@ impl RefractBountyEscrow {
 
         // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
+        let new_balance =
+            checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
         // Transfer before updating state to surface transfer errors early,
         // but the balance is updated after so a revert leaves state consistent.
         let token = Self::token_addr(&env)?;
@@ -354,7 +358,7 @@ impl RefractBountyEscrow {
             &researcher,
             &amount,
         );
-        env.storage().instance().set(&DataKey::Balance, &(balance - amount));
+        env.storage().instance().set(&DataKey::Balance, &new_balance);
 
         let record = AwardRecord {
             researcher,
@@ -406,9 +410,11 @@ impl RefractBountyEscrow {
 
         // Reserve the funds.
         let reserved = Self::raw_reserved(&env)?;
+        let new_reserved =
+            checked_add(reserved, amount).map_err(|_| BountyError::InvalidAmount)?;
         env.storage()
             .instance()
-            .set(&DataKey::Reserved, &(reserved + amount));
+            .set(&DataKey::Reserved, &new_reserved);
 
         let payout_id: u64 = env
             .storage()
@@ -469,15 +475,19 @@ impl RefractBountyEscrow {
 
         // Release reservation.
         let reserved = Self::raw_reserved(&env)?;
+        let new_reserved =
+            checked_sub(reserved, amount).map_err(|_| BountyError::InsufficientBalance)?;
         env.storage()
             .instance()
-            .set(&DataKey::Reserved, &(reserved - amount));
+            .set(&DataKey::Reserved, &new_reserved);
 
         // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
+        let new_balance =
+            checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
         env.storage()
             .instance()
-            .set(&DataKey::Balance, &(balance - amount));
+            .set(&DataKey::Balance, &new_balance);
 
         // Transfer last — if it fails the state update above will revert with
         // it (Soroban's atomic transaction model), leaving the record Pending.
@@ -523,15 +533,19 @@ impl RefractBountyEscrow {
 
         // Release reservation.
         let reserved = Self::raw_reserved(&env)?;
+        let new_reserved =
+            checked_sub(reserved, amount).map_err(|_| BountyError::InsufficientBalance)?;
         env.storage()
             .instance()
-            .set(&DataKey::Reserved, &(reserved - amount));
+            .set(&DataKey::Reserved, &new_reserved);
 
         // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
+        let new_balance =
+            checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
         env.storage()
             .instance()
-            .set(&DataKey::Balance, &(balance - amount));
+            .set(&DataKey::Balance, &new_balance);
 
         // Transfer swept funds back to governance.
         token::Client::new(&env, &record.token).transfer(
@@ -881,21 +895,4 @@ impl RefractBountyEscrow {
     }
 
     /// Immutable record of a rewarded disclosure, if any.
-    pub fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
-        env.storage().persistent().get(&DataKey::Award(report_hash))
-    }
-
-    /// Pull-payout record by id.
-    pub fn get_payout(env: Env, payout_id: u64) -> Option<PayoutRecord> {
-        env.storage().persistent().get(&DataKey::Payout(payout_id))
-    }
-
-    /// Registered payout-address binding for a commitment, if any.
-    pub fn get_payout_binding(env: Env, commitment: BytesN<32>) -> Option<PayoutBindingRecord> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PayoutBinding(commitment))
-    }
-
-    /// Commitment-award record for a commitment, if any.
-    pub fn get_commitment_award(env: Env, commitment: BytesN<
+    pub fn get_award(

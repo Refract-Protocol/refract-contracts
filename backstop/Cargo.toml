@@ -11,6 +11,7 @@ crate-type = ["lib", "cdylib", "rlib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 refract-common = { path = "../common" }
+refract-math = { path = "../math" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

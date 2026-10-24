@@ -33,6 +33,21 @@ use alloc::vec::Vec;
 /// Basis-point denominator (100% = 10_000 bps).
 pub const BPS_DENOM: i128 = 10_000;
 
+/// Maximum valid basis-point value (100% = 10_000 bps) as `u32`.
+pub const MAX_BPS: u32 = 10_000;
+
+/// Standard Soroban 7-decimal fixed-point scale factor (`10^7` stroops per unit).
+pub const SCALE_1E7: i128 = 10_000_000;
+
+/// Explicit rounding direction for fixed-point and basis-point division.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rounding {
+    /// Round toward zero (down for non-negative values).
+    Floor,
+    /// Round away from zero (up for non-negative values when a remainder is present).
+    Ceil,
+}
+
 /// Errors returned by the allocation helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MathError {
@@ -155,14 +170,122 @@ pub fn split_ratio(amount: i128, numerator: i128, denominator: i128) -> Result<S
 /// Returns [`MathError::Overflow`] only when the final result does not fit in
 /// an `i128`.
 pub fn mul_div_floor(a: i128, b: i128, c: i128) -> Result<i128, MathError> {
+    mul_div(a, b, c, Rounding::Floor)
+}
+
+/// `ceil(a * b / c)` for non-negative inputs with a 256-bit intermediate.
+///
+/// Rounds up by one unit whenever `(a * b) mod c != 0`.
+/// Returns [`MathError::Overflow`] only when the final result does not fit in
+/// an `i128`.
+pub fn mul_div_ceil(a: i128, b: i128, c: i128) -> Result<i128, MathError> {
+    mul_div(a, b, c, Rounding::Ceil)
+}
+
+/// Computes `a * b / c` for non-negative `i128` inputs using a 256-bit
+/// intermediate and explicit [`Rounding`].
+pub fn mul_div(a: i128, b: i128, c: i128, rounding: Rounding) -> Result<i128, MathError> {
     if a < 0 || b < 0 || c < 0 {
         return Err(MathError::Negative);
     }
     if c == 0 {
         return Err(MathError::DivisionByZero);
     }
-    let (q, _) = mul_div_rem_u128(a as u128, b as u128, c as u128)?;
-    i128::try_from(q).map_err(|_| MathError::Overflow)
+    let (q, r) = mul_div_rem_u128(a as u128, b as u128, c as u128)?;
+    let adjusted = match rounding {
+        Rounding::Floor => q,
+        Rounding::Ceil => {
+            if r > 0 {
+                q.checked_add(1).ok_or(MathError::Overflow)?
+            } else {
+                q
+            }
+        }
+    };
+    i128::try_from(adjusted).map_err(|_| MathError::Overflow)
+}
+
+/// Applies a basis-point share (`0..=10_000`) to a non-negative `amount` with
+/// explicit [`Rounding`].
+pub fn apply_bps(amount: i128, bps: u32, rounding: Rounding) -> Result<i128, MathError> {
+    if bps > MAX_BPS {
+        return Err(MathError::InvalidRatio);
+    }
+    mul_div(amount, i128::from(bps), BPS_DENOM, rounding)
+}
+
+/// Applies a basis-point share (`0..=10_000`) to `amount`, rounding down.
+pub fn apply_bps_floor(amount: i128, bps: u32) -> Result<i128, MathError> {
+    apply_bps(amount, bps, Rounding::Floor)
+}
+
+/// Applies a basis-point share (`0..=10_000`) to `amount`, rounding up.
+pub fn apply_bps_ceil(amount: i128, bps: u32) -> Result<i128, MathError> {
+    apply_bps(amount, bps, Rounding::Ceil)
+}
+
+/// Computes the basis-point ratio `part * 10_000 / whole` (`0..=10_000`) for
+/// `0 <= part <= whole` and `whole > 0`.
+pub fn ratio_bps(part: i128, whole: i128, rounding: Rounding) -> Result<u32, MathError> {
+    if whole <= 0 {
+        return Err(MathError::DivisionByZero);
+    }
+    if part < 0 {
+        return Err(MathError::Negative);
+    }
+    if part > whole {
+        return Err(MathError::InvalidRatio);
+    }
+    let bps = mul_div(part, BPS_DENOM, whole, rounding)?;
+    u32::try_from(bps).map_err(|_| MathError::Overflow)
+}
+
+/// Converts whole token units to `1e7`-scaled stroops (`units * 10_000_000`).
+pub fn to_1e7(units: i128) -> Result<i128, MathError> {
+    if units < 0 {
+        return Err(MathError::Negative);
+    }
+    units.checked_mul(SCALE_1E7).ok_or(MathError::Overflow)
+}
+
+/// Converts `1e7`-scaled stroops back to whole token units with explicit
+/// [`Rounding`].
+pub fn from_1e7(scaled: i128, rounding: Rounding) -> Result<i128, MathError> {
+    mul_div(scaled, 1, SCALE_1E7, rounding)
+}
+
+/// Checked non-negative addition returning [`MathError`].
+pub fn checked_add(a: i128, b: i128) -> Result<i128, MathError> {
+    if a < 0 || b < 0 {
+        return Err(MathError::Negative);
+    }
+    a.checked_add(b).ok_or(MathError::Overflow)
+}
+
+/// Checked non-negative subtraction (`a - b >= 0`) returning [`MathError`].
+pub fn checked_sub(a: i128, b: i128) -> Result<i128, MathError> {
+    if a < 0 || b < 0 || b > a {
+        return Err(MathError::Negative);
+    }
+    Ok(a - b)
+}
+
+/// Checked non-negative multiplication returning [`MathError`].
+pub fn checked_mul(a: i128, b: i128) -> Result<i128, MathError> {
+    if a < 0 || b < 0 {
+        return Err(MathError::Negative);
+    }
+    a.checked_mul(b).ok_or(MathError::Overflow)
+}
+
+/// Non-panicking saturating addition on `i128`.
+pub fn saturating_add(a: i128, b: i128) -> i128 {
+    a.saturating_add(b)
+}
+
+/// Non-panicking saturating subtraction on `i128`.
+pub fn saturating_sub(a: i128, b: i128) -> i128 {
+    a.saturating_sub(b)
 }
 
 /// Moves the unowned part of a vault into the dust sink.
