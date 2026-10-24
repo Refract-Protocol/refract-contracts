@@ -126,6 +126,43 @@ stellar contract deploy \
 
 Then `initialize` each contract (admin, USDC token address, and pool↔registry wiring).
 
+## Operator CLI (`cargo xtask`)
+
+Routine administration and inspection of the four governance-adjacent contracts (`refract_backstop`, `refract_bounty`, `refract_grants`, and `refract_treasury`) is available via `cargo xtask`. Contract IDs, RPC URLs, and network passphrases are resolved automatically from `deployments/<network>.json` (with fallback to `deployments/config.json`).
+
+### Safety rules
+- **Fixed-point (`1e7`) scaling**: Pass human-readable decimal amounts (e.g. `250.5`); `xtask` converts them to `1e7` stroops (`2505000000`) using checked integer math.
+- **No raw secret keys**: `--source` accepts only a named Stellar CLI identity (`stellar keys add <name>`) or public address (`G...`) and rejects `S...` secret seeds on the command line.
+- **Mainnet confirmation gate**: Any state-mutating operation on `--network mainnet` requires `--confirm-mainnet`.
+- **Dry-run preview**: Pass `--dry-run` (and optionally `--json`) to inspect the exact `stellar contract invoke` command before broadcasting.
+
+### Examples
+
+```bash
+# Backstop: stake, unstake, and inspect pool/staker status
+cargo xtask backstop stake --network local --source alice --tranche senior --amount 250.5 --dry-run
+cargo xtask backstop unstake --network local --source alice --tranche senior --shares 100 --dry-run
+cargo xtask backstop status --network local --staker GBXEAS6ALJH4H45A4MNM5QQ2LCJUXAOXZVIIYTX7WH3LSHNKGUX3DTRT --dry-run
+
+# Bounty: top up escrow, inspect a payout/disclosure claim, or check balances
+cargo xtask bounty fund --network local --source alice --amount 1000 --dry-run
+cargo xtask bounty check-claim --network local --payout-id 0 --dry-run
+cargo xtask bounty status --network local --dry-run
+
+# Grants: confirm a delivered milestone or inspect grant liabilities
+cargo xtask grants approve-milestone --network local --source timelock --grant-id 1 --milestone-index 0 --dry-run
+cargo xtask grants status --network local --grant-id 1 --dry-run
+
+# Treasury: deposit tokens, propose a withdrawal request, or inspect status
+cargo xtask treasury deposit --network local --source alice --amount 500 --dry-run
+cargo xtask treasury propose-withdrawal --network local --source alice \
+  --payee GBXEAS6ALJH4H45A4MNM5QQ2LCJUXAOXZVIIYTX7WH3LSHNKGUX3DTRT \
+  --amount 75.25 \
+  --purpose-hash aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --dry-run
+cargo xtask treasury status --network local --request-id 0 --dry-run
+```
+
 ## Authorization model
 
 - **RefractPool** — `provide_capital`, `withdraw_capital`, and `buy_policy` require the caller's auth. `set_oracle`, `set_policy_registry`, `set_pool_config`, `set_admin`, and `set_paused` are admin-only. `process_claim` is permissionless and calls the wired `RefractOracle` contract cross-contract to verify the trigger condition. The former `update_oracle` admin-push shortcut has been removed; trigger state now comes exclusively from the real oracle contract.

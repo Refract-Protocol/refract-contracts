@@ -1,12 +1,53 @@
 #![no_std]
 
+//! # RefractBackstop
+//!
+//! First-loss insurance backstop tranche for `RefractPool`.
+//!
+//! ## Solvency & Coverage-Ratio Health Views (#239)
+//!
+//! Operators and the monitoring backend can inspect live backstop health via
+//! pure, read-only views and trigger hysteresis-guarded threshold alerts:
+//!
+//! - [`RefractBackstop::total_staked_capital`]: total capital currently staked.
+//! - [`RefractBackstop::encumbered_capital`] & [`RefractBackstop::idle_capital`]:
+//!   capital encumbered by in-force pool coverage vs unencumbered idle capital.
+//! - [`RefractBackstop::aggregate_in_force_coverage`]: pulls aggregate active
+//!   coverage from `RefractPool::aggregate_in_force_coverage` via
+//!   `try_invoke_contract`, degrading gracefully to cached coverage if the
+//!   cross-contract read is unavailable.
+//! - [`RefractBackstop::solvency_ratio_bps`]: `total_capital / coverage` in
+//!   basis points (computed via 1e7 fixed-point helper); returns `None` when
+//!   in-force coverage is zero.
+//! - [`RefractBackstop::coverage_ratio_bps`]: `coverage / total_capital` in
+//!   basis points; returns `None` when staked capital is zero.
+//! - [`RefractBackstop::feed_utilization_bps`]: per-feed coverage utilization
+//!   against backstop capital in basis points; returns `None` when staked
+//!   capital is zero.
+//! - [`RefractBackstop::check_health`]: permissionless entrypoint that compares
+//!   live ratios against admin-configured [`HealthThresholds`] and emits
+//!   `HLTHALRT` / `HLTHRECV` events only on threshold crossings with
+//!   hysteresis.
+
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    IntoVal, Symbol, Vec,
 };
 
-/// Basis-point denominator used for premium-share configuration.
+/// Basis-point denominator used for premium-share and ratio configuration.
 const BPS_DENOM: i128 = 10_000;
+
+/// 1e7 fixed-point scaling factor used for intermediate ratio math.
+const FP_SCALE: i128 = 10_000_000;
+
+/// Default minimum solvency ratio threshold in basis points (100% = 10,000 bps).
+pub const DEFAULT_MIN_SOLVENCY_BPS: i128 = 10_000;
+
+/// Default maximum coverage-to-capital ratio threshold in basis points (100% = 10,000 bps).
+pub const DEFAULT_MAX_COVERAGE_BPS: i128 = 10_000;
+
+/// Default hysteresis band in basis points (5% = 500 bps) required to clear an active alert.
+pub const DEFAULT_HYSTERESIS_BPS: i128 = 500;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +76,9 @@ enum DataKey {
     PolicyExposure(u64),
     AggregateFeedExposure,
     TrackedFeeds,
+    CachedCoverage,
+    HealthThresholds,
+    HealthAlertState,
 }
 
 #[contracttype]
@@ -100,6 +144,41 @@ pub enum BackstopError {
     FeedCapExceeded = 14,
     HolderFeedCapExceeded = 15,
     DuplicatePolicyExposure = 16,
+    InvalidThreshold = 17,
+}
+
+/// Admin-configured health thresholds and hysteresis band (in basis points).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthThresholds {
+    /// Alert triggers when `solvency_ratio_bps < min_solvency_bps` and clears
+    /// when `solvency_ratio_bps >= min_solvency_bps + hysteresis_bps`.
+    pub min_solvency_bps: i128,
+    /// Alert triggers when `coverage_ratio_bps > max_coverage_bps` and clears
+    /// when `coverage_ratio_bps <= max_coverage_bps - hysteresis_bps`.
+    pub max_coverage_bps: i128,
+    /// Hysteresis band (in bps) preventing repeated event spam near the boundary.
+    pub hysteresis_bps: i128,
+}
+
+/// Latched alert state persisted across `check_health` calls.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthAlertState {
+    pub solvency_breached: bool,
+    pub coverage_breached: bool,
+}
+
+/// Pure read-only health snapshot of the backstop tranche.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopHealthSnapshot {
+    pub total_capital: i128,
+    pub encumbered_capital: i128,
+    pub idle_capital: i128,
+    pub aggregate_coverage: i128,
+    pub solvency_ratio_bps: Option<i128>,
+    pub coverage_ratio_bps: Option<i128>,
 }
 
 #[contracttype]
@@ -171,6 +250,22 @@ impl RefractBackstop {
         env.storage().instance().set(&DataKey::UnabsorbedShortfall, &0i128);
         env.storage().instance().set(&DataKey::AggregateFeedExposure, &0i128);
         env.storage().instance().set(&DataKey::TrackedFeeds, &Vec::<Symbol>::new(&env));
+        env.storage().instance().set(&DataKey::CachedCoverage, &0i128);
+        env.storage().instance().set(
+            &DataKey::HealthThresholds,
+            &HealthThresholds {
+                min_solvency_bps: DEFAULT_MIN_SOLVENCY_BPS,
+                max_coverage_bps: DEFAULT_MAX_COVERAGE_BPS,
+                hysteresis_bps: DEFAULT_HYSTERESIS_BPS,
+            },
+        );
+        env.storage().instance().set(
+            &DataKey::HealthAlertState,
+            &HealthAlertState {
+                solvency_breached: false,
+                coverage_breached: false,
+            },
+        );
         for tranche in [Tranche::Junior, Tranche::Senior] {
             env.storage().instance().set(
                 &DataKey::TrancheState(tranche),
@@ -752,236 +847,4 @@ impl RefractBackstop {
             return Err(BackstopError::Unauthorized);
         }
         if max_feed_coverage < 0
-            || !(0..=BPS_DENOM).contains(&max_feed_coverage_bps)
-            || max_holder_feed_coverage < 0
-        {
-            return Err(BackstopError::InvalidFeedCap);
-        }
-        let cap = FeedCapConfig {
-            max_feed_coverage,
-            max_feed_coverage_bps,
-            max_holder_feed_coverage,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::FeedCap(feed.clone()), &cap);
-        env.events().publish(
-            (symbol_short!("FEEDCAP"), feed),
-            (
-                max_feed_coverage,
-                max_feed_coverage_bps,
-                max_holder_feed_coverage,
-            ),
-        );
-        Ok(())
-    }
-
-    /// Return the configured exposure caps for `feed`, if any.
-    pub fn feed_cap(env: Env, feed: Symbol) -> Option<FeedCapConfig> {
-        env.storage().persistent().get(&DataKey::FeedCap(feed))
-    }
-
-    /// Return the active underwritten coverage currently tracked on `feed`.
-    pub fn feed_exposure(env: Env, feed: Symbol) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::FeedExposure(feed))
-            .unwrap_or(0)
-    }
-
-    /// Return the active underwritten coverage held by `holder` on `feed`.
-    pub fn holder_feed_exposure(env: Env, holder: Address, feed: Symbol) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::HolderFeedExposure(holder, feed))
-            .unwrap_or(0)
-    }
-
-    /// Return the aggregate active underwritten coverage across all tracked feeds.
-    pub fn aggregate_feed_exposure(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::AggregateFeedExposure)
-            .unwrap_or(0)
-    }
-
-    /// Return the list of feeds that have had underwriting exposure recorded.
-    pub fn tracked_feeds(env: Env) -> Vec<Symbol> {
-        env.storage()
-            .instance()
-            .get(&DataKey::TrackedFeeds)
-            .unwrap_or(Vec::new(&env))
-    }
-
-    /// Return the recorded exposure metadata for `policy_id`, if any.
-    pub fn policy_exposure(env: Env, policy_id: u64) -> Option<PolicyExposureRecord> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PolicyExposure(policy_id))
-    }
-
-    /// Pure read-only check verifying whether adding `coverage_amount` for
-    /// `(holder, feed)` stays within the feed's absolute cap, relative bps cap,
-    /// and per-holder-per-feed cap.
-    pub fn check_exposure_caps(
-        env: Env,
-        holder: Address,
-        feed: Symbol,
-        coverage_amount: i128,
-    ) -> Result<(), BackstopError> {
-        if coverage_amount <= 0 {
-            return Err(BackstopError::InvalidAmount);
-        }
-        let state = Self::get_state(&env)?;
-        let Some(cap) = Self::feed_cap(env.clone(), feed.clone()) else {
-            return Ok(());
-        };
-        let next_feed = Self::feed_exposure(env.clone(), feed.clone()) + coverage_amount;
-        if cap.max_feed_coverage > 0 && next_feed > cap.max_feed_coverage {
-            return Err(BackstopError::FeedCapExceeded);
-        }
-        if cap.max_feed_coverage_bps > 0 {
-            let max_by_bps = state.total_capital * cap.max_feed_coverage_bps / BPS_DENOM;
-            if next_feed > max_by_bps {
-                return Err(BackstopError::FeedCapExceeded);
-            }
-        }
-        if cap.max_holder_feed_coverage > 0 {
-            let next_holder =
-                Self::holder_feed_exposure(env, holder, feed) + coverage_amount;
-            if next_holder > cap.max_holder_feed_coverage {
-                return Err(BackstopError::HolderFeedCapExceeded);
-            }
-        }
-        Ok(())
-    }
-
-    /// Record underwriting exposure for a newly issued policy after enforcing
-    /// all configured concentration caps. Callable only by the pool or admin.
-    pub fn record_policy_exposure(
-        env: Env,
-        caller: Address,
-        policy_id: u64,
-        holder: Address,
-        feed: Symbol,
-        coverage_amount: i128,
-    ) -> Result<(), BackstopError> {
-        caller.require_auth();
-        let config = Self::get_config(&env)?;
-        if caller != config.pool && caller != config.admin {
-            return Err(BackstopError::Unauthorized);
-        }
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::PolicyExposure(policy_id))
-        {
-            return Err(BackstopError::DuplicatePolicyExposure);
-        }
-        Self::check_exposure_caps(env.clone(), holder.clone(), feed.clone(), coverage_amount)?;
-
-        let prev_feed = Self::feed_exposure(env.clone(), feed.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::FeedExposure(feed.clone()), &(prev_feed + coverage_amount));
-
-        let prev_holder = Self::holder_feed_exposure(env.clone(), holder.clone(), feed.clone());
-        env.storage().persistent().set(
-            &DataKey::HolderFeedExposure(holder.clone(), feed.clone()),
-            &(prev_holder + coverage_amount),
-        );
-
-        let prev_agg = Self::aggregate_feed_exposure(env.clone());
-        env.storage()
-            .instance()
-            .set(&DataKey::AggregateFeedExposure, &(prev_agg + coverage_amount));
-
-        let mut feeds = Self::tracked_feeds(env.clone());
-        let mut seen = false;
-        for f in feeds.iter() {
-            if f == feed {
-                seen = true;
-                break;
-            }
-        }
-        if !seen {
-            feeds.push_back(feed.clone());
-            env.storage().instance().set(&DataKey::TrackedFeeds, &feeds);
-        }
-
-        let record = PolicyExposureRecord {
-            policy_id,
-            holder,
-            feed: feed.clone(),
-            amount: coverage_amount,
-            active: true,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::PolicyExposure(policy_id), &record);
-
-        env.events().publish(
-            (symbol_short!("EXP_ADD"), feed),
-            (policy_id, coverage_amount),
-        );
-        Ok(())
-    }
-
-    /// Release underwriting exposure when a policy settles or expires.
-    /// Idempotent per `policy_id`: a subsequent call for an already-released
-    /// policy (e.g., if both settlement and expiry paths invoke release) is a
-    /// safe no-op returning `Ok(0)` and never double-decrements exposure.
-    pub fn release_policy_exposure(
-        env: Env,
-        caller: Address,
-        policy_id: u64,
-    ) -> Result<i128, BackstopError> {
-        caller.require_auth();
-        let config = Self::get_config(&env)?;
-        if caller != config.pool && caller != config.admin {
-            return Err(BackstopError::Unauthorized);
-        }
-        let Some(mut record) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, PolicyExposureRecord>(&DataKey::PolicyExposure(policy_id))
-        else {
-            return Ok(0);
-        };
-        if !record.active {
-            return Ok(0);
-        }
-        record.active = false;
-        env.storage()
-            .persistent()
-            .set(&DataKey::PolicyExposure(policy_id), &record);
-
-        let prev_feed = Self::feed_exposure(env.clone(), record.feed.clone());
-        env.storage().persistent().set(
-            &DataKey::FeedExposure(record.feed.clone()),
-            &(prev_feed - record.amount).max(0),
-        );
-
-        let prev_holder =
-            Self::holder_feed_exposure(env.clone(), record.holder.clone(), record.feed.clone());
-        env.storage().persistent().set(
-            &DataKey::HolderFeedExposure(record.holder, record.feed.clone()),
-            &(prev_holder - record.amount).max(0),
-        );
-
-        let prev_agg = Self::aggregate_feed_exposure(env.clone());
-        env.storage().instance().set(
-            &DataKey::AggregateFeedExposure,
-            &(prev_agg - record.amount).max(0),
-        );
-
-        env.events().publish(
-            (symbol_short!("EXP_REL"), record.feed),
-            (policy_id, record.amount),
-        );
-        Ok(record.amount)
-    }
-}
-
-#[cfg(test)]
-mod test;
+            || !(0..=

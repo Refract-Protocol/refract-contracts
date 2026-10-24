@@ -662,3 +662,177 @@ fn test_multi_feed_exposure_sum_invariant() {
     assert_eq!(sum, 3_600);
 }
 
+// ── Issue #239: Solvency & Coverage-Ratio Health Views tests ─────────────────
+
+#[contract]
+pub struct MockCoveragePool;
+
+#[contractimpl]
+impl MockCoveragePool {
+    pub fn set_coverage(env: Env, coverage: i128) {
+        env.storage().instance().set(&symbol_short!("cov"), &coverage);
+    }
+
+    pub fn set_feed(env: Env, feed: Symbol, exposure: i128) {
+        env.storage().persistent().set(&feed, &exposure);
+    }
+
+    pub fn aggregate_in_force_coverage(env: Env) -> i128 {
+        env.storage().instance().get(&symbol_short!("cov")).unwrap_or(0)
+    }
+
+    pub fn feed_in_force_coverage(env: Env, feed: Symbol) -> i128 {
+        env.storage().persistent().get(&feed).unwrap_or(0)
+    }
+}
+
+#[test]
+fn test_health_views_zero_one_and_extreme_balances() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let mock_pool_id = env.register_contract(None, MockCoveragePool);
+    let mock_pool = MockCoveragePoolClient::new(&env, &mock_pool_id);
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin);
+    let sac = token::StellarAssetClient::new(&env, &token_id.address());
+
+    let contract_id = env.register_contract(None, RefractBackstop);
+    let client = RefractBackstopClient::new(&env, &contract_id);
+    client.initialize(&mock_pool_id, &admin, &token_id.address(), &2_000);
+
+    // 1. Zero capital, zero coverage -> division-by-zero returns None, never panics.
+    assert_eq!(client.total_staked_capital(), 0);
+    assert_eq!(client.aggregate_in_force_coverage(), 0);
+    assert_eq!(client.encumbered_capital(), 0);
+    assert_eq!(client.idle_capital(), 0);
+    assert_eq!(client.solvency_ratio_bps(), None);
+    assert_eq!(client.coverage_ratio_bps(), None);
+    assert_eq!(client.feed_utilization_bps(&symbol_short!("USDC")), None);
+
+    // 2. Unit balance (1) and unit coverage (1) -> 10_000 bps (100%).
+    let staker = Address::generate(&env);
+    sac.mint(&staker, &1_000_000_000_000_000_000i128);
+    client.deposit(&staker, &1);
+    mock_pool.set_coverage(&1);
+    mock_pool.set_feed(&symbol_short!("USDC"), &1);
+
+    assert_eq!(client.total_staked_capital(), 1);
+    assert_eq!(client.encumbered_capital(), 1);
+    assert_eq!(client.idle_capital(), 0);
+    assert_eq!(client.solvency_ratio_bps(), Some(10_000));
+    assert_eq!(client.coverage_ratio_bps(), Some(10_000));
+    assert_eq!(
+        client.feed_utilization_bps(&symbol_short!("USDC")),
+        Some(10_000)
+    );
+
+    // 3. Extreme balance: 500_000_000_000_000_000 capital vs 250_000_000_000_000_000 coverage.
+    let extreme_add = 500_000_000_000_000_000i128 - 1;
+    client.deposit(&staker, &extreme_add);
+    mock_pool.set_coverage(&250_000_000_000_000_000i128);
+    mock_pool.set_feed(&symbol_short!("USDC"), &125_000_000_000_000_000i128);
+
+    let snap = client.health_snapshot();
+    assert_eq!(snap.total_capital, 500_000_000_000_000_000i128);
+    assert_eq!(snap.encumbered_capital, 250_000_000_000_000_000i128);
+    assert_eq!(snap.idle_capital, 250_000_000_000_000_000i128);
+    assert_eq!(snap.solvency_ratio_bps, Some(20_000)); // 200%
+    assert_eq!(snap.coverage_ratio_bps, Some(5_000)); // 50%
+    assert_eq!(
+        client.feed_utilization_bps(&symbol_short!("USDC")),
+        Some(2_500)
+    );
+}
+
+#[test]
+fn test_check_health_threshold_crossing_and_hysteresis() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let mock_pool_id = env.register_contract(None, MockCoveragePool);
+    let mock_pool = MockCoveragePoolClient::new(&env, &mock_pool_id);
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin);
+    let sac = token::StellarAssetClient::new(&env, &token_id.address());
+
+    let contract_id = env.register_contract(None, RefractBackstop);
+    let client = RefractBackstopClient::new(&env, &contract_id);
+    client.initialize(&mock_pool_id, &admin, &token_id.address(), &2_000);
+
+    // Configure min_solvency_bps = 10_000 (100%), max_coverage_bps = 10_000 (100%), hysteresis = 1_000 (10%).
+    client.set_health_thresholds(&admin, &10_000, &10_000, &1_000);
+    assert_eq!(
+        client.health_thresholds(),
+        HealthThresholds {
+            min_solvency_bps: 10_000,
+            max_coverage_bps: 10_000,
+            hysteresis_bps: 1_000,
+        }
+    );
+
+    let staker = Address::generate(&env);
+    sac.mint(&staker, &100_000);
+    client.deposit(&staker, &10_000);
+
+    // Coverage = 8_000 -> solvency = 12_500 bps, coverage = 8_000 bps (healthy).
+    mock_pool.set_coverage(&8_000);
+    let state = client.check_health();
+    assert!(!state.solvency_breached);
+    assert!(!state.coverage_breached);
+
+    // Coverage rises to 12_500 -> solvency = 8_000 bps (< 10_000), coverage = 12_500 bps (> 10_000).
+    // Crosses threshold -> both alerts latch.
+    mock_pool.set_coverage(&12_500);
+    let state = client.check_health();
+    assert!(state.solvency_breached);
+    assert!(state.coverage_breached);
+
+    // Coverage improves slightly to 9_500 -> solvency = 10_526 bps (< 11_000 required by hysteresis),
+    // coverage = 9_500 bps (> 9_000 required by hysteresis). Remains latched!
+    mock_pool.set_coverage(&9_500);
+    let state = client.check_health();
+    assert!(state.solvency_breached);
+    assert!(state.coverage_breached);
+
+    // Coverage drops to 8_000 -> solvency = 12_500 bps (>= 11_000), coverage = 8_000 bps (<= 9_000).
+    // Clears hysteresis band -> both alerts recover!
+    mock_pool.set_coverage(&8_000);
+    let state = client.check_health();
+    assert!(!state.solvency_breached);
+    assert!(!state.coverage_breached);
+}
+
+#[test]
+fn test_graceful_fallback_when_pool_is_not_deployed_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // setup_backstop uses a plain generated Address for `pool` (not a deployed contract).
+    let (pool, _, client, contract_id, token_id, _, sac, token_admin) = setup_backstop(&env);
+    let staker = Address::generate(&env);
+    deposit_capital(
+        &env,
+        &staker,
+        10_000,
+        &client,
+        &contract_id,
+        &token_id,
+        &sac,
+        &token_admin,
+    );
+
+    // Cross-contract call fails gracefully and falls back to cached coverage (0).
+    env.mock_all_auths();
+    assert_eq!(client.aggregate_in_force_coverage(), 0);
+    assert_eq!(client.solvency_ratio_bps(), None);
+    assert_eq!(client.coverage_ratio_bps(), Some(0));
+
+    // Push cached coverage from pool and verify views reflect it.
+    let mut feeds = Vec::new(&env);
+    feeds.push_back((symbol_short!("DEPEG"), 4_000i128));
+    client.s

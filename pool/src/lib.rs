@@ -838,6 +838,12 @@ impl RefractPool {
         }
     }
 
+    /// Cheap, pure single-read view of aggregate in-force coverage across all active policies.
+    /// Consulted by `RefractBackstop` health and solvency views (#239).
+    pub fn aggregate_in_force_coverage(env: Env) -> i128 {
+        Self::_accounting(&env).total_coverage
+    }
+
     pub fn get_policy(env: Env, id: u64) -> Option<Policy> {
         env.storage().persistent().get(&DataKey::Policy(id))
     }
