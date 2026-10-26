@@ -17,6 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check the panic-free policy
         run: bash scripts/check_panic_free.sh
