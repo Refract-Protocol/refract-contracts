@@ -56,6 +56,12 @@ pub enum DataKey {
     /// Screening status for a grant recipient (issue #244).
     RecipientStatus(Address),
     ReentrancyLock,
+    /// Whether the contract is paused (instance, #211).
+    Paused,
+    /// On-chain storage schema version (instance, #212).
+    SchemaVersion,
+    /// Pauser role holder (persistent, #211).
+    PauserRole(Address),
 }
 
 #[contracttype]
@@ -93,10 +99,17 @@ pub enum GrantsError {
     /// (issue #244).
     RecipientNotAllowed = 20,
     ReentrancyDetected = 21,
+    /// The contract is paused (#211).
+    Paused = 22,
 }
 
 #[contract]
 pub struct RefractGrants;
+
+impl RefractGrants {
+    /// Current on-chain storage schema version for the grants contract.
+    pub const SCHEMA_VERSION: u32 = 1;
+}
 
 #[contractimpl]
 impl RefractGrants {
@@ -143,6 +156,7 @@ impl RefractGrants {
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, GrantsError> {
         Self::require_governance(&env, &caller)?;
+        Self::require_not_paused(&env)?;
         if total_amount <= 0 {
             return Err(GrantsError::InvalidTotalAmount);
         }
@@ -197,6 +211,7 @@ impl RefractGrants {
         milestone_index: u32,
     ) -> Result<(), GrantsError> {
         Self::require_governance(&env, &caller)?;
+        Self::require_not_paused(&env)?;
         let mut grant = Self::grant(&env, grant_id)?;
         if milestone_index >= grant.milestones.len() {
             return Err(GrantsError::InvalidMilestoneIndex);
@@ -542,6 +557,151 @@ impl RefractGrants {
     fn release_reentrancy_guard(env: &Env) {
         env.storage().temporary().remove(&DataKey::ReentrancyLock);
     }
+
+    // ─── #211: Coordinated pause facility ─────────────────────────────────
+
+    /// Grant the pauser role to `account`. Governance-only.
+    pub fn grant_pauser_role(
+        env: Env,
+        caller: Address,
+        account: Address,
+    ) -> Result<(), GrantsError> {
+        caller.require_auth();
+        Self::require_governance(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauserRole(account.clone()), &true);
+        env.events().publish((symbol_short!("PROLE_G"),), account);
+        Ok(())
+    }
+
+    /// Revoke the pauser role from `account`. Governance-only.
+    pub fn revoke_pauser_role(
+        env: Env,
+        caller: Address,
+        account: Address,
+    ) -> Result<(), GrantsError> {
+        caller.require_auth();
+        Self::require_governance(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PauserRole(account.clone()));
+        env.events().publish((symbol_short!("PROLE_R"),), account);
+        Ok(())
+    }
+
+    /// Pause the grants contract. Callable by the pauser role or governance.
+    /// While paused, `create_grant` and `confirm_milestone` are blocked.
+    /// `claim` (outflow) remains callable so confirmed-but-unclaimed funds
+    /// can be settled by grantees.
+    pub fn pause(env: Env, caller: Address) -> Result<(), GrantsError> {
+        caller.require_auth();
+        Self::require_governance_or_pauser(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("GR_PAUS"),), caller);
+        Ok(())
+    }
+
+    /// Unpause the grants contract. Governance-only (pauser can freeze but not
+    /// unilaterally resume, matching the pool guardian asymmetry).
+    pub fn unpause(env: Env, caller: Address) -> Result<(), GrantsError> {
+        caller.require_auth();
+        Self::require_governance(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("GR_UNPS"),), caller);
+        Ok(())
+    }
+
+    /// Whether the grants contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    // ─── #212: Timelock-gated upgrade + state migration ───────────────────
+
+    /// Replace the contract wasm. Governance (timelock) only.
+    /// Must be queued through the timelock to enforce the mandatory upgrade delay.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), GrantsError> {
+        caller.require_auth();
+        Self::require_governance(&env, &caller)?;
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((symbol_short!("GR_UPGR"),), new_wasm_hash);
+        Ok(())
+    }
+
+    /// Migrate on-chain storage from a previous schema to `SCHEMA_VERSION`.
+    /// Governance (timelock) only. Idempotent: calling it when already at the
+    /// current version returns the current version unchanged.
+    pub fn migrate(env: Env, caller: Address) -> Result<u32, GrantsError> {
+        caller.require_auth();
+        Self::require_governance(&env, &caller)?;
+        let stored: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(0);
+        if stored >= Self::SCHEMA_VERSION {
+            return Ok(stored);
+        }
+        // ── Schema 0 → 1 ──────────────────────────────────────────────────
+        // Version 1 is the initial schema. Ensure instance keys introduced
+        // in v1 carry sensible defaults on any pre-v1 deployment.
+        if stored < 1 {
+            if !env.storage().instance().has(&DataKey::NextGrantId) {
+                env.storage().instance().set(&DataKey::NextGrantId, &0u64);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &Self::SCHEMA_VERSION);
+        env.events()
+            .publish((symbol_short!("GR_MIGR"),), Self::SCHEMA_VERSION);
+        Ok(Self::SCHEMA_VERSION)
+    }
+
+    /// The schema version currently stored on-chain (0 if never migrated).
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(0)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), GrantsError> {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(GrantsError::Paused);
+        }
+        Ok(())
+    }
+
+    fn require_governance_or_pauser(env: &Env, caller: &Address) -> Result<(), GrantsError> {
+        let governance = Self::governance(env)?;
+        if *caller == governance {
+            return Ok(());
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PauserRole(caller.clone()))
+        {
+            return Ok(());
+        }
+        Err(GrantsError::Unauthorized)
+    }
 }
 
 #[cfg(test)]
@@ -611,3 +771,7 @@ mod reentrancy_test {
         assert_eq!(client.get_grant(&grant_id).unwrap().claimable, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "proptest_invariants.rs"]
+mod proptest_invariants;

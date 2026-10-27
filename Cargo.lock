@@ -1099,7 +1099,9 @@ dependencies = [
 name = "refract-backstop"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "refract-common",
+ "refract-math",
  "refract-registry",
  "soroban-sdk",
 ]
@@ -1108,6 +1110,7 @@ dependencies = [
 name = "refract-bounty"
 version = "0.1.0"
 dependencies = [
+ "refract-math",
  "soroban-sdk",
 ]
 
@@ -1141,6 +1144,8 @@ dependencies = [
 name = "refract-grants"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "refract-math",
  "sha2",
  "soroban-sdk",
 ]
@@ -1183,6 +1188,13 @@ name = "refract-interfaces"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+]
+
+[[package]]
+name = "refract-math"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
@@ -1259,6 +1271,7 @@ dependencies = [
 name = "refract-treasury"
 version = "0.1.0"
 dependencies = [
+ "refract-math",
  "soroban-sdk",
 ]
 

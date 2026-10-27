@@ -17,3 +17,4 @@ refract-math = { path = "../math" }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils", "alloc"] }
+proptest = { workspace = true }

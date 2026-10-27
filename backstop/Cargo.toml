@@ -17,6 +17,7 @@ refract-math = { path = "../math" }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 refract-common = { path = "../common", features = ["testutils"] }
 refract-registry = { path = "../registry" }
+proptest = { workspace = true }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

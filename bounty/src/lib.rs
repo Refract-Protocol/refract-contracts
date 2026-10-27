@@ -60,6 +60,21 @@
 //! unrecoverable loss of the ability to claim or rotate that commitment. There
 //! is intentionally no admin override capable of redirecting an awarded
 //! commitment payout.
+//!
+//! ## Issue #211 — Coordinated Pause Facility
+//!
+//! A pauser role (or governance directly) can call `pause` to halt
+//! state-mutating inflows (`fund`, `award`, `create_payout`,
+//! `award_commitment`). Outflows (`claim`, `sweep_expired`,
+//! `claim_by_commitment`) remain callable while paused so funds already
+//! in flight can be settled. Unpausing requires governance (not just a
+//! pauser), matching the pool guardian asymmetry.
+//!
+//! ## Issue #212 — Timelock-Gated Upgrade + State Migration
+//!
+//! `upgrade` replaces the contract wasm; governance must queue it through the
+//! timelock. After upgrade, `migrate` runs any storage-schema changes and
+//! records `DataKey::SchemaVersion`. Both entrypoints are governance-only.
 
 use refract_math::{checked_add, checked_sub};
 use soroban_sdk::{
@@ -78,11 +93,6 @@ pub const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
 pub const PERSISTENT_TTL_EXTEND: u32 = 518_400;
 
 // ── Allowlist helpers ─────────────────────────────────────────────────────────
-//
-// The bounty contract stores its own recipient-status entries rather than
-// calling a separate allowlist contract, keeping the dependency graph simple.
-// The `common::allowlist` module is designed to live inside the host contract's
-// persistent storage; we use it directly here.
 
 /// Screening status for a payout recipient (issue #244).
 #[contracttype]
@@ -117,7 +127,6 @@ pub enum DataKey {
     /// Pull-based payout escrow record.
     Payout(u64),
     /// Screening status for a recipient address (issue #244).
-    /// Maps `Address → ScreeningStatus` — see `common::allowlist`.
     RecipientStatus(Address),
     /// Payout-address binding keyed by `commitment = SHA-256(preimage)`.
     PayoutBinding(BytesN<32>),
@@ -129,13 +138,17 @@ pub enum DataKey {
     UsedCommitment(BytesN<32>),
     /// Tracks whether a payout address is frozen as compromised.
     FrozenAddress(Address),
+    /// Contract-level pause flag (instance). `true` while paused. (#211)
+    Paused,
+    /// Addresses that hold the pauser role (persistent). (#211)
+    PauserRole(Address),
+    /// Storage schema version (instance). (#212)
+    SchemaVersion,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Immutable, timestamped record that a specific disclosure was rewarded.
-/// Only the commitment (hash) is stored on-chain; vulnerability details stay
-/// off-chain per SECURITY.md.
 #[contracttype]
 #[derive(Clone)]
 pub struct AwardRecord {
@@ -150,11 +163,8 @@ pub struct AwardRecord {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum PayoutStatus {
-    /// Awaiting claim by the recipient.
     Pending = 0,
-    /// Successfully claimed by the recipient.
     Claimed = 1,
-    /// Deadline passed and funds swept back to governance.
     Swept = 2,
 }
 
@@ -162,15 +172,10 @@ pub enum PayoutStatus {
 #[contracttype]
 #[derive(Clone)]
 pub struct PayoutRecord {
-    /// The address allowed to call `claim`.
     pub recipient: Address,
-    /// Token asset (must match the contract's configured token).
     pub token: Address,
-    /// Amount reserved for this payout.
     pub amount: i128,
-    /// Ledger timestamp after which `sweep_expired` is callable.
     pub deadline: u64,
-    /// Current payout status.
     pub status: PayoutStatus,
 }
 
@@ -179,23 +184,17 @@ pub struct PayoutRecord {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum CommitmentAwardStatus {
-    /// Adjudicated and reserved against the commitment; preimage not yet revealed.
     Awarded = 0,
-    /// Preimage verified and reward paid to the bound payout address.
     Claimed = 1,
 }
 
-/// Binding between a commitment (`SHA-256(preimage)`) and a rotatable payout address.
+/// Binding between a commitment and a rotatable payout address.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PayoutBindingRecord {
-    /// Controller authorized to rotate the payout address or trigger a claim.
     pub owner: Address,
-    /// Current destination address that receives funds when claimed.
     pub payout_address: Address,
-    /// Ledger timestamp when the binding was created or last rotated.
     pub registered_at: u64,
-    /// Ledger timestamp after which the binding is considered expired until refreshed/rotated.
     pub expires_at: u64,
 }
 
@@ -203,15 +202,10 @@ pub struct PayoutBindingRecord {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitmentAwardRecord {
-    /// SHA-256 commitment to the vulnerability report.
     pub report_hash: BytesN<32>,
-    /// Payout commitment (`SHA-256(preimage)`) bound at disclosure/award time.
     pub commitment: BytesN<32>,
-    /// Reserved reward amount.
     pub amount: i128,
-    /// Ledger timestamp when the award was approved.
     pub awarded_at: u64,
-    /// Current state (`Awarded` vs `Claimed`).
     pub status: CommitmentAwardStatus,
 }
 
@@ -227,33 +221,21 @@ pub enum BountyError {
     InsufficientBalance = 4,
     Unauthorized = 5,
     DuplicateReport = 6,
-    /// No payout record with the given id.
     PayoutNotFound = 7,
-    /// Caller is not the payout recipient.
     NotRecipient = 8,
-    /// Payout is not in Pending/Awarded status.
     PayoutAlreadySettled = 9,
-    /// Sweep called before the deadline.
     DeadlineNotReached = 10,
-    /// Payout deadline must be in the future.
     InvalidDeadline = 11,
-    /// The destination address has not been screened and allowlisted by
-    /// governance (issue #244).
     RecipientNotAllowed = 12,
-    /// Commitment was already registered or bound to another report.
     CommitmentAlreadyUsed = 13,
-    /// No payout-address binding found for the commitment.
     BindingNotFound = 14,
-    /// Payout-address binding TTL has expired.
     BindingExpired = 15,
-    /// Caller is not the owner of the payout-address binding.
     NotBindingOwner = 16,
-    /// Preimage does not match any awarded commitment.
     InvalidPreimage = 17,
-    /// Payout address is currently frozen by governance as compromised.
     AddressFrozen = 18,
-    /// Commitment does not match the commitment recorded at disclosure time.
     CommitmentMismatch = 19,
+    /// The contract is paused; state-mutating inflows are blocked. (#211)
+    Paused = 20,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -296,11 +278,158 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
+    // ─── #211: Coordinated pause facility ────────────────────────────────
+    //
+    // Pauser role (or governance) can pause. While paused:
+    //   - fund, award, create_payout, award_commitment are refused.
+    //   - claim, sweep_expired, claim_by_commitment still work so funds
+    //     already in flight can settle.
+    // Unpausing is governance-only — a pauser can freeze but not resume.
+
+    /// Grant the pauser role to `account`. Governance-only.
+    pub fn grant_pauser_role(
+        env: Env,
+        caller: Address,
+        account: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauserRole(account.clone()), &true);
+        env.events().publish((symbol_short!("PROLE_G"),), account);
+        Ok(())
+    }
+
+    /// Revoke the pauser role from `account`. Governance-only.
+    pub fn revoke_pauser_role(
+        env: Env,
+        caller: Address,
+        account: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PauserRole(account.clone()));
+        env.events().publish((symbol_short!("PROLE_R"),), account);
+        Ok(())
+    }
+
+    /// Pause the bounty escrow. Callable by the pauser role or governance.
+    pub fn pause(env: Env, caller: Address) -> Result<(), BountyError> {
+        caller.require_auth();
+        Self::require_governance_or_pauser(&env, &caller)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("PAUSED"),), caller);
+        Ok(())
+    }
+
+    /// Unpause the bounty escrow. Governance-only (pauser can freeze but not
+    /// unilaterally resume, matching the pool guardian model).
+    pub fn unpause(env: Env, caller: Address) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("UNPAUSED"),), caller);
+        Ok(())
+    }
+
+    /// Whether the bounty escrow is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    // ─── #212: Timelock-gated upgrade + state migration ───────────────────
+
+    /// Current storage schema version for the bounty escrow.
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    /// Replace the contract wasm. Governance (timelock) only. Must be queued
+    /// through the timelock to enforce the mandatory upgrade delay.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((symbol_short!("UPGRADED"),), new_wasm_hash);
+        Ok(())
+    }
+
+    /// Migrate on-chain storage from a previous schema to `SCHEMA_VERSION`.
+    /// Governance (timelock) only. Idempotent: calling it when already at the
+    /// current version is a safe no-op.
+    ///
+    /// When a storage layout change is introduced, increment `SCHEMA_VERSION`
+    /// and add a migration branch here before deploying the new wasm.
+    pub fn migrate(env: Env, caller: Address) -> Result<u32, BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        let stored: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(0);
+        if stored >= Self::SCHEMA_VERSION {
+            return Ok(stored);
+        }
+        // ── Schema 0 → 1 ─────────────────────────────────────────────────
+        // Version 1 is the initial schema. Ensure Reserved and NextPayoutId
+        // carry sensible defaults on any pre-v1 deployment.
+        if stored < 1 {
+            if !env.storage().instance().has(&DataKey::Reserved) {
+                env.storage().instance().set(&DataKey::Reserved, &0i128);
+            }
+            if !env.storage().instance().has(&DataKey::NextPayoutId) {
+                env.storage().instance().set(&DataKey::NextPayoutId, &0u64);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &Self::SCHEMA_VERSION);
+        env.events()
+            .publish((symbol_short!("MIGRATED"),), Self::SCHEMA_VERSION);
+        Ok(Self::SCHEMA_VERSION)
+    }
+
+    /// The schema version currently stored on-chain (0 if never migrated).
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(0)
+    }
+
     // ─── Funding ──────────────────────────────────────────────────────────
 
     /// Top up the reward pool. Callable by anyone, including the treasury.
+    /// Blocked while paused (#211).
     pub fn fund(env: Env, from: Address, amount: i128) -> Result<(), BountyError> {
         from.require_auth();
+        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
@@ -315,9 +444,7 @@ impl RefractBountyEscrow {
     // ─── Push payout (legacy award path) ─────────────────────────────────
 
     /// Award a bounty to a security researcher immediately (push payout).
-    ///
-    /// Gated strictly by the governance/timelock address. The `report_hash`
-    /// commitment is stored on-chain as an immutable, timestamped record.
+    /// Governance-only. Blocked while paused (#211).
     pub fn award(
         env: Env,
         caller: Address,
@@ -330,28 +457,23 @@ impl RefractBountyEscrow {
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
+        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
         if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
             return Err(BountyError::DuplicateReport);
         }
-        // Reject payouts to addresses that have not been screened by governance
-        // (issue #244).
         if !Self::is_recipient_allowed_inner(&env, &researcher) {
             return Err(BountyError::RecipientNotAllowed);
         }
-        // Must not exceed available (unreserved) balance.
         if amount > Self::available_balance_inner(&env)? {
             return Err(BountyError::InsufficientBalance);
         }
 
-        // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
         let new_balance =
             checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
-        // Transfer before updating state to surface transfer errors early,
-        // but the balance is updated after so a revert leaves state consistent.
         let token = Self::token_addr(&env)?;
         token::Client::new(&env, &token).transfer(
             &env.current_contract_address(),
@@ -374,13 +496,8 @@ impl RefractBountyEscrow {
 
     // ─── Pull payout (Issue 276) ──────────────────────────────────────────
 
-    /// Create a pull-based payout escrow record. Governance/timelock-gated.
-    ///
-    /// Reserves `amount` from the available balance and writes an on-chain
-    /// record. The recipient can call `claim(payout_id)` to receive the funds.
-    /// After `deadline` passes, `sweep_expired(payout_id)` returns the funds.
-    ///
-    /// Returns the new payout id.
+    /// Create a pull-based payout escrow record. Governance-gated.
+    /// Blocked while paused (#211).
     pub fn create_payout(
         env: Env,
         caller: Address,
@@ -393,6 +510,7 @@ impl RefractBountyEscrow {
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
+        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
@@ -400,7 +518,6 @@ impl RefractBountyEscrow {
         if deadline <= now {
             return Err(BountyError::InvalidDeadline);
         }
-        // Reject payouts to addresses that have not been screened (issue #244).
         if !Self::is_recipient_allowed_inner(&env, &recipient) {
             return Err(BountyError::RecipientNotAllowed);
         }
@@ -408,7 +525,6 @@ impl RefractBountyEscrow {
             return Err(BountyError::InsufficientBalance);
         }
 
-        // Reserve the funds.
         let reserved = Self::raw_reserved(&env)?;
         let new_reserved =
             checked_add(reserved, amount).map_err(|_| BountyError::InvalidAmount)?;
@@ -445,10 +561,7 @@ impl RefractBountyEscrow {
     }
 
     /// Claim a payout. Callable only by the recorded recipient.
-    ///
-    /// Callable after the deadline as long as the record has not been swept.
-    /// The token transfer is the final operation so a failed transfer leaves
-    /// the record `Pending` and intact.
+    /// Remains callable while paused (funds in flight).
     pub fn claim(env: Env, recipient: Address, payout_id: u64) -> Result<i128, BountyError> {
         recipient.require_auth();
 
@@ -468,12 +581,10 @@ impl RefractBountyEscrow {
 
         let amount = record.amount;
 
-        // Update state before transfer (reentrancy guard).
         record.status = PayoutStatus::Claimed;
         env.storage().persistent().set(&payout_key, &record);
         Self::bump_persistent(&env, &payout_key);
 
-        // Release reservation.
         let reserved = Self::raw_reserved(&env)?;
         let new_reserved =
             checked_sub(reserved, amount).map_err(|_| BountyError::InsufficientBalance)?;
@@ -481,7 +592,6 @@ impl RefractBountyEscrow {
             .instance()
             .set(&DataKey::Reserved, &new_reserved);
 
-        // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
         let new_balance =
             checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
@@ -489,8 +599,6 @@ impl RefractBountyEscrow {
             .instance()
             .set(&DataKey::Balance, &new_balance);
 
-        // Transfer last — if it fails the state update above will revert with
-        // it (Soroban's atomic transaction model), leaving the record Pending.
         token::Client::new(&env, &record.token).transfer(
             &env.current_contract_address(),
             &recipient,
@@ -503,10 +611,7 @@ impl RefractBountyEscrow {
     }
 
     /// Sweep an expired payout back to governance. Permissionless, idempotent.
-    ///
-    /// Only callable after the deadline. Claimed records return
-    /// `PayoutAlreadySettled`. A second sweep call also returns
-    /// `PayoutAlreadySettled` (idempotent guard).
+    /// Remains callable while paused (funds in flight).
     pub fn sweep_expired(env: Env, payout_id: u64) -> Result<i128, BountyError> {
         let payout_key = DataKey::Payout(payout_id);
         let mut record: PayoutRecord = env
@@ -526,12 +631,10 @@ impl RefractBountyEscrow {
         let amount = record.amount;
         let governance = Self::governance_addr(&env)?;
 
-        // Update state before transfer.
         record.status = PayoutStatus::Swept;
         env.storage().persistent().set(&payout_key, &record);
         Self::bump_persistent(&env, &payout_key);
 
-        // Release reservation.
         let reserved = Self::raw_reserved(&env)?;
         let new_reserved =
             checked_sub(reserved, amount).map_err(|_| BountyError::InsufficientBalance)?;
@@ -539,7 +642,6 @@ impl RefractBountyEscrow {
             .instance()
             .set(&DataKey::Reserved, &new_reserved);
 
-        // Deduct from total balance.
         let balance = Self::raw_balance(&env)?;
         let new_balance =
             checked_sub(balance, amount).map_err(|_| BountyError::InsufficientBalance)?;
@@ -547,7 +649,6 @@ impl RefractBountyEscrow {
             .instance()
             .set(&DataKey::Balance, &new_balance);
 
-        // Transfer swept funds back to governance.
         token::Client::new(&env, &record.token).transfer(
             &env.current_contract_address(),
             &governance,
@@ -568,11 +669,7 @@ impl RefractBountyEscrow {
         Self::hash_preimage(&env, &preimage)
     }
 
-    /// File a vulnerability disclosure commitment bound to a payout `commitment`
-    /// rather than the submitter's funding address.
-    ///
-    /// Rejects duplicate `report_hash` submissions and rejects any `commitment`
-    /// already used for another disclosure or award.
+    /// File a vulnerability disclosure commitment bound to a payout `commitment`.
     pub fn submit_disclosure(
         env: Env,
         submitter: Address,
@@ -605,11 +702,7 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
-    /// Register a payout address against a secret `preimage`, binding
-    /// `commitment = SHA-256(preimage)` to `payout_address`.
-    ///
-    /// Requiring `preimage` at registration prevents front-running even if
-    /// `commitment` has already appeared on-chain in a disclosure or award.
+    /// Register a payout address against a secret `preimage`.
     pub fn register_payout_address(
         env: Env,
         owner: Address,
@@ -646,8 +739,7 @@ impl RefractBountyEscrow {
         Ok(commitment)
     }
 
-    /// Rotate the payout address bound to `commitment = SHA-256(preimage)` before
-    /// the award is claimed, atomically revoking the previous payout address.
+    /// Rotate the payout address bound to `commitment = SHA-256(preimage)`.
     pub fn rotate_payout_address(
         env: Env,
         owner: Address,
@@ -703,8 +795,8 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
-    /// Adjudicate a disclosure and reserve `amount` in the `Awarded` state
-    /// against `commitment` rather than the submitter's identity.
+    /// Adjudicate a disclosure and reserve `amount` in the `Awarded` state.
+    /// Governance-only. Blocked while paused (#211).
     pub fn award_commitment(
         env: Env,
         caller: Address,
@@ -717,6 +809,7 @@ impl RefractBountyEscrow {
         if caller != governance {
             return Err(BountyError::Unauthorized);
         }
+        Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(BountyError::InvalidAmount);
         }
@@ -774,9 +867,8 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
-    /// Claim an awarded bounty by presenting the secret `preimage` for the
-    /// commitment and paying the currently registered (and non-frozen) payout
-    /// address.
+    /// Claim an awarded bounty by presenting the secret `preimage`.
+    /// Remains callable while paused (funds in flight).
     pub fn claim_by_commitment(
         env: Env,
         caller: Address,
@@ -854,8 +946,7 @@ impl RefractBountyEscrow {
         Ok(amount)
     }
 
-    /// Freeze or unfreeze a payout address flagged as compromised without
-    /// altering any awarded reward amount. Governance-gated.
+    /// Freeze or unfreeze a payout address. Governance-gated.
     pub fn freeze_payout_address(
         env: Env,
         caller: Address,
@@ -877,6 +968,51 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
+    // ─── Allowlist management (issue #244) ────────────────────────────────
+
+    /// Allow `recipient` to receive bounty payouts. Governance-only.
+    pub fn allow_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage().persistent().set(
+            &DataKey::RecipientStatus(recipient.clone()),
+            &ScreeningStatus::Allowed,
+        );
+        env.events().publish((symbol_short!("al_allow"),), recipient);
+        Ok(())
+    }
+
+    /// Block `recipient` from receiving bounty payouts. Governance-only.
+    pub fn block_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage().persistent().set(
+            &DataKey::RecipientStatus(recipient.clone()),
+            &ScreeningStatus::Blocked,
+        );
+        env.events().publish((symbol_short!("al_block"),), recipient);
+        Ok(())
+    }
+
+    /// Whether `recipient` is on the governance allowlist.
+    pub fn is_recipient_allowed(env: Env, recipient: Address) -> bool {
+        Self::is_recipient_allowed_inner(&env, &recipient)
+    }
+
     // ─── Read-only views ──────────────────────────────────────────────────
 
     /// Total funds held in escrow (includes pending payout reserves).
@@ -895,4 +1031,130 @@ impl RefractBountyEscrow {
     }
 
     /// Immutable record of a rewarded disclosure, if any.
-    pub fn get_award(
+    pub fn get_award(env: Env, report_hash: BytesN<32>) -> Option<AwardRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Award(report_hash))
+    }
+
+    /// Payout record for `payout_id`, if any.
+    pub fn get_payout(env: Env, payout_id: u64) -> Option<PayoutRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Payout(payout_id))
+    }
+
+    /// Commitment award record, if any.
+    pub fn get_commitment_award(
+        env: Env,
+        commitment: BytesN<32>,
+    ) -> Option<CommitmentAwardRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CommitmentAward(commitment))
+    }
+
+    /// Payout binding record, if any.
+    pub fn get_payout_binding(env: Env, commitment: BytesN<32>) -> Option<PayoutBindingRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayoutBinding(commitment))
+    }
+
+    // ─── Private helpers ──────────────────────────────────────────────────
+
+    fn governance_addr(env: &Env) -> Result<Address, BountyError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(BountyError::NotInitialized)
+    }
+
+    fn token_addr(env: &Env) -> Result<Address, BountyError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(BountyError::NotInitialized)
+    }
+
+    fn raw_balance(env: &Env) -> Result<i128, BountyError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Balance)
+            .ok_or(BountyError::NotInitialized)
+    }
+
+    fn raw_reserved(env: &Env) -> Result<i128, BountyError> {
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::Reserved)
+            .unwrap_or(0i128))
+    }
+
+    fn available_balance_inner(env: &Env) -> Result<i128, BountyError> {
+        let balance = Self::raw_balance(env)?;
+        let reserved = Self::raw_reserved(env)?;
+        Ok(balance.saturating_sub(reserved).max(0))
+    }
+
+    fn is_recipient_allowed_inner(env: &Env, recipient: &Address) -> bool {
+        matches!(
+            env.storage()
+                .persistent()
+                .get::<DataKey, ScreeningStatus>(&DataKey::RecipientStatus(recipient.clone())),
+            Some(ScreeningStatus::Allowed)
+        )
+    }
+
+    fn is_address_frozen(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::FrozenAddress(address.clone()))
+            .unwrap_or(false)
+    }
+
+    fn hash_preimage(env: &Env, preimage: &BytesN<32>) -> BytesN<32> {
+        let bytes = soroban_sdk::Bytes::from_slice(env, preimage.to_array().as_ref());
+        env.crypto().sha256(&bytes).to_bytes()
+    }
+
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), BountyError> {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(BountyError::Paused);
+        }
+        Ok(())
+    }
+
+    fn require_governance_or_pauser(env: &Env, caller: &Address) -> Result<(), BountyError> {
+        let governance = Self::governance_addr(env)?;
+        if *caller == governance {
+            return Ok(());
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PauserRole(caller.clone()))
+        {
+            return Ok(());
+        }
+        Err(BountyError::Unauthorized)
+    }
+}
+
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod proptest_invariants;
