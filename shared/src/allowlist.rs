@@ -93,6 +93,15 @@ impl Allowlist {
         Ok(())
     }
 
+    /// Whether an asset is explicitly listed and enabled. An unset key is not
+    /// allowed: only explicitly added entries pass.
+    pub fn is_allowed(&self, asset: AssetId) -> bool {
+        self.assets
+            .get(&asset)
+            .map(|entry| entry.enabled)
+            .unwrap_or(false)
+    }
+
     /// Checks a call of `amount` and, if it passes, adds it to the asset's exposure.
     pub fn check_and_record(&mut self, asset: AssetId, amount: i128) -> Result<(), AllowlistError> {
         if amount <= 0 {
@@ -164,6 +173,15 @@ mod tests {
             list.check_and_record(USDC, 1),
             Err(AllowlistError::NotListed)
         );
+    }
+
+    #[test]
+    fn unset_key_is_not_allowed() {
+        let list = Allowlist::new();
+        assert!(!list.is_allowed(USDC));
+        let list = list();
+        assert!(list.is_allowed(USDC));
+        assert!(!list.is_allowed(2));
     }
 
     #[test]

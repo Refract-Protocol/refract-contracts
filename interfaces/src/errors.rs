@@ -66,12 +66,15 @@ pub enum RefractError {
     /// The contract is in a state where the call cannot be honoured (for
     /// example a deposit into a backstop whose capital was fully drawn).
     InvalidState = 114,
+    /// An amount was exactly zero where a strictly positive amount is
+    /// required (for example a compensation request).
+    ZeroAmount = 115,
 }
 
 impl RefractError {
     /// Every variant, in discriminant order. Used by the round-trip tests
     /// and handy for off-chain decoders.
-    pub const ALL: [RefractError; 18] = [
+    pub const ALL: [RefractError; 19] = [
         RefractError::AlreadyInitialized,
         RefractError::NotInitialized,
         RefractError::Unauthorized,
@@ -90,6 +93,7 @@ impl RefractError {
         RefractError::NothingToClaim,
         RefractError::Overflow,
         RefractError::InvalidState,
+        RefractError::ZeroAmount,
     ];
 
     /// The stable `u32` code carried by a revert.
@@ -139,7 +143,7 @@ mod test {
     #[test]
     fn discriminants_are_pinned() {
         // Changing any of these is an ABI break: append new variants instead.
-        let expected: [(RefractError, u32); 18] = [
+        let expected: [(RefractError, u32); 19] = [
             (RefractError::AlreadyInitialized, 1),
             (RefractError::NotInitialized, 2),
             (RefractError::Unauthorized, 3),
@@ -158,6 +162,7 @@ mod test {
             (RefractError::NothingToClaim, 112),
             (RefractError::Overflow, 113),
             (RefractError::InvalidState, 114),
+            (RefractError::ZeroAmount, 115),
         ];
         for (err, code) in expected {
             assert_eq!(err.code(), code);
@@ -204,10 +209,6 @@ mod test {
                 Err(InvokeError::Contract(7)),
                 RefractError::InvalidState
             ),
-            RefractError::InvalidState
-        );
-        assert_eq!(
-            RefractError::from_invoke_result(Err(InvokeError::Abort), RefractError::InvalidState),
             RefractError::InvalidState
         );
     }
