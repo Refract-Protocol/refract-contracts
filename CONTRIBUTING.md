@@ -15,7 +15,7 @@ high, but we'll help you get there.
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo test          # should pass on a clean checkout
+cargo test          # quick local loop; should pass on a clean checkout
 ```
 
 ## Development workflow
@@ -29,14 +29,22 @@ cargo test          # should pass on a clean checkout
    cargo test --all
    cargo build --target wasm32-unknown-unknown --release
    ```
+   `cargo test` is the quick loop while iterating; `cargo test --all` is the
+   real CI gate and must pass before you open a PR. The clippy invocation above
+   matches the lints configured in `clippy.toml`.
 4. When adding or updating dependencies, run the supply-chain and license checks locally:
    ```bash
    cargo install cargo-deny cargo-audit
-   cargo deny --workspace check advisories licenses bans sources
+   cargo deny check
    python3 scripts/audit.py
    ```
-   `deny.toml` enforces our MIT-compatible license allow-list, crates.io-only source policy, yanked-crate ban, and wildcard-version ban across the entire workspace (including `backstop`, `bounty`, `grants`, and `treasury`). `audit.toml` tracks any time-bounded RustSec advisory exceptions (enforced by `scripts/audit.py`).
-5. Open a PR against `main` and fill in the template.
+   `cargo deny check` reads `deny.toml`, which enforces our MIT-compatible
+   license allow-list, crates.io-only source policy, yanked-crate ban, and
+   wildcard-version ban across the entire workspace (including `backstop`,
+   `bounty`, `grants`, and `treasury`). `audit.toml` tracks any time-bounded
+   RustSec advisory exceptions (enforced by `scripts/audit.py`).
+5. Open a PR against `main` and fill in the template at
+   [`.github/PULL_REQUEST_TEMPLATE.md`](./.github/PULL_REQUEST_TEMPLATE.md).
 
 ## Coding standards
 

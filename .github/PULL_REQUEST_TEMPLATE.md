@@ -14,7 +14,7 @@
 
 - [ ] I read [CONTRIBUTING.md](../CONTRIBUTING.md)
 - [ ] Tests added/updated for the change
-- [ ] Local gate passes (lint / typecheck or fmt + clippy + test / build)
+- [ ] Local gate passes (`cargo test`, `cargo test --all`, `cargo deny check`, and clippy per `clippy.toml`)
 - [ ] No secrets, keys, or `.env` values committed
 - [ ] Behavioural changes are documented in the README where relevant
 
