@@ -85,6 +85,10 @@ impl ReviewerStakes {
 
     /// Slashes `amount` from a reviewer after an adjudicated finding. Governance
     /// only. Returns the amount slashed.
+    ///
+    /// The slash is capped at the stake held: if `amount` exceeds the stake, the
+    /// whole stake is slashed and the reviewer is left with nothing. The
+    /// subtraction uses checked arithmetic so it can never underflow.
     pub fn slash(&mut self, caller: ReviewerId, reviewer: ReviewerId, amount: i128) -> Result<i128, StakeError> {
         if caller != self.governance {
             return Err(StakeError::Unauthorized);
@@ -92,15 +96,15 @@ impl ReviewerStakes {
         if amount <= 0 {
             return Err(StakeError::InvalidAmount);
         }
-        let held = self.stakes.get_mut(&reviewer).ok_or(StakeError::NotStaked)?;
-        if amount > *held {
-            return Err(StakeError::InsufficientStake);
-        }
-        *held -= amount;
-        if *held == 0 {
+        let held = *self.stakes.get(&reviewer).ok_or(StakeError::NotStaked)?;
+        let slashed = amount.min(held);
+        let remaining = held.checked_sub(slashed).ok_or(StakeError::Overflow)?;
+        if remaining == 0 {
             self.stakes.remove(&reviewer);
+        } else {
+            self.stakes.insert(reviewer, remaining);
         }
-        Ok(amount)
+        Ok(slashed)
     }
 
     /// The reviewer's current stake, zero if none.
@@ -150,9 +154,18 @@ mod tests {
         let mut stakes = book();
         stakes.stake(REVIEWER, 150).unwrap();
         assert_eq!(stakes.slash(REVIEWER, REVIEWER, 10), Err(StakeError::Unauthorized));
-        assert_eq!(stakes.slash(GOVERNANCE, REVIEWER, 151), Err(StakeError::InsufficientStake));
         assert_eq!(stakes.slash(GOVERNANCE, REVIEWER, 50), Ok(50));
         assert_eq!(stakes.stake_of(REVIEWER), 100);
+    }
+
+    #[test]
+    fn a_slash_above_the_stake_clamps_to_zero_without_underflow() {
+        let mut stakes = book();
+        stakes.stake(REVIEWER, 150).unwrap();
+        assert_eq!(stakes.slash(GOVERNANCE, REVIEWER, 151), Ok(150));
+        assert_eq!(stakes.stake_of(REVIEWER), 0);
+        assert!(!stakes.is_eligible(REVIEWER));
+        assert_eq!(stakes.slash(GOVERNANCE, REVIEWER, 1), Err(StakeError::NotStaked));
     }
 
     #[test]
