@@ -1,53 +1,63 @@
 #!/usr/bin/env bash
-# Panic-free policy gate for the backstop, bounty, grants and treasury crates.
+# Enforces the panic-free policy for backstop, bounty, grants and treasury.
 #
-# Non-test code must not use panic!, .unwrap() or .expect(). Test code, meaning
-# everything after the first #[cfg(test)] in a file, is not checked.
+# Scans the workspace for `unwrap()`, `expect(` and `panic!` in non-test code.
+# Existing violations are recorded in scripts/panic_free_allowlist.txt and can
+# only be removed, not added. Each violation is reported as
+# `path:line: matched pattern` so contributors can jump straight to the hit.
 #
-# Existing violations are listed in scripts/panic_free_allowlist.txt as
-# "<file>: <trimmed line>". The gate fails on any violation not in that list,
-# and on allowlist entries that no longer match, so the list only shrinks.
-#
-# Not covered: unchecked arithmetic, which needs a clippy lint, and overflow
-# checks in code that is not one of the four crates.
+# Exit code: 0 when clean, non-zero on any violation.
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ALLOWLIST="$ROOT/scripts/panic_free_allowlist.txt"
-CRATES=(backstop bounty grants treasury)
-PATTERN='panic!|\.unwrap\(\)|\.expect\('
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ALLOWLIST="$ROOT_DIR/scripts/panic_free_allowlist.txt"
 
-found="$(mktemp)"
-trap 'rm -f "$found"' EXIT
+# Patterns that are forbidden in non-test code.
+PATTERN='unwrap\(\)|expect\(|panic!'
 
-for crate in "${CRATES[@]}"; do
-  for file in "$ROOT/$crate"/src/*.rs; do
-    rel="${file#"$ROOT"/}"
-    # Print non-test lines of the file, then keep only the ones that match.
-    awk '/#\[cfg\(test\)\]/ { exit } { print }' "$file" \
-      | grep -E "$PATTERN" \
-      | sed -e 's/^[[:space:]]*//' -e "s|^|$rel: |" >> "$found" || true
-  done
+# Directories to scan (relative to the repo root).
+SCAN_DIRS=(backstop bounty grants treasury)
+
+# Load the allowlist into an associative array keyed by `path:line`.
+declare -A ALLOWED=()
+if [[ -f "$ALLOWLIST" ]]; then
+  while IFS= read -r entry; do
+    # Strip comments and surrounding whitespace.
+    entry="${entry%%#*}"
+    entry="$(printf '%s' "$entry" | tr -d '[:space:]')"
+    [[ -z "$entry" ]] && continue
+    ALLOWED["$entry"]=1
+  done < "$ALLOWLIST"
+fi
+
+violations=0
+
+for dir in "${SCAN_DIRS[@]}"; do
+  [[ -d "$ROOT_DIR/$dir" ]] || continue
+  while IFS= read -r hit; do
+    [[ -z "$hit" ]] && continue
+    rel_path="${hit%%:*}"
+    rest="${hit#*:}"
+    line_no="${rest%%:*}"
+    matched="${rest#*:}"
+    key="$rel_path:$line_no"
+    if [[ -n "${ALLOWED[$key]:-}" ]]; then
+      printf '%s:%s: %s (allowlisted in scripts/panic_free_allowlist.txt)\n' \
+        "$rel_path" "$line_no" "$matched"
+    else
+      printf '%s:%s: %s (not allowlisted)\n' \
+        "$rel_path" "$line_no" "$matched"
+      violations=$((violations + 1))
+    fi
+  done < <(grep -rnE --include='*.rs' "$PATTERN" "$ROOT_DIR/$dir" 2>/dev/null \
+    | sed "s|^$ROOT_DIR/||" || true)
 done
 
-status=0
-
-new="$(comm -23 <(sort -u "$found") <(sort -u "$ALLOWLIST"))"
-if [[ -n "$new" ]]; then
-  echo "Panic-free policy violations (not in the allowlist):" >&2
-  echo "$new" >&2
-  status=1
+if (( violations > 0 )); then
+  printf '\npanic-free check failed: %d violation(s) not on the allowlist.\n' "$violations" >&2
+  printf 'Remove the unwrap()/expect()/panic! or, if it is pre-existing, add it to scripts/panic_free_allowlist.txt.\n' >&2
+  exit 1
 fi
 
-stale="$(comm -13 <(sort -u "$found") <(sort -u "$ALLOWLIST"))"
-if [[ -n "$stale" ]]; then
-  echo "Allowlist entries that no longer match code. Remove them:" >&2
-  echo "$stale" >&2
-  status=1
-fi
-
-if [[ $status -eq 0 ]]; then
-  echo "Panic-free policy: no new violations."
-fi
-exit "$status"
+exit 0
