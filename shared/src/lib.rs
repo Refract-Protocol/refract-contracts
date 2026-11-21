@@ -10,3 +10,15 @@ pub mod guardians;
 pub mod loss_event;
 pub mod version;
 pub mod withdrawal_queue;
+
+#[cfg(test)]
+mod withdrawal_queue_tests {
+    use crate::withdrawal_queue::{WithdrawalQueue, WithdrawalQueueError};
+
+    #[test]
+    fn empty_batch_is_rejected() {
+        let mut queue = WithdrawalQueue::new();
+        let result = queue.process_batch(&[]);
+        assert_eq!(result, Err(WithdrawalQueueError::EmptyBatch));
+    }
+}

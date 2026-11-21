@@ -207,3 +207,6 @@ We welcome contributors — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) and our [
 
 <!-- handsoff-issue-273 -->
 - #273: Implement a Guardian-Based Admin Key Recovery Path for the Four Contracts
+
+<!-- handsoff-issue-519 -->
+- #519: Governance backstop weight ignores zero-weight votes
