@@ -210,3 +210,6 @@ We welcome contributors — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) and our [
 
 <!-- handsoff-issue-194 -->
 - #194: Compensation Request: 9 Upstream Merged PRs for Wave 9 (@OrderStream)
+
+<!-- handsoff-issue-514 -->
+- #514: Oracle price feed treats a stale timestamp as fresh
