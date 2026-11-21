@@ -184,4 +184,30 @@ mod tests {
             Err(CompensationError::Unauthorized)
         );
     }
+
+    #[test]
+    fn zero_amounts_are_rejected() {
+        let mut compensation = funded();
+        assert_eq!(
+            compensation.fund_program(GOVERNANCE, PROGRAM, 0),
+            Err(CompensationError::InvalidAmount)
+        );
+        assert_eq!(
+            compensation.record_review(GOVERNANCE, PROGRAM, REVIEWER, 0, false),
+            Err(CompensationError::InvalidAmount)
+        );
+        assert_eq!(compensation.budget(PROGRAM), Some(100));
+        assert_eq!(compensation.owed(REVIEWER), 0);
+    }
+
+    #[test]
+    fn positive_amounts_are_accepted() {
+        let mut compensation = funded();
+        assert_eq!(compensation.fund_program(GOVERNANCE, PROGRAM, 1), Ok(()));
+        assert_eq!(
+            compensation.record_review(GOVERNANCE, PROGRAM, REVIEWER, 1, false),
+            Ok(())
+        );
+        assert_eq!(compensation.owed(REVIEWER), 1);
+    }
 }
