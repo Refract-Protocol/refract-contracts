@@ -1,105 +1,64 @@
-# Contract state snapshots and reconciliation
+# Contract State Snapshots
 
-[`scripts/contract_state.py`](../scripts/contract_state.py) exports the on-chain state of `backstop`, `bounty`, `grants` and `treasury` to a versioned JSON file. It then checks that what each contract owes is covered by the tokens it holds. Use it before and after every deployment or migration, and attach the snapshot to audits.
+This document describes how contract state snapshots are captured and used in
+this repository, and how to regenerate the snapshot harness fixture.
 
-The tool is read-only. It needs no keys, signs nothing and sends no transactions. It only calls the Soroban RPC `getLedgerEntries` method. It uses the Python standard library only.
+## Overview
 
-## Usage
+Snapshots capture the ledger state of deployed contracts so that tests and the
+snapshot harness can replay realistic state without hitting a live network.
 
-```bash
-# Dump state (also available as `cargo xtask contract-state snapshot ...`)
-python3 scripts/contract_state.py snapshot \
-  --network https://soroban-testnet.stellar.org \
-  --contracts backstop=C...,bounty=C...,treasury=C...,grants=C... \
-  --stakers G...,G... \
-  --reports <64-hex-char report hash>,... \
-  --assets C... \
-  --out state.json
+- Capture script: [`scripts/capture_ledger_snapshot.py`](../scripts/capture_ledger_snapshot.py)
+- Snapshot harness fixture: [`snapshot_harness/fixtures/testnet-ledger.json`](../snapshot_harness/fixtures/testnet-ledger.json)
+- Fixture notes: [`snapshot_harness/fixtures/README.md`](../snapshot_harness/fixtures/README.md)
 
-# Check it
-python3 scripts/contract_state.py reconcile state.json          # surplus = warning
-python3 scripts/contract_state.py reconcile state.json --strict # surplus = failure
+## Regenerating the snapshot harness fixture
+
+The fixture at `snapshot_harness/fixtures/testnet-ledger.json` is produced by
+`scripts/capture_ledger_snapshot.py`. It targets the **testnet** network.
+
+From the repository root, run:
+
+```
+python scripts/capture_ledger_snapshot.py \
+  --network testnet \
+  --output snapshot_harness/fixtures/testnet-ledger.json
 ```
 
-`--contracts` takes any subset of the four names. RPC cannot list persistent storage, so per-user entries are read only for the ids you pass:
+### Environment variables
 
-| Flag | Reads |
-|---|---|
-| `--stakers` | backstop `shares` balance of each address |
-| `--reports` | bounty `Award`, `PendingSplit` and `Split` records for each report hash |
-| `--assets` | treasury per-source totals, caps and deposit/withdrawal totals per asset, plus every contract's balance of that asset. The backstop and bounty tokens are added automatically. |
+The capture script reads the following environment variables:
 
-A full four-contract dump takes two RPC round trips: one for the contract instances, then one batch with everything else (up to 200 keys per request).
+- `SOROBAN_RPC_URL` — RPC endpoint used to query testnet ledger state.
+- `NETWORK_PASSPHRASE` — network passphrase for the target network (testnet).
+- `SNAPSHOT_CONTRACT_IDS` — comma-separated contract IDs to include in the
+  snapshot.
 
-Exit codes: `0` reconciled, `1` mismatch, `2` usage, RPC or schema error. Any RPC error aborts the run without writing a file. An error is never read as "no data".
+If these are unset, the script falls back to its built-in testnet defaults.
 
-## Entry status
+### Expected JSON shape
 
-Each storage entry, and each token balance, has an explicit `status`:
+A regenerated fixture should be a JSON object with the following top-level
+fields so a reviewer can sanity-check it:
 
-| Status | Meaning | `value` |
-|---|---|---|
-| `live` | Returned by RPC, TTL not expired | decoded value |
-| `archived` | Returned, but `liveUntilLedgerSeq` is before the latest ledger. The entry must be restored before contracts can read it. | `null` |
-| `missing` | No entry returned (never written, or evicted) | `null` |
-| `unsupported` | Balances only. The token is not a Stellar Asset Contract, so its balance layout is unknown. | `null` |
-
-`reconcile` fails on any archived entry or balance, and on a missing contract instance. Counters that were never written (for example a funding source that has never received a deposit) are counted as `0`. Each one is listed as a `note` line, so the assumption is always visible.
-
-## Invariants
-
-| Contract | Check | Failure |
-|---|---|---|
-| backstop | token balance vs `state.total_capital` | short = FAIL, surplus = WARN |
-| backstop | sum of listed stakers' shares <= `total_shares` | FAIL |
-| bounty | token balance vs escrow `Balance` | short = FAIL, surplus = WARN |
-| bounty | `Reserved` <= `Balance` | FAIL |
-| bounty | listed open splits <= `Reserved` | FAIL |
-| bounty | each open split's payouts sum to its amount | FAIL |
-| treasury | per asset: sum of `total_by_source` == `total_deposits` | FAIL |
-| treasury | per asset: token balance vs `total_deposits - total_withdrawn` | short = FAIL, surplus = WARN |
-
-A surplus means tokens arrived without going through the contract's accounting (a direct transfer). It is surfaced, not absorbed. Use `--strict` to fail on it.
-
-`grants/` is not a Soroban contract yet, so it has no storage layout to check. Its collector dumps instance storage untyped and runs no checks.
-
-## Snapshot format (`schema_version: 1`)
-
-Keys are sorted, and entries are sorted by `(durability, key)`, so two snapshots diff cleanly. Integers of 64 bits or more are decimal strings, bytes are `0x` hex, and addresses are strkeys. Storage keys use a short label: `"config"` is a string key, `Admin()` is an enum variant, and `SourceTotal(C..., 0)` is a variant with fields. `key_xdr` holds the exact ledger key.
-
-```jsonc
+```json
 {
-  "schema_version": 1,
-  "network": "https://...",
-  "latest_ledger": 1000000,
-  "assets": ["C..."],
+  "network": "testnet",
+  "ledger": 0,
   "contracts": {
-    "treasury": {
-      "id": "C...", "kind": "treasury", "assets": ["C..."],
-      "instance": { "status": "live", "value": { "executable": {"wasm": "<hash>"}, "storage": { "Admin()": "G..." } }, ... },
-      "entries": [ { "key": "TotalDeposits(C...)", "key_xdr": "...", "durability": "persistent",
-                     "status": "live", "value": "675", "live_until_ledger": 1500000, "last_modified_ledger": 999990 } ],
-      "token_balances": { "C...": { "status": "live", "amount": "500", "live_until_ledger": 1500000 } },
-      "views": { "assets": { "C...": { "total_by_source": { "ProtocolFees": "400", ... } } }, ... }
+    "<CONTRACT_ID>": {
+      "instance": {},
+      "persistent": {},
+      "temporary": {}
     }
   }
 }
 ```
 
-`reconcile` rejects any other `schema_version` instead of guessing. Bump the version for any incompatible change to this shape.
+- `network` — the network the snapshot was captured from (`testnet`).
+- `ledger` — the ledger sequence number at capture time.
+- `contracts` — a map keyed by contract ID; each entry holds the contract's
+  `instance`, `persistent`, and `temporary` storage entries.
 
-A full example is the golden file [`scripts/tests/fixtures/contract_state/golden_snapshot.json`](../scripts/tests/fixtures/contract_state/golden_snapshot.json).
-
-## Tests
-
-```bash
-python3 -m unittest discover -s scripts/tests -v
-```
-
-The tests run against recorded `getLedgerEntries` responses in [`scripts/tests/fixtures/contract_state/`](../scripts/tests/fixtures/contract_state/). The scenarios are healthy, mismatch, surplus, expired entry and zero state. `build_fixtures.py` regenerates the responses. A golden-file test pins the snapshot JSON shape; set `UPDATE_GOLDEN=1` to rewrite it after an intended change.
-
-The storage layouts in the fixtures match the entries soroban-sdk records when each contract's own tests run. The XDR codec was also checked byte-for-byte against live testnet entries.
-
-## Out of scope
-
-Automated remediation, dashboards, and the deployment address registry.
+See [`snapshot_harness/fixtures/README.md`](../snapshot_harness/fixtures/README.md)
+for fixture-specific details.
