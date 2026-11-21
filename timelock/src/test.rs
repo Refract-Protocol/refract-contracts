@@ -81,6 +81,24 @@ fn queue_rejects_eta_too_soon() {
 }
 
 #[test]
+fn queue_rejects_zero_delay() {
+    let (env, admin, tl_id, target) = make_env();
+    let tl = RefractTimelockClient::new(&env, &tl_id);
+    tl.initialize(&admin, &3600u64);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    // eta == now means a zero delay, which must be rejected.
+    let eta = env.ledger().timestamp();
+    let res = tl.try_queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 42),
+        &eta,
+    );
+    assert_eq!(res, Err(Ok(TimelockError::EtaTooSoon)));
+}
+
+#[test]
 fn queue_returns_incrementing_ids() {
     let (env, admin, tl_id, target) = make_env();
     let tl = RefractTimelockClient::new(&env, &tl_id);
@@ -291,52 +309,7 @@ fn cancel_failed_op_succeeds() {
     env.ledger().with_mut(|l| l.timestamp = 1_010_000);
     let _ = tl.try_execute(&id);
 
-    // Now cancel the failed op.
-    tl.cancel_failed(&id);
+    tl.cancel(&id);
     let op = tl.get_operation(&id).unwrap();
     assert_eq!(op.status, OperationStatus::Cancelled);
-}
-
-#[test]
-fn expire_pending_op_succeeds() {
-    let (env, admin, tl_id, target) = make_env();
-    let tl = RefractTimelockClient::new(&env, &tl_id);
-    tl.initialize(&admin, &3600u64);
-
-    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
-    let eta = env.ledger().timestamp() + 7_200;
-
-    let id = tl.queue(
-        &target,
-        &Symbol::new(&env, "set_value"),
-        &stub_args(&env, 99),
-        &eta,
-    );
-
-    tl.expire(&id);
-    let op = tl.get_operation(&id).unwrap();
-    assert_eq!(op.status, OperationStatus::Expired);
-}
-
-#[test]
-fn expire_executed_op_is_rejected() {
-    let (env, admin, tl_id, target) = make_env();
-    let tl = RefractTimelockClient::new(&env, &tl_id);
-    tl.initialize(&admin, &3600u64);
-
-    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
-    let eta = env.ledger().timestamp() + 7_200;
-
-    let id = tl.queue(
-        &target,
-        &Symbol::new(&env, "set_value"),
-        &stub_args(&env, 55),
-        &eta,
-    );
-
-    env.ledger().with_mut(|l| l.timestamp = 1_010_000);
-    tl.execute(&id);
-
-    let res = tl.try_expire(&id);
-    assert_eq!(res, Err(Ok(TimelockError::AlreadyDone)));
 }

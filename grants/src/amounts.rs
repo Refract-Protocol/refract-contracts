@@ -21,6 +21,8 @@ pub enum AmountError {
     UnsupportedDecimals,
     /// The converted amount does not fit in an i128.
     Overflow,
+    /// The amount is zero, which can never be meaningfully paid out.
+    ZeroAmount,
 }
 
 /// Converts `amount` from `from` decimals to `to` decimals. Scaling down rounds
@@ -48,6 +50,15 @@ pub fn to_protocol(amount: i128, token_decimals: u32) -> Result<i128, AmountErro
 /// Converts a protocol amount back to a token's decimals. Rounds toward zero.
 pub fn from_protocol(amount: i128, token_decimals: u32) -> Result<i128, AmountError> {
     convert(amount, PROTOCOL_DECIMALS, token_decimals)
+}
+
+/// Validates a compensation amount in the protocol's 7-decimal fixed point.
+/// Zero is rejected because it can never be meaningfully paid out.
+pub fn validate(amount: i128) -> Result<i128, AmountError> {
+    if amount == 0 {
+        return Err(AmountError::ZeroAmount);
+    }
+    Ok(amount)
 }
 
 #[cfg(test)]
@@ -82,5 +93,12 @@ mod tests {
             Err(AmountError::UnsupportedDecimals)
         );
         assert_eq!(convert(1, 7, 19), Err(AmountError::UnsupportedDecimals));
+    }
+
+    #[test]
+    fn zero_amount_is_rejected_and_positive_amount_passes() {
+        assert_eq!(validate(0), Err(AmountError::ZeroAmount));
+        assert_eq!(validate(1), Ok(1));
+        assert_eq!(validate(10_000_000), Ok(10_000_000));
     }
 }
