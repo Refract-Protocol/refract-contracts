@@ -3,6 +3,18 @@
 This guide is for auditors and users who want to confirm that the contract
 deployed on Stellar was built from the reviewed source.
 
+## Prerequisites
+
+`scripts/verify_build.sh` needs the `wasm32-unknown-unknown` target. Install it
+before running the script:
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+If the target is missing, the script stops before building and prints this
+install hint instead of a bare cargo error.
+
 ## What the script checks
 
 `scripts/verify_build.sh` runs three checks for each release contract (`pool`,

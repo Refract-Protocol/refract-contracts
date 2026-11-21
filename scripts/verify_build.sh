@@ -25,6 +25,19 @@ NETWORK="${NETWORK:-testnet}"
 # The three release contracts. Override with CONTRACTS="pool policy".
 CONTRACTS=(${CONTRACTS:-pool policy oracle})
 
+# Preflight: fail early with an actionable message when the wasm target is
+# missing, instead of surfacing a cryptic cargo error mid-build.
+if ! command -v rustup >/dev/null 2>&1; then
+  echo "rustup not found; install the Rust toolchain first (see docs/reproducible-builds.md)" >&2
+  exit 1
+fi
+if ! rustup target list --installed 2>/dev/null | grep -qx 'wasm32-unknown-unknown'; then
+  echo "missing Rust target: wasm32-unknown-unknown" >&2
+  echo "install it with: rustup target add wasm32-unknown-unknown" >&2
+  echo "see docs/reproducible-builds.md for the full reproducible-build setup" >&2
+  exit 1
+fi
+
 mkdir -p "$OUT"
 COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
 TOOLCHAIN="$(rustc --version)"
