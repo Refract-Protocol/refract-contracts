@@ -192,6 +192,17 @@ Each relayer carries an on-chain reputation score (range `[1, 1_000]`, default `
 
 ⚠️ **Pre-audit.** These contracts are testnet-only and have not had a professional security review. Do not deploy on mainnet. See [`SECURITY.md`](./SECURITY.md).
 
+## Snapshot fixture regeneration
+
+The file `snapshot_harness/fixtures/testnet-ledger.json` is a captured ledger snapshot used by the snapshot harness tests. Regenerate it with:
+
+```bash
+STELLAR_NETWORK=testnet python scripts/capture_ledger_snapshot.py \
+  > snapshot_harness/fixtures/testnet-ledger.json
+```
+
+`STELLAR_NETWORK` defaults to `testnet`. The output JSON contains a top-level object with `ledger_sequence`, `ledger_entries`, and `timestamp` keys. Verify the new file includes all three before committing.
+
 ## Contributing
 
 We welcome contributors — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) and our [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md).
