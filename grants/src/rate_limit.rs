@@ -81,6 +81,8 @@ impl RateLimiter {
         if counter.0 != window {
             *counter = (window, 0);
         }
+        // A rejected call must not consume window budget: only accepted calls
+        // increment the counter, so a throttled caller is not throttled longer.
         if counter.1 >= limit.max_calls {
             return Err(RateLimitError::Limited);
         }
@@ -156,6 +158,29 @@ mod tests {
         // Still refused, and the refusal did not move the window forward.
         assert_eq!(
             limiter.check_and_record(ALICE, SUBMIT, 1),
+            Err(RateLimitError::Limited)
+        );
+    }
+
+    #[test]
+    fn a_rejected_call_does_not_extend_the_throttle() {
+        let mut limiter = RateLimiter::new(LIMIT);
+        limiter.check_and_record(ALICE, SUBMIT, 0).unwrap();
+        limiter.check_and_record(ALICE, SUBMIT, 0).unwrap();
+
+        // Repeated rejections within the window must not consume budget.
+        for ledger in 0..50 {
+            assert_eq!(
+                limiter.check_and_record(ALICE, SUBMIT, ledger),
+                Err(RateLimitError::Limited)
+            );
+        }
+
+        // The next window still grants a full budget of accepted calls.
+        assert_eq!(limiter.check_and_record(ALICE, SUBMIT, 100), Ok(()));
+        assert_eq!(limiter.check_and_record(ALICE, SUBMIT, 100), Ok(()));
+        assert_eq!(
+            limiter.check_and_record(ALICE, SUBMIT, 100),
             Err(RateLimitError::Limited)
         );
     }
