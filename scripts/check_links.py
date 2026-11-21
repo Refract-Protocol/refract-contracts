@@ -74,6 +74,8 @@ def main():
                 if not target or target.startswith(("mailto:", "javascript:", "#")):
                     continue
 
+                line_no = content.count("\n", 0, match.start()) + 1
+
                 if target.startswith(("http://", "https://")):
                     if args.skip_external:
                         continue
@@ -86,15 +88,15 @@ def main():
                         ok, info = checked_external[target]
 
                     if not ok:
-                        broken_links.append((rel_path, target, info or "Unreachable"))
+                        broken_links.append((rel_path, line_no, target, info or "Unreachable"))
                 else:
                     if not check_local_link(file_path, target):
-                        broken_links.append((rel_path, target, "Local file does not exist"))
+                        broken_links.append((rel_path, line_no, target, "Local file does not exist"))
 
     if broken_links:
         print(f"\nFound {len(broken_links)} broken link(s):")
-        for src, target, reason in broken_links:
-            print(f"  {src} -> {target} ({reason})")
+        for src, line_no, target, reason in broken_links:
+            print(f"  {src}:{line_no}: {target} ({reason})")
         sys.exit(1)
     else:
         print("All markdown cross-references and links verified successfully!")
