@@ -5,7 +5,8 @@
 //! amount from the sponsor's budget. The rule is set by governance, and its
 //! target must be above its minimum, so each refill leaves the escrow with
 //! headroom. A refill that the sponsor cannot cover is refused, and the escrow
-//! is left unchanged.
+//! is left unchanged. A refill that would push the escrow past its configured
+//! cap is likewise refused.
 
 /// When the escrow drops below `minimum`, top it up to `refill_to`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,8 @@ pub enum EscrowError {
     InsufficientEscrow,
     /// The sponsor's budget does not cover the refill.
     InsufficientSponsorFunds,
+    /// The refill would push the escrow past its configured cap.
+    ExceedsCap,
     /// A running total did not fit in an i128.
     Overflow,
 }
@@ -34,15 +37,17 @@ pub enum EscrowError {
 pub struct ProgramEscrow {
     governance: u64,
     balance: i128,
+    cap: i128,
     rule: Option<RefillRule>,
 }
 
 impl ProgramEscrow {
-    /// An empty escrow with no refill rule.
+    /// An empty escrow with no refill rule and no cap.
     pub fn new(governance: u64) -> Self {
         Self {
             governance,
             balance: 0,
+            cap: i128::MAX,
             rule: None,
         }
     }
@@ -52,9 +57,26 @@ impl ProgramEscrow {
         self.balance
     }
 
+    /// The configured maximum the escrow balance may reach.
+    pub fn cap(&self) -> i128 {
+        self.cap
+    }
+
     /// The refill rule, if one is set.
     pub fn rule(&self) -> Option<RefillRule> {
         self.rule
+    }
+
+    /// Sets the maximum the escrow balance may reach. Governance only.
+    pub fn set_cap(&mut self, caller: u64, cap: i128) -> Result<(), EscrowError> {
+        if caller != self.governance {
+            return Err(EscrowError::Unauthorized);
+        }
+        if cap < 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        self.cap = cap;
+        Ok(())
     }
 
     /// Adds sponsor funds to the escrow. A sponsor may top up at any time.
@@ -103,7 +125,8 @@ impl ProgramEscrow {
 
     /// Applies the refill rule if the escrow is below its minimum. Takes the amount
     /// from the sponsor's budget and returns it. The refill is refused, and nothing
-    /// changes, if the sponsor cannot cover it.
+    /// changes, if the sponsor cannot cover it or if it would push the escrow past
+    /// its configured cap.
     pub fn auto_refill(&mut self, sponsor_budget: i128) -> Result<i128, EscrowError> {
         let needed = match self.refill_needed() {
             Some(needed) => needed,
@@ -112,7 +135,11 @@ impl ProgramEscrow {
         if needed > sponsor_budget {
             return Err(EscrowError::InsufficientSponsorFunds);
         }
-        self.balance = self.balance.checked_add(needed).ok_or(EscrowError::Overflow)?;
+        let new_balance = self.balance.checked_add(needed).ok_or(EscrowError::Overflow)?;
+        if new_balance > self.cap {
+            return Err(EscrowError::ExceedsCap);
+        }
+        self.balance = new_balance;
         Ok(needed)
     }
 }
@@ -169,6 +196,25 @@ mod tests {
             Err(EscrowError::InsufficientSponsorFunds)
         );
         assert_eq!(escrow.balance(), 50);
+    }
+
+    #[test]
+    fn a_refill_that_would_exceed_the_cap_is_refused_without_changes() {
+        let mut escrow = escrow();
+        escrow.set_cap(GOVERNANCE, 400).unwrap();
+        escrow.pay(250).unwrap();
+        assert_eq!(escrow.refill_needed(), Some(450));
+        assert_eq!(escrow.auto_refill(1_000), Err(EscrowError::ExceedsCap));
+        assert_eq!(escrow.balance(), 50);
+    }
+
+    #[test]
+    fn a_refill_within_the_cap_is_allowed() {
+        let mut escrow = escrow();
+        escrow.set_cap(GOVERNANCE, 500).unwrap();
+        escrow.pay(250).unwrap();
+        assert_eq!(escrow.auto_refill(1_000), Ok(450));
+        assert_eq!(escrow.balance(), 500);
     }
 
     #[test]
