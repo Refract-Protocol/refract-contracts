@@ -38,6 +38,8 @@ pub enum QueueError {
     NotOwner,
     /// An intermediate value did not fit in an i128.
     Overflow,
+    /// The queue was empty, so there was nothing to fill.
+    EmptyBatch,
 }
 
 /// Withdrawal requests in the order they were made.
@@ -102,7 +104,15 @@ impl WithdrawalQueue {
     /// `shares * available / total_requested`, rounded down, and the rest stays
     /// queued. Rounding down means the fills never add up to more than
     /// `available`. Returns the fills made in this round.
+    ///
+    /// An empty queue is rejected with [`QueueError::EmptyBatch`] rather than
+    /// treated as a successful no-op, so caller bugs surface instead of
+    /// silently wasting a ledger write.
     pub fn fill_pro_rata(&mut self, available: i128) -> Result<Vec<Fill>, QueueError> {
+        if self.requests.is_empty() {
+            return Err(QueueError::EmptyBatch);
+        }
+
         let total = self.total_requested();
         if available <= 0 || total == 0 {
             return Ok(Vec::new());
@@ -162,6 +172,14 @@ mod tests {
         assert_eq!(queue.cancel(id, BOB), Err(QueueError::NotOwner));
         assert_eq!(queue.cancel(99, ALICE), Err(QueueError::NotFound));
         queue.cancel(id, ALICE).unwrap();
+        assert!(queue.pending().is_empty());
+    }
+
+    #[test]
+    fn empty_batch_is_rejected() {
+        let mut queue = WithdrawalQueue::new();
+        assert_eq!(queue.fill_pro_rata(1_000), Err(QueueError::EmptyBatch));
+        assert_eq!(queue.fill_pro_rata(0), Err(QueueError::EmptyBatch));
         assert!(queue.pending().is_empty());
     }
 
