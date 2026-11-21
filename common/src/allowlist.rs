@@ -130,6 +130,9 @@ pub fn status(env: &Env, recipient: &Address) -> Option<ScreeningStatus> {
 }
 
 /// Return `true` iff `recipient` is `Allowed`.
+///
+/// An unset key (no screening record) is treated as **not allowed** — only
+/// addresses explicitly added via [`allow`] pass this check.
 pub fn is_allowed(env: &Env, recipient: &Address) -> bool {
     matches!(status(env, recipient), Some(ScreeningStatus::Allowed))
 }
@@ -178,6 +181,18 @@ mod tests {
     #[test]
     fn unlisted_address_is_not_allowed() {
         let (env, addr) = setup();
+        assert!(!is_allowed(&env, &addr));
+        assert_eq!(
+            require_allowed(&env, &addr),
+            Err(AllowlistError::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn unset_key_defaults_to_deny() {
+        let (env, addr) = setup();
+        // No entry has ever been written for this address.
+        assert_eq!(status(&env, &addr), None);
         assert!(!is_allowed(&env, &addr));
         assert_eq!(
             require_allowed(&env, &addr),
