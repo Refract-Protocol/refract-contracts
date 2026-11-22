@@ -580,3 +580,21 @@ fn test_per_holder_indexing_unbounded_growth_boundary() {
     let ids = registry.get_holder_active_policy_ids(&holder);
     assert_eq!(ids.len(), 50);
 }
+
+#[test]
+fn get_policy_returns_the_requested_policy_among_several() {
+    let f = setup();
+    let a = Address::generate(&f.env);
+    let b = Address::generate(&f.env);
+    f.registry
+        .register_policy(&f.pool, &registration(1, &a, CoverageType::StablecoinDepeg));
+    f.registry
+        .register_policy(&f.pool, &registration(2, &b, CoverageType::StablecoinDepeg));
+    f.registry
+        .register_policy(&f.pool, &registration(3, &a, CoverageType::StablecoinDepeg));
+
+    let rec = f.registry.get_policy(&2);
+    assert_eq!(rec.holder, b);
+    assert_eq!(f.registry.get_policy(&3).holder, a);
+    assert_eq!(f.registry.get_policy(&1).holder, a);
+}

@@ -828,12 +828,7 @@ impl RefractOracle {
             .storage()
             .persistent()
             .get(&DataKey::Reading(feed_id))?;
-        let diff = if reading.value >= peg_price {
-            reading.value.checked_sub(peg_price)?
-        } else {
-            peg_price.checked_sub(reading.value)?
-        };
-        diff.checked_mul(10_000)?.checked_div(peg_price)
+        Self::band_bps(reading.value, peg_price)
     }
 
     /// Guardian helper: combined staleness + depeg status for a feed.
@@ -846,8 +841,18 @@ impl RefractOracle {
         peg_price: i128,
         depeg_bps: i128,
     ) -> (bool, bool, i128) {
-        let stale = Self::is_stale(env.clone(), feed_id.clone(), max_staleness_secs);
-        let band = Self::depeg_bps(env, feed_id, peg_price).unwrap_or(i128::MAX);
+        // Read the price entry once and derive both flags from it.
+        let reading: Option<OracleReading> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Reading(feed_id));
+        let stale = match &reading {
+            None => true,
+            Some(r) => env.ledger().timestamp().saturating_sub(r.timestamp) > max_staleness_secs,
+        };
+        let band = reading
+            .and_then(|r| Self::band_bps(r.value, peg_price))
+            .unwrap_or(i128::MAX);
         let depegged = band > depeg_bps;
         (stale || depegged, stale, band)
     }
@@ -906,6 +911,20 @@ impl RefractOracle {
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────
+
+    /// Absolute deviation of `value` from `peg_price` in basis points.
+    /// Caller guarantees nothing; returns `None` when `peg_price <= 0`.
+    fn band_bps(value: i128, peg_price: i128) -> Option<i128> {
+        if peg_price <= 0 {
+            return None;
+        }
+        let diff = if value >= peg_price {
+            value.checked_sub(peg_price)?
+        } else {
+            peg_price.checked_sub(value)?
+        };
+        diff.checked_mul(10_000)?.checked_div(peg_price)
+    }
 
     fn require_admin(env: &Env) -> Result<(), OracleError> {
         let admin: Address = env

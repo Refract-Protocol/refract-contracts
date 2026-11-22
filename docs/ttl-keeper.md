@@ -16,3 +16,5 @@ cargo xtask ttl bump --dry-run
 ```
 
 Run `cargo xtask ttl bump` to submit configured invocations. The Python keeper uses only the standard library; a compatible Stellar CLI and funded keeper identity are required for live bumps.
+
+The keeper only requests the configured `ttl_keys` (never a full ledger snapshot) and fetches the latest ledger once per run. With `bump --dry-run`, no commands are executed and each contract that needs a bump reports the keys it would extend under `would_extend`.

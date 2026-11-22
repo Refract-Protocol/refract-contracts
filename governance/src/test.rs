@@ -270,3 +270,31 @@ fn cannot_execute_defeated_proposal() {
     let res = gov.try_queue(&id, &(env.ledger().timestamp() + 100));
     assert_eq!(res, Err(Ok(GovernanceError::WrongState)));
 }
+
+#[test]
+fn tally_matches_hand_computed_votes() {
+    let (env, admin, token, alice, bob, _) = make_env();
+    let gov_id = env.register_contract(None, RefractGovernor);
+    let gov = RefractGovernorClient::new(&env, &gov_id);
+    gov.initialize(&admin, &default_config(&token));
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    let target = env.register_contract(None, stub::Stub);
+    let id = gov.propose(
+        &alice,
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 1),
+        &Symbol::new(&env, "prop_t"),
+    );
+
+    assert_eq!(gov.cast_vote(&alice, &id, &true), 1_000_000_000);
+    assert_eq!(gov.cast_vote(&bob, &id, &false), 500_000_000);
+
+    let p = gov.get_proposal(&id).unwrap();
+    assert_eq!(p.votes_for, 1_000_000_000);
+    assert_eq!(p.votes_against, 500_000_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_010_000);
+    assert_eq!(gov.finalize(&id), ProposalStatus::Succeeded);
+}

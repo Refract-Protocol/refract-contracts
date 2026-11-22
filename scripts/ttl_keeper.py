@@ -42,7 +42,7 @@ def ttl_from_entry(entry):
     return struct.unpack_from(">I", xdr, 40)[0]
 
 
-def query_contract_ttl(rpc_url, contract):
+def query_contract_ttl(rpc_url, contract, ledger=None):
     keys = contract.get("ttl_keys", [])
     if not contract.get("id") or not keys:
         return {
@@ -51,7 +51,8 @@ def query_contract_ttl(rpc_url, contract):
             "remaining_ttl": None,
         }
 
-    ledger = int(rpc_call(rpc_url, "getLatestLedger", {})["sequence"])
+    if ledger is None:
+        ledger = int(rpc_call(rpc_url, "getLatestLedger", {})["sequence"])
     result = rpc_call(rpc_url, "getLedgerEntries", {"keys": keys})
     entries = result.get("entries", [])
     if len(entries) != len(keys):
@@ -64,6 +65,14 @@ def query_contract_ttl(rpc_url, contract):
         "remaining_ttl": min(remaining, default=0),
         "entries": remaining,
     }
+
+
+def keys_below_threshold(contract, result, threshold):
+    """Return the configured TTL keys whose remaining TTL is under threshold."""
+    if not result.get("configured"):
+        return []
+    keys = contract.get("ttl_keys", [])
+    return [k for k, ttl in zip(keys, result["entries"]) if ttl < threshold]
 
 
 def invoke_bump(keeper, contract, extend_to):
@@ -100,9 +109,14 @@ def main(argv):
         extend_to = int(keeper["extend_to"])
         report = []
         failed = False
+        ledger = None  # fetched once per tick, shared by all contracts
         for contract in config.get("contracts", []):
             try:
-                result = query_contract_ttl(keeper["rpc_url"], contract)
+                if ledger is None and contract.get("id") and contract.get("ttl_keys"):
+                    ledger = int(
+                        rpc_call(keeper["rpc_url"], "getLatestLedger", {})["sequence"]
+                    )
+                result = query_contract_ttl(keeper["rpc_url"], contract, ledger)
                 needs_bump = (
                     result["configured"]
                     and result["remaining_ttl"] < threshold
@@ -111,6 +125,9 @@ def main(argv):
                 result["action"] = "noop"
                 if needs_bump and args.action == "bump":
                     if args.dry_run:
+                        result["would_extend"] = keys_below_threshold(
+                            contract, result, threshold
+                        )
                         result["action"] = "dry_run_bump"
                     else:
                         invoke_bump(keeper, contract, extend_to)

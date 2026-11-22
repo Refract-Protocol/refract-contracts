@@ -887,3 +887,27 @@ fn first_submission_from_a_relayer_is_always_accepted() {
     );
     assert!(res.is_ok());
 }
+
+#[test]
+fn consecutive_reads_and_guardian_status_agree() {
+    let f = setup();
+    submit(&f, "USDC_PRICE", 9_900_000);
+    let feed = Symbol::new(&f.env, "USDC_PRICE");
+
+    let first = f.oracle.get_reading(&feed);
+    let second = f.oracle.get_reading(&feed);
+    assert_eq!(first, second);
+
+    // guardian_status derives staleness and depeg band from one read and
+    // must match the individual helpers.
+    let (tripped, stale, band) = f.oracle.guardian_status(&feed, &3_600, &SCALE, &50);
+    assert_eq!(stale, f.oracle.is_stale(&feed, &3_600));
+    assert_eq!(band, f.oracle.depeg_bps(&feed, &SCALE).unwrap());
+    assert!(tripped); // 100 bps band > 50
+
+    let missing = Symbol::new(&f.env, "NOPE");
+    assert_eq!(
+        f.oracle.guardian_status(&missing, &3_600, &SCALE, &50),
+        (true, true, i128::MAX)
+    );
+}
