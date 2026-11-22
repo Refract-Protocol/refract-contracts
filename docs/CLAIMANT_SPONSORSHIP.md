@@ -30,6 +30,43 @@ by governance. When spend reaches 80% of the ceiling the bounty contract emits
 no funds. The relay reads the same ceiling from `sponsor-policy.json` and
 refuses to submit once the local counter would pass it.
 
+## When the sponsor runs out
+
+"Sponsor runs dry" can mean three different things. The behaviour of each, as
+the code stands today:
+
+1. Sponsor ceiling reached (relay). `check_policy` in
+   `scripts/fee_bump_relay.py` raises `RelayError("sponsor ceiling reached")`
+   when `spent + amount` would pass `ceiling` in `sponsor-policy.json`. The
+   relay exits with that error before building or submitting the envelope, and
+   `spent` is not updated. Nothing reaches the chain; the claimant's award or
+   grant is untouched and can be retried once governance raises the ceiling or
+   the epoch resets the policy. A revoked policy fails the same way with
+   `RelayError("sponsorship revoked")`.
+2. Paying contract short of tokens (on chain). `pay` in `common/src/payout.rs`
+   calls `try_transfer`; a token balance error maps to
+   `TransferOutcome::InsufficientBalance`. The call does not revert. `pay`
+   writes a `PayoutRecord` with status `Failed` and reason
+   `InsufficientBalance`, adds `amount` to the token's liability, and emits a
+   `pay_fail` event. The host contract keeps its own state update, and the
+   record can be re-attempted with `retry` (or reclaimed with `reclaim`). The
+   claimant sees a failed payout record, not a transaction error.
+3. Escrow top-up from a sponsor budget. `ProgramEscrow::auto_refill` in
+   `bounty/src/escrow_refill.rs` returns `EscrowError::InsufficientSponsorFunds`
+   and leaves the escrow unchanged when the budget cannot cover the refill.
+
+Known limitations:
+
+- `treasury/src/payments.rs` has no sponsor-balance check; the on-chain
+  behaviour above lives in `common/src/payout.rs`.
+- `bounty/src/escrow_refill.rs` is not declared as a module anywhere in the
+  workspace, so it is not compiled or reachable from a contract today.
+- The on-chain errors `SponsorCeilingReached` and `SponsorshipRevoked`, and the
+  `set_sponsor` / `revoke_sponsorship` entrypoints, and the `SPEND` / `CEILING`
+  events named elsewhere in this document do not exist in the contract code
+  (`rg SponsorCeilingReached` only matches this file). The ceiling and
+  revocation checks are enforced only by the off-chain relay.
+
 ## Revocation
 
 The sponsor calls `revoke_sponsorship`. That sets a flag. It does not move
