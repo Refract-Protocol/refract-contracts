@@ -75,6 +75,8 @@ pub enum ParamsError {
     NotInitialized = 2,
     /// Caller is not the governance/timelock address.
     Unauthorized = 3,
+    /// The value is outside the documented range for a well-known key.
+    ValueOutOfRange = 4,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -166,6 +168,9 @@ impl RefractParams {
         if caller != timelock {
             return Err(ParamsError::Unauthorized);
         }
+        if !Self::in_bounds(&env, &key, value) {
+            return Err(ParamsError::ValueOutOfRange);
+        }
         Self::write_param(&env, key, value);
         Ok(())
     }
@@ -217,6 +222,33 @@ impl RefractParams {
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Range check for well-known keys. Unknown keys are unconstrained.
+    ///
+    /// * `*_bps` keys: `0..=10_000`.
+    /// * `paused`: `0` or `1`.
+    /// * `*_approver_thr`: `>= 1`.
+    /// * cooldown, bounty amounts and the treasury cap: `>= 0`.
+    fn in_bounds(env: &Env, key: &Symbol, value: i128) -> bool {
+        let is = |name: &str| *key == Symbol::new(env, name);
+        if is("premium_share_bps") || is("loss_haircut_bps") {
+            (0..=10_000).contains(&value)
+        } else if is("paused") {
+            value == 0 || value == 1
+        } else if is("bounty_approver_thr") || is("grants_approver_thr") {
+            value >= 1
+        } else if is("unstake_cooldown")
+            || is("bounty_critical")
+            || is("bounty_high")
+            || is("bounty_medium")
+            || is("bounty_low")
+            || is("treasury_spend_cap")
+        {
+            value >= 0
+        } else {
+            true
+        }
+    }
 
     fn write_param(env: &Env, key: Symbol, value: i128) {
         env.storage()

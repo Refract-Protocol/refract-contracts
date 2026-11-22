@@ -183,3 +183,40 @@ fn timelock_scenario_drives_parameter_update() {
     params.set(&timelock_addr, &key, &1000i128); // raise to 10%
     assert_eq!(params.get(&key), Some(1000i128));
 }
+
+// ─── Bounds checks ────────────────────────────────────────────────────────────
+
+#[test]
+fn set_enforces_bounds_on_well_known_keys() {
+    let f = setup();
+    let bps = Symbol::new(&f.env, "premium_share_bps");
+    // Lower and upper bounds are accepted.
+    f.params.set(&f.timelock, &bps, &0i128);
+    assert_eq!(f.params.get(&bps), Some(0i128));
+    f.params.set(&f.timelock, &bps, &10_000i128);
+    assert_eq!(f.params.get(&bps), Some(10_000i128));
+    // One past each bound is rejected and leaves the stored value intact.
+    assert_eq!(
+        f.params.try_set(&f.timelock, &bps, &-1i128),
+        Err(Ok(ParamsError::ValueOutOfRange))
+    );
+    assert_eq!(
+        f.params.try_set(&f.timelock, &bps, &10_001i128),
+        Err(Ok(ParamsError::ValueOutOfRange))
+    );
+    assert_eq!(f.params.get(&bps), Some(10_000i128));
+
+    let paused = Symbol::new(&f.env, "paused");
+    f.params.set(&f.timelock, &paused, &1i128);
+    assert_eq!(
+        f.params.try_set(&f.timelock, &paused, &2i128),
+        Err(Ok(ParamsError::ValueOutOfRange))
+    );
+
+    let thr = Symbol::new(&f.env, "bounty_approver_thr");
+    f.params.set(&f.timelock, &thr, &1i128);
+    assert_eq!(
+        f.params.try_set(&f.timelock, &thr, &0i128),
+        Err(Ok(ParamsError::ValueOutOfRange))
+    );
+}
