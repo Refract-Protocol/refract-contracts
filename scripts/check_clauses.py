@@ -42,7 +42,7 @@ def main() -> int:
                 errors.append(f"{clause_id}: test {test['name']} not found in {test['file']}")
 
     if errors:
-        print("Clause conformance check failed:")
+        print(f"Clause conformance check failed: {len(errors)} problem(s) found")
         for error in errors:
             print(f"  - {error}")
         return 1
