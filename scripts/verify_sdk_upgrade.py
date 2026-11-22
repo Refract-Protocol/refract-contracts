@@ -13,6 +13,7 @@ import os
 import sys
 import subprocess
 import glob
+import re
 
 def check_abi_stability():
     print("[1/4] Checking ABI & Contract Specification Stability...")
@@ -43,6 +44,26 @@ def check_storage_key_invariants():
                     print(f"      - Warning: {crate} missing explicit DataKey definition")
                 else:
                     print(f"      - {crate}: DataKey schema and discriminant alignment verified")
+    return True
+
+def check_sdk_version():
+    """Compare the workspace soroban-sdk requirement with the locked version."""
+    try:
+        with open("Cargo.toml", "r", encoding="utf-8") as f:
+            manifest = f.read()
+        with open("Cargo.lock", "r", encoding="utf-8") as f:
+            lock = f.read()
+    except OSError:
+        return True
+    want = re.search(r'^soroban-sdk\s*=\s*(?:\{\s*version\s*=\s*)?"=?\^?([\d.]+)"', manifest, re.M)
+    have = re.search(r'name = "soroban-sdk"\s+version = "([\d.]+)"', lock)
+    if not want or not have:
+        return True
+    expected, found = want.group(1), have.group(1)
+    parse = lambda v: tuple(int(p) for p in v.split("."))
+    if parse(found)[0] != parse(expected)[0] or parse(found) < parse(expected):
+        print(f"SDK version mismatch: expected {expected}, found {found}")
+        return False
     return True
 
 def check_wasm_sizes():
@@ -100,6 +121,7 @@ def generate_checklist_report():
 def main():
     print("=== Refract Contracts: SDK Upgrade Verification Gate ===")
     ok = True
+    ok = check_sdk_version() and ok
     ok = check_abi_stability() and ok
     ok = check_storage_key_invariants() and ok
     ok = check_wasm_sizes() and ok
