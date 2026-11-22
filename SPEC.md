@@ -6,6 +6,17 @@
 
 ---
 
+## Amount unit
+
+Unless a section says otherwise, every amount, price, rate and balance in this
+document is an integer in **1e7 fixed-point stroops** (`SCALE_1E7 = 10_000_000`,
+so 1 whole token = `10_000_000`). The type is `Amount = i128`
+(`interfaces/src/types.rs`); conversions go through `to_1e7` / `from_1e7` in
+`math/src/lib.rs`. There is no floating point anywhere. Rates expressed in basis
+points (`*_bps`) are plain integers out of `10_000`, not 1e7-scaled.
+
+---
+
 ## 1. Purpose
 
 This document is the formal, machine-checkable specification of `RefractPool`'s
@@ -212,6 +223,8 @@ formal-spec:
 > Issue #218. Code: `RefractPool::process_claim` (`pool/src/lib.rs`) and
 > `RefractBackstop::draw_down` (`backstop/src/lib.rs`).
 
+All amounts below use the [1e7 fixed-point unit](#amount-unit).
+
 When a triggered claim is larger than the pool's own capital, the pool draws
 the difference from `RefractBackstop`:
 
@@ -292,6 +305,8 @@ combined. Quorum is `quorum_bps` of `GovernorConfig::total_voting_supply`.
 ## 8. Protocol Revenue, Backstop, and Storage TTL
 
 ### Bounty and grant payout fees
+
+Gross, net and fee amounts are in the [1e7 fixed-point unit](#amount-unit); the fee rate is in basis points.
 
 `RefractBountyEscrow` and `RefractGrants` use a governance-authorized fee rate
 bounded by 1,000 basis points. `quote_payout` rounds the fee down so the
@@ -423,6 +438,8 @@ checked on both sides (`python3 scripts/merkle_batch.py selftest` and
 
 ### 9.2 Lifecycle
 
+`total_amount` and leaf `amount` are in the [1e7 fixed-point unit](#amount-unit).
+
 | Step | Entrypoint | Rules |
 |------|------------|-------|
 | Publish | `publish_batch(caller, root, total_amount, asset, expiry)` | Admin (timelock) only. `total_amount > 0`, `expiry` in the future, and `total_amount <= free balance`. Reserves `total_amount`. Emits `batch_published`. |
@@ -531,6 +548,8 @@ audit records in the other three contracts.
 on-chain, from application to final milestone payment.
 
 ### Applications
+
+Grant and milestone amounts are in the [1e7 fixed-point unit](#amount-unit).
 
 | Transition | Caller | Notes |
 |---|---|---|
