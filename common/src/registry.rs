@@ -47,7 +47,9 @@ pub fn resolve(env: &Env, registry: &Address, role: Role) -> Option<Address> {
     RegistryClient::new(env, registry).get(&role)
 }
 
-/// `true` if `addr` is currently registered for `role`.
+/// `true` if `addr` is currently registered for `role`. Never panics on an
+/// unregistered role: it returns `false`, consistent with [`resolve`]
+/// returning `None`.
 pub fn is_trusted(env: &Env, registry: &Address, role: Role, addr: &Address) -> bool {
     RegistryClient::new(env, registry).is_trusted(&role, addr)
 }
