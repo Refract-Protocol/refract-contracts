@@ -887,3 +887,22 @@ fn first_submission_from_a_relayer_is_always_accepted() {
     );
     assert!(res.is_ok());
 }
+
+#[test]
+fn a_timestamp_above_u32_max_is_accepted_and_a_later_one_is_rejected_as_future() {
+    let f = setup();
+    let big = u32::MAX as u64 + 1_000;
+    f.env.ledger().with_mut(|li| li.timestamp = big);
+
+    let feed = Symbol::new(&f.env, "USDC_PRICE");
+    let src = Symbol::new(&f.env, "test_source");
+    assert!(f
+        .oracle
+        .try_submit(&f.relayer, &feed, &9_000_000, &big, &src)
+        .is_ok());
+
+    let res = f
+        .oracle
+        .try_submit(&f.relayer, &feed, &9_000_000, &(big + 1), &src);
+    assert_eq!(res, Err(Ok(OracleError::FutureTimestamp)));
+}
