@@ -9,6 +9,12 @@
 /// A staker's handle.
 pub type StakerId = u64;
 
+/// Maximum number of requests settled by one queue drain.
+///
+/// Keeping this bound means callers can make progress on the head of a large
+/// queue without loading or mutating every later request in the same call.
+pub const MAX_FILL_BATCH: usize = 16;
+
 /// One queued withdrawal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -45,6 +51,9 @@ pub enum QueueError {
 pub struct WithdrawalQueue {
     next_id: u64,
     requests: Vec<Request>,
+    /// Cached sum of pending shares. Maintaining it at mutation time avoids a
+    /// full-queue read solely to calculate a proportional fill.
+    total_requested: i128,
 }
 
 impl WithdrawalQueue {
@@ -59,13 +68,19 @@ impl WithdrawalQueue {
             return Err(QueueError::InvalidShares);
         }
         let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).ok_or(QueueError::Overflow)?;
+        let next_id = self.next_id.checked_add(1).ok_or(QueueError::Overflow)?;
+        let next_total = self
+            .total_requested
+            .checked_add(shares)
+            .ok_or(QueueError::Overflow)?;
         self.requests.push(Request {
             id,
             staker,
             shares,
             requested_at: now,
         });
+        self.next_id = next_id;
+        self.total_requested = next_total;
         Ok(id)
     }
 
@@ -76,9 +91,7 @@ impl WithdrawalQueue {
 
     /// Total shares still waiting across the queue.
     pub fn total_requested(&self) -> i128 {
-        self.requests
-            .iter()
-            .fold(0i128, |total, request| total.saturating_add(request.shares))
+        self.total_requested
     }
 
     /// Withdraws a queued request. Only the staker who made it may cancel it.
@@ -91,14 +104,19 @@ impl WithdrawalQueue {
         if self.requests[index].staker != staker {
             return Err(QueueError::NotOwner);
         }
-        self.requests.remove(index);
+        let request = self.requests.remove(index);
+        self.total_requested = self
+            .total_requested
+            .checked_sub(request.shares)
+            .ok_or(QueueError::Overflow)?;
         Ok(())
     }
 
     /// Fills the queue from `available` shares' worth of capital.
     ///
-    /// If `available` covers the whole queue, every request is filled in full
-    /// and the queue empties. Otherwise each request is filled by
+    /// At most [`MAX_FILL_BATCH`] oldest requests are processed per call. If
+    /// `available` covers the whole queue, the processed head batch is filled
+    /// in full. Otherwise each request in that batch is filled by
     /// `shares * available / total_requested`, rounded down, and the rest stays
     /// queued. Rounding down means the fills never add up to more than
     /// `available`. Returns the fills made in this round.
@@ -108,20 +126,31 @@ impl WithdrawalQueue {
             return Ok(Vec::new());
         }
 
+        let batch_len = self.requests.len().min(MAX_FILL_BATCH);
         if available >= total {
+            let drained_total = self
+                .requests
+                .iter()
+                .take(batch_len)
+                .try_fold(0i128, |sum, request| sum.checked_add(request.shares))
+                .ok_or(QueueError::Overflow)?;
             let fills = self
                 .requests
-                .drain(..)
+                .drain(..batch_len)
                 .map(|request| Fill {
                     id: request.id,
                     shares: request.shares,
                 })
                 .collect();
+            self.total_requested = self
+                .total_requested
+                .checked_sub(drained_total)
+                .ok_or(QueueError::Overflow)?;
             return Ok(fills);
         }
 
         let mut fills = Vec::new();
-        for request in self.requests.iter_mut() {
+        for request in self.requests.iter_mut().take(batch_len) {
             let share = request
                 .shares
                 .checked_mul(available)
@@ -133,6 +162,10 @@ impl WithdrawalQueue {
                     shares: share,
                 });
                 request.shares -= share;
+                self.total_requested = self
+                    .total_requested
+                    .checked_sub(share)
+                    .ok_or(QueueError::Overflow)?;
             }
         }
         Ok(fills)
@@ -222,5 +255,20 @@ mod tests {
         queue.request(ALICE, 100, 0).unwrap();
         assert!(queue.fill_pro_rata(0).unwrap().is_empty());
         assert_eq!(queue.total_requested(), 100);
+    }
+
+    #[test]
+    fn drain_only_processes_the_bounded_head_batch() {
+        let mut queue = WithdrawalQueue::new();
+        for index in 0..=MAX_FILL_BATCH {
+            queue.request(index as StakerId, 1, index as u64).unwrap();
+        }
+
+        let fills = queue.fill_pro_rata((MAX_FILL_BATCH + 1) as i128).unwrap();
+        assert_eq!(fills.len(), MAX_FILL_BATCH);
+        assert_eq!(fills[0].id, 0);
+        assert_eq!(fills[MAX_FILL_BATCH - 1].id, (MAX_FILL_BATCH - 1) as u64);
+        assert_eq!(queue.pending().len(), 1);
+        assert_eq!(queue.pending()[0].id, MAX_FILL_BATCH as u64);
     }
 }
