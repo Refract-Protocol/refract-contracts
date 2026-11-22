@@ -231,9 +231,16 @@ class Stellar:
                 return None
             return hashlib.sha256(out.read_bytes()).hexdigest()
 
-    def deploy(self, wasm: Path, salt: bytes) -> str:
-        return self.run("contract", "deploy", "--wasm", str(wasm), "--salt", salt.hex(),
-                        "--source", self.source, *self.net).stdout.strip().splitlines()[-1]
+    def deploy(self, wasm: Path, salt: bytes, name: str = "?") -> str:
+        out = self.run("contract", "deploy", "--wasm", str(wasm), "--salt", salt.hex(),
+                       "--source", self.source, *self.net).stdout.strip()
+        line = out.splitlines()[-1] if out else ""
+        try:
+            strkey_decode(line)
+        except Exception:
+            die(f"{name}: could not parse a contract id from deploy output: {line!r} "
+                f"(raw output: {out!r})")
+        return line
 
     def invoke(self, contract_id: str, fn: str, args: dict, send: bool = True,
                check: bool = True) -> subprocess.CompletedProcess:
@@ -348,7 +355,7 @@ def cmd_deploy(args, cfg: dict) -> None:
             if actual != expected:
                 die(f"{name}: {wasm} sha256 {actual} != manifest {expected}")
             log(f"deploying {name} …")
-            got = cli.deploy(wasm, salt_for(name))
+            got = cli.deploy(wasm, salt_for(name), name)
             if got != cid:
                 die(f"{name}: deployed at {got}, expected {cid}")
             on_chain = expected
