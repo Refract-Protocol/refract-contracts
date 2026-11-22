@@ -36,6 +36,10 @@ pub type ClaimId = u64;
 /// Identifier of a governance proposal (`RefractGovernor`).
 pub type ProposalId = u64;
 
+/// Ledger / Unix timestamp in seconds. Matches `env.ledger().timestamp()`, which
+/// is `u64`; oracle and timelock timestamps use this width with no narrowing casts.
+pub type Timestamp = u64;
+
 /// Identifier of a queued timelock operation (`RefractTimelock`).
 pub type OperationId = u64;
 

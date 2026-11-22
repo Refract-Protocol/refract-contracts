@@ -340,3 +340,20 @@ fn expire_executed_op_is_rejected() {
     let res = tl.try_expire(&id);
     assert_eq!(res, Err(Ok(TimelockError::AlreadyDone)));
 }
+
+#[test]
+fn queue_rejects_eta_too_soon_for_timestamps_above_u32_max() {
+    let (env, admin, tl_id, target) = make_env();
+    let tl = RefractTimelockClient::new(&env, &tl_id);
+    tl.initialize(&admin, &3600u64);
+
+    let now = u32::MAX as u64 + 10_000;
+    env.ledger().with_mut(|l| l.timestamp = now);
+    let res = tl.try_queue(
+        &target,
+        &Symbol::new(&env, "set_value"),
+        &stub_args(&env, 42),
+        &(now + 100),
+    );
+    assert_eq!(res, Err(Ok(TimelockError::EtaTooSoon)));
+}
