@@ -165,6 +165,8 @@ def validate_deny_policy():
 
 
 def cargo_audit():
+    if shutil.which("cargo-audit") is None:
+        raise ToolingError("`cargo-audit` is not installed (run `cargo install cargo-audit --locked`); nothing was audited")
     res = run(["cargo", "audit", "--json"])
     # cargo audit exits 1 both when it finds vulnerabilities and when it
     # breaks (e.g. the advisory DB fetch failed). A parsable report with
