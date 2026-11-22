@@ -5,11 +5,17 @@
 **Complexity:** High (200 points)  
 **Status:** Documentation — implementation deferred
 
+> **Current code status:** The mitigations proposed in Section 4 (deposit
+> cooldown, decaying entry fee, time-weighted share price) are design options
+> only. None is implemented in `pool/src/lib.rs`. The pool has no commit-reveal
+> scheme. The only timing control that exists is the withdrawal lockup described
+> in Section 3. See Section 9, "Known gaps".
+
 ---
 
 ## 1. Problem Statement
 
-`provide_capital` in `pool/src/lib.rs` mints shares immediately and proportionally using the current `total_capital / total_shares` ratio (see `_calc_shares`, line ~915). There is no minimum bonding period before newly-deposited capital is eligible for a pro-rata share of premiums already held in the pool.
+`provide_capital` in `pool/src/lib.rs` mints shares immediately and proportionally using the current `total_capital / total_shares` ratio (via `_calc_shares`, called from `quote_shares` and `provide_capital`). There is no minimum bonding period before newly-deposited capital is eligible for a pro-rata share of premiums already held in the pool.
 
 This means an LP who observes an imminent or already-confirmed-but-unclaimed trigger event can:
 
@@ -116,6 +122,11 @@ At this utilization and duration, `P << L` for any individual claim, making the 
 
 ## 3. Comparison Against Existing Mitigations
 
+The only mitigation implemented today is the withdrawal lockup: `provide_capital`
+records `DataKey::LastDeposit(provider)`, and `withdraw_capital` returns
+`PoolError::LockupActive` until `lockup_days` (default 7) have passed since that
+timestamp. Each new deposit resets the timer.
+
 The existing `lockup_days` mechanism **does not** address this attack. Lockup restricts **withdrawal** timing — it prevents the attacker from depositing and immediately withdrawing, but it does not prevent them from capturing premium accrual before a trigger. An attacker willing to wait out the lockup period (default: 7 days) faces no obstacle.
 
 ---
@@ -206,3 +217,19 @@ The fee is immaterial for any LP whose investment horizon matches the intended u
 - `pool/src/pricing_proptest.rs`: Existing share-price invariant proofs
 - ERC-4626 inflation attack pattern (design reference)
 - `docs/POOL_HARDENING_PLAN.md`: Related pool hardening work
+
+---
+
+## 9. Known gaps
+
+Not implemented in the pool today (this document describes them as proposals only):
+
+- **Deposit cooldown / decaying entry fee (Options A and B):** `provide_capital`
+  mints shares at the current `total_capital / total_shares` ratio with no entry
+  fee and no per-LP accrual checkpoint. A deposit made just before
+  `process_claim` shares in premiums that accrued before it (risk: premium
+  capture by a just-in-time depositor, profitable only when `P > L`, Section 2.4).
+- **Time-weighted share price (Option C):** not implemented.
+- **Commit-reveal for deposits or claims:** not implemented and not proposed here.
+  `process_claim` is permissionless and `provide_capital` takes effect immediately.
+- **`ENTRY_FEE_BPS` / `ENTRY_FEE_COOLDOWN_SECS`:** these constants do not exist.
