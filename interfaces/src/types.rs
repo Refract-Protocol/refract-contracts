@@ -13,8 +13,9 @@ use crate::errors::RefractError;
 
 // ── Numeric conventions ──────────────────────────────────────────────────────
 
-/// A token amount in 1e7 fixed point (the USDC / Stellar asset convention):
-/// `10_000_000` is one whole token.
+/// A token amount in stroops: 1e7 fixed point (the USDC / Stellar asset
+/// convention), so `10_000_000` stroops is one whole token. This matches
+/// `SCALE_1E7` in `refract-math`.
 pub type Amount = i128;
 
 /// Scale of an [`Amount`]: one whole token.

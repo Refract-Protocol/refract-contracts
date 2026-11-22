@@ -118,6 +118,11 @@ def main(argv):
                 report.append(result)
             except Exception as error:
                 failed = True
+                print(
+                    f"ttl_keeper: {contract.get('name', 'unknown')}: RPC endpoint "
+                    f"{keeper['rpc_url']} failed: {error}",
+                    file=sys.stderr,
+                )
                 report.append({"contract": contract.get("name", "unknown"), "error": str(error)})
         print(
             json.dumps(
