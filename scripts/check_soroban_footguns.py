@@ -105,7 +105,7 @@ def main():
                     if violations:
                         print(f"\nViolations in {path}:")
                         for v in violations:
-                            print(f"  Line {v['line']}: [{v['type']}] {v['message']}")
+                            print(f"  {v['file']}:{v['line']}: [{v['type']}] {v['message']}")
                         total_violations += len(violations)
                     else:
                         print(f"  [OK] {path}: clean (0 footguns)")
