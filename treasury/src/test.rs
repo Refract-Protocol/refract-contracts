@@ -1,6 +1,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use super::*;
+use crate::reserve::Reserve;
 use refract_common::payout::{PayoutStatus, RECLAIM_TIMEOUT_SECS};
 use refract_common::testutils::{MockMode, MockToken, MockTokenClient};
 use refract_registry::{RefractRegistry, RefractRegistryClient};
@@ -258,4 +259,16 @@ fn works_with_real_stellar_asset() {
     let tc = token::Client::new(&t.env, &sac.address());
     assert_eq!(tc.balance(&to), 400);
     assert_eq!(tc.balance(&t.id), 600);
+}
+
+#[test]
+fn reserve_coverage_reads_the_maintained_balance() {
+    let mut reserve = Reserve::new(1, 1_000).unwrap();
+    reserve.route_inflow(40, 1_000).unwrap();
+    reserve.route_inflow(30, 1_000).unwrap();
+    reserve.route_inflow(30, 1_000).unwrap();
+
+    assert!(reserve.can_cover(100));
+    assert!(reserve.can_cover(1));
+    assert!(!reserve.can_cover(101));
 }

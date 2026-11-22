@@ -1,4 +1,6 @@
 use super::*;
+use alloc::collections::BTreeMap;
+use crate::scoring::Rubric;
 
 const GOVERNANCE: Address = 1;
 const RECIPIENT: Address = 2;
@@ -43,6 +45,21 @@ fn funded_grant(
 
 fn held(grants: &RefractGrants, id: GrantId, who: Address) -> i128 {
     grants.funder_position(id, who).unwrap().held()
+}
+
+#[test]
+fn batch_scoring_uses_one_rubric_view_with_expected_totals() {
+    let rubric = Rubric::new(&[(1, 6_000), (2, 4_000)]).unwrap();
+    let requests = BTreeMap::from([
+        (10, BTreeMap::from([(1, 10_000), (2, 0)])),
+        (11, BTreeMap::from([(1, 5_000), (2, 5_000)])),
+        (12, BTreeMap::from([(1, 0), (2, 10_000)])),
+    ]);
+
+    assert_eq!(
+        rubric.totals(&requests),
+        Ok(BTreeMap::from([(10, 6_000), (11, 5_000), (12, 4_000)]))
+    );
 }
 
 // ─── Existing behaviour ──────────────────────────────────────────────────

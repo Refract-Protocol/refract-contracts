@@ -46,6 +46,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 mod contract;
+pub mod scoring;
 
 pub use contract::{
     BumpKey, OnchainGrant, OnchainMilestone, PayoutQuote, RefractGrants,

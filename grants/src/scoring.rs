@@ -7,7 +7,8 @@
 //! applications by total, highest first, and breaks ties by lower application
 //! id, so the same inputs always give the same order.
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 /// Basis points in a whole rubric.
 pub const FULL_WEIGHT: u32 = 10_000;
@@ -65,13 +66,49 @@ impl Rubric {
     /// Weighted total for one reviewer's scores on one application. Every
     /// criterion must be scored, and no other criterion may be.
     pub fn total(&self, scores: &BTreeMap<CriterionId, u32>) -> Result<u32, ScoringError> {
+        let weighted_criteria = self.weighted_criteria();
+        Self::total_with_criteria(scores, &weighted_criteria)
+    }
+
+    /// Score a batch of applications using one precomputed view of the rubric.
+    ///
+    /// The rubric does not change during a batch, so materialising its weighted
+    /// criteria once avoids rebuilding the same reviewer-total inputs for every
+    /// application. The per-application arithmetic is deliberately identical
+    /// to [`Self::total`].
+    pub fn totals(
+        &self,
+        requests: &BTreeMap<ApplicationId, BTreeMap<CriterionId, u32>>,
+    ) -> Result<BTreeMap<ApplicationId, u32>, ScoringError> {
+        let weighted_criteria = self.weighted_criteria();
+        let mut totals = BTreeMap::new();
+        for (application_id, scores) in requests {
+            totals.insert(*application_id, Self::total_with_criteria(scores, &weighted_criteria)?);
+        }
+        Ok(totals)
+    }
+
+    fn weighted_criteria(&self) -> Vec<(CriterionId, u32)> {
+        self.weights
+            .iter()
+            .map(|(criterion, weight)| (*criterion, *weight))
+            .collect()
+    }
+
+    fn total_with_criteria(
+        scores: &BTreeMap<CriterionId, u32>,
+        weighted_criteria: &[(CriterionId, u32)],
+    ) -> Result<u32, ScoringError> {
         for criterion in scores.keys() {
-            if !self.weights.contains_key(criterion) {
+            if !weighted_criteria
+                .iter()
+                .any(|(known_criterion, _)| known_criterion == criterion)
+            {
                 return Err(ScoringError::UnknownCriterion);
             }
         }
         let mut weighted: u64 = 0;
-        for (criterion, weight) in &self.weights {
+        for (criterion, weight) in weighted_criteria {
             let score = *scores.get(criterion).ok_or(ScoringError::MissingCriterion)?;
             if score > MAX_SCORE {
                 return Err(ScoringError::ScoreOutOfRange);

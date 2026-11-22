@@ -55,6 +55,15 @@ impl Reserve {
         self.balance
     }
 
+    /// Whether the reserve can cover one positive payment.
+    ///
+    /// This is a direct read of the maintained reserve balance. Callers must
+    /// not derive availability by replaying historical payments: `route_inflow`
+    /// and `withdraw` update the balance with every reserve transition.
+    pub fn can_cover(&self, amount: i128) -> bool {
+        amount > 0 && amount <= self.balance
+    }
+
     /// What the reserve should hold, given the protocol's obligations.
     pub fn target(&self, obligations: i128) -> i128 {
         if obligations <= 0 {
@@ -87,7 +96,7 @@ impl Reserve {
         if amount <= 0 {
             return Err(ReserveError::InvalidAmount);
         }
-        if amount > self.balance {
+        if !self.can_cover(amount) {
             return Err(ReserveError::InsufficientReserve);
         }
         self.balance = saturating_sub(self.balance, amount);
@@ -153,6 +162,19 @@ mod tests {
         assert_eq!(reserve.withdraw(GOVERNANCE, 101), Err(ReserveError::InsufficientReserve));
         reserve.withdraw(GOVERNANCE, 100).unwrap();
         assert_eq!(reserve.balance(), 0);
+    }
+
+    #[test]
+    fn direct_balance_check_is_independent_of_payment_order() {
+        let mut reserve = Reserve::new(GOVERNANCE, 1_000).unwrap();
+        reserve.route_inflow(40, 1_000).unwrap();
+        reserve.route_inflow(30, 1_000).unwrap();
+        reserve.route_inflow(30, 1_000).unwrap();
+
+        assert!(reserve.can_cover(100));
+        assert!(reserve.can_cover(60));
+        assert!(!reserve.can_cover(101));
+        assert!(!reserve.can_cover(0));
     }
 
     #[test]

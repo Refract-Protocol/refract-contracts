@@ -66,6 +66,12 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
 
+pub mod evidence;
+use evidence::{validate_entry, EvidenceEntry, ReportManifest, VerificationStatus, MAX_EVIDENCE_ENTRIES};
+
+#[cfg(test)]
+mod evidence_test;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Default lifetime of a payout-address binding (30 days in ledger seconds).
@@ -129,6 +135,8 @@ pub enum DataKey {
     UsedCommitment(BytesN<32>),
     /// Tracks whether a payout address is frozen as compromised.
     FrozenAddress(Address),
+    /// Immutable evidence manifest keyed by its disclosure report hash.
+    EvidenceManifest(BytesN<32>),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -254,6 +262,10 @@ pub enum BountyError {
     AddressFrozen = 18,
     /// Commitment does not match the commitment recorded at disclosure time.
     CommitmentMismatch = 19,
+    /// An evidence entry is malformed or exceeds its manifest bounds.
+    InvalidEvidence = 20,
+    /// No evidence manifest or entry exists for the supplied identifier.
+    EvidenceNotFound = 21,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -877,6 +889,88 @@ impl RefractBountyEscrow {
         Ok(())
     }
 
+    // ─── Evidence manifests ───────────────────────────────────────────────
+
+    /// Append immutable evidence metadata to a report.
+    ///
+    /// `content_hash` is the cache: payloads remain off-chain and are never
+    /// replaced in this contract, so verification reads the submitted digest
+    /// rather than hashing the same payload again.
+    pub fn append_evidence(
+        env: Env,
+        reporter: Address,
+        report_hash: BytesN<32>,
+        entry: EvidenceEntry,
+    ) -> Result<(), BountyError> {
+        reporter.require_auth();
+        let _ = Self::governance_addr(&env)?;
+        validate_entry(&entry)?;
+        if env.storage().persistent().has(&DataKey::Award(report_hash.clone())) {
+            return Err(BountyError::DuplicateReport);
+        }
+
+        let key = DataKey::EvidenceManifest(report_hash.clone());
+        let mut manifest: ReportManifest = match env.storage().persistent().get(&key) {
+            Some(existing) => {
+                if existing.reporter != reporter {
+                    return Err(BountyError::Unauthorized);
+                }
+                existing
+            }
+            None => ReportManifest {
+                reporter: reporter.clone(),
+                entries: soroban_sdk::Vec::new(&env),
+            },
+        };
+        if manifest.entries.len() >= MAX_EVIDENCE_ENTRIES {
+            return Err(BountyError::InvalidEvidence);
+        }
+        manifest.entries.push_back(entry);
+        env.storage().persistent().set(&key, &manifest);
+        Self::bump_persistent(&env, &key);
+        env.events()
+            .publish((symbol_short!("e_append"), report_hash), manifest.entries.len());
+        Ok(())
+    }
+
+    /// Record governance's decision for an evidence entry.
+    ///
+    /// There is no payload replacement operation. The content hash committed
+    /// by `append_evidence` therefore remains valid for the entry's lifetime.
+    pub fn verify_evidence(
+        env: Env,
+        caller: Address,
+        report_hash: BytesN<32>,
+        index: u32,
+        status: VerificationStatus,
+        reason_hash: Option<BytesN<32>>,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        if status == VerificationStatus::Unverified {
+            return Err(BountyError::InvalidEvidence);
+        }
+
+        let key = DataKey::EvidenceManifest(report_hash.clone());
+        let mut manifest: ReportManifest = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(BountyError::EvidenceNotFound)?;
+        let mut entry = manifest.entries.get(index).ok_or(BountyError::EvidenceNotFound)?;
+        entry.status = status;
+        entry.reason_hash = reason_hash;
+        manifest.entries.set(index, entry);
+        env.storage().persistent().set(&key, &manifest);
+        Self::bump_persistent(&env, &key);
+        env.events()
+            .publish((symbol_short!("e_verify"), report_hash), (index, status));
+        Ok(())
+    }
+
     // ─── Read-only views ──────────────────────────────────────────────────
 
     /// Total funds held in escrow (includes pending payout reserves).
@@ -892,6 +986,13 @@ impl RefractBountyEscrow {
     /// The governance/timelock address authorized to award payouts.
     pub fn governance(env: Env) -> Result<Address, BountyError> {
         Self::governance_addr(&env)
+    }
+
+    /// Return the evidence metadata committed for a report, if present.
+    pub fn get_manifest(env: Env, report_hash: BytesN<32>) -> Option<ReportManifest> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EvidenceManifest(report_hash))
     }
 
     /// Immutable record of a rewarded disclosure, if any.

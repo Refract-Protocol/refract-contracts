@@ -55,6 +55,9 @@ fn reporter_appends_and_reads_manifest() {
     let manifest = s.client.get_manifest(&hash).unwrap();
     assert_eq!(manifest.reporter, reporter);
     assert_eq!(manifest.entries.len(), 1);
+    // The payload stays off-chain: the submitted content hash is the cached
+    // immutable commitment used during review, not a value recomputed later.
+    assert_eq!(manifest.entries.get(0).unwrap().content_hash, entry(&s.env).content_hash);
 }
 
 #[test]
