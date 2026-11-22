@@ -109,6 +109,7 @@ def main() -> None:
         raise SystemExit("fixture exceeds 400KB; narrow the contract list")
     with open(args.output, "w", encoding="utf-8") as handle:
         handle.write(text)
+    print(f"ledger_sequence={snapshot['ledger_sequence']} output={args.output}")
 
 
 if __name__ == "__main__":
