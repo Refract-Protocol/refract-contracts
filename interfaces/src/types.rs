@@ -13,8 +13,14 @@ use crate::errors::RefractError;
 
 // ── Numeric conventions ──────────────────────────────────────────────────────
 
-/// A token amount in 1e7 fixed point (the USDC / Stellar asset convention):
-/// `10_000_000` is one whole token.
+/// A token amount, stored as an `i128` count of base units (stroops) with
+/// 1e7 base units per whole token (the USDC / Stellar asset convention):
+/// `10_000_000` is one whole token, never `1`.
+///
+/// Arithmetic on an `Amount` must use checked operations (`checked_add`,
+/// `checked_mul`, ...) or the helpers in this crate, because contracts compile
+/// with overflow checks and a plain operator panics on overflow. See
+/// `docs/checked-arithmetic-bounds.md` for the bounds and rationale.
 pub type Amount = i128;
 
 /// Scale of an [`Amount`]: one whole token.
