@@ -37,7 +37,7 @@ All amounts use **1e7 fixed-point** (the Stellar USDC convention). The contracts
 ## Build & test
 
 ```bash
-cargo test                                          # run the unit-test suite
+cargo test --all                                    # run the unit-test suite (matches CI)
 cargo fmt --all --check                             # formatting
 cargo clippy --all-targets -- -D warnings           # lints
 cargo build --target wasm32-unknown-unknown --release   # optimized wasm
@@ -45,11 +45,13 @@ cargo build --target wasm32-unknown-unknown --release   # optimized wasm
 
 The release `.wasm` artifacts land in `target/wasm32-unknown-unknown/release/`.
 
+If you add or change a dependency, also run the supply-chain and license check configured in [`deny.toml`](./deny.toml) (`cargo deny check`).
+
 ### Coverage
 
 CI's `coverage` job measures line and branch coverage per crate with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov). It fails if any crate drops below its floor in [`coverage-floor.toml`](./coverage-floor.toml). The job summary shows the per-crate table, the delta against the base branch (on PRs), a per-file breakdown, and a list of uncovered `pub fn` entrypoints and error paths. The HTML report is uploaded as the `coverage-<sha>` artefact and kept for 14 days.
 
-- **Host-run tests only.** The numbers come from `cargo test` on the host. The wasm32 build isn't instrumented.
+- **Host-run tests only.** The numbers come from `cargo test --all` on the host. The wasm32 build isn't instrumented.
 - **Test modules are excluded** from the denominator: `*/src/test.rs` and `pool/src/pricing_proptest.rs`.
 - **Branch coverage needs nightly**, so the job pins a nightly toolchain. The release profile isn't used.
 - **Floors can only go down on purpose.** A PR that lowers a value in `coverage-floor.toml` fails unless it has the `coverage-floor-lowered` label. Please raise a floor whenever coverage goes up.
