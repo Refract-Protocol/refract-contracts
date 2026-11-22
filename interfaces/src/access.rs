@@ -109,6 +109,11 @@ pub fn pending_admin(env: &Env) -> Option<Address> {
 /// Whether `account` holds `role`. The admin holds [`Role::Admin`] and no
 /// explicit grants; use [`require_role`] for checks, which also lets the
 /// admin through.
+///
+/// `role` is the closed [`Role`] enum, so an unrecognised role identifier
+/// cannot be constructed in Rust and is rejected by the host when decoding
+/// an argument from outside the contract; there is no unknown-role case to
+/// map to an error here. A missing grant is `false`.
 pub fn has_role(env: &Env, role: Role, account: &Address) -> bool {
     extend_instance_ttl(env);
     if role == Role::Admin {

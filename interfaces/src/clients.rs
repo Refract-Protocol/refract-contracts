@@ -193,7 +193,9 @@ pub trait TreasuryInterface {
         amount: Amount,
         to: Address,
     ) -> Result<(), RefractError>;
-    /// The treasury's balance of `token`.
+    /// The treasury's balance of `token`. A token the treasury holds none of
+    /// (including one it has never received) reads as zero; it is neither an
+    /// error nor a panic.
     fn balance(env: Env, token: Address) -> Amount;
 }
 
