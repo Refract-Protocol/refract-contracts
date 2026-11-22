@@ -291,6 +291,7 @@ def cmd_inspect(args):
     batch = load(args.batch)
     print(json.dumps({k: batch[k] for k in ("asset", "root", "total_amount", "depth")}, indent=2))
     print(f"leaves: {len(batch['leaves'])}")
+    print(f"summary leaves={len(batch['leaves'])} root={batch['root']}")
     return 0
 
 
