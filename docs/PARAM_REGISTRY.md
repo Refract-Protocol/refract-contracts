@@ -3,7 +3,7 @@
 **Issue:** #122  
 **Category:** Governance & Treasury  
 **Complexity:** High (200 points)  
-**Status:** Documentation — implementation deferred
+**Status:** Documentation. The `params/` crate now exists (see Section 2.4); the `sync_params` pattern is still not implemented.
 
 ---
 
@@ -78,6 +78,22 @@ pub enum DataKey {
 ```
 
 Persistent storage is appropriate for `Param` entries — these are protocol-level configuration values that must survive ledger TTL expiry and should never silently revert to defaults.
+
+### 2.4 Implemented behaviour and bounds (`params/src/lib.rs`)
+
+The crate on this branch differs from the sketch above: it is initialized with
+`initialize(timelock)` (there is no `admin` or `set_admin`), seeds well-known
+keys, and adds `set_timelock`, `get_or_default` and `timelock()`.
+
+**There is no bounds check.** `set(caller, key, value)` verifies only that
+`caller` authorizes and equals the stored timelock (`ParamsError::Unauthorized`
+otherwise, `NotInitialized` before `initialize`), then stores `value` for any
+`key`, unconditionally. No parameter is range-checked: values may be negative,
+zero or arbitrarily large, and unknown keys are accepted. `ParamsError` has only
+`AlreadyInitialized`, `NotInitialized` and `Unauthorized`; there is no
+out-of-range variant. Each consuming contract is responsible for validating the
+value it reads. Governance proposals must therefore choose values within safe
+ranges themselves. This is the same on `origin/main`.
 
 ---
 
