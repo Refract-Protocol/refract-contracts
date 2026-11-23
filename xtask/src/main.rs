@@ -178,12 +178,30 @@ fn main() {
 
 fn run_operator(args: &[String]) {
     let (cmd, custom_dir, json_output) =
-        operator::parse_operator_args(args).unwrap_or_else(|e| fatal(&e.to_string()));
+        operator::parse_operator_args(args).unwrap_or_else(|e| {
+            eprintln!(
+                "operator {}: argument error: {}",
+                args.first().map(String::as_str).unwrap_or(""),
+                e
+            );
+            fatal(&e.to_string())
+        });
     let deployments_dir = custom_dir.unwrap_or_else(|| repo_root().join("deployments"));
-    let plan = operator::build_plan(&cmd, &deployments_dir)
-        .unwrap_or_else(|e| fatal(&e.to_string()));
-    let output =
-        operator::execute_plan(&plan, json_output).unwrap_or_else(|e| fatal(&e.to_string()));
+    let plan = operator::build_plan(&cmd, &deployments_dir).unwrap_or_else(|e| {
+        eprintln!(
+            "operator {}: plan error: {}",
+            args.first().map(String::as_str).unwrap_or(""),
+            e
+        );
+        fatal(&e.to_string())
+    });
+    let output = operator::execute_plan(&plan, json_output).unwrap_or_else(|e| {
+        eprintln!(
+            "operator {} {}: execution error: {}",
+            plan.domain, plan.action, e
+        );
+        fatal(&e.to_string())
+    });
     print!("{output}");
 }
 

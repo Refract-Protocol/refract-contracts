@@ -1453,18 +1453,31 @@ pub fn execute_plan(plan: &OperatorPlan, json_output: bool) -> Result<String, Op
             .args(step.to_stellar_args())
             .output()
             .map_err(|e| {
-                OperatorError::ExecutionFailed(format!(
-                    "failed to invoke `{stellar_bin}` (pass `--dry-run` to preview commands): {e}"
-                ))
+                let msg = format!(
+                    "{} {}: failed to invoke `{stellar_bin}` (pass `--dry-run` to preview commands): {e}",
+                    plan.domain, plan.action
+                );
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(msg.as_bytes());
+                OperatorError::ExecutionFailed(msg)
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         if !output.status.success() {
-            return Err(OperatorError::ExecutionFailed(format!(
-                "`{}` failed: {stderr}",
-                step.function
-            )));
+            let msg = format!(
+                "{} {}: `{}` failed: {stderr}",
+                plan.domain, plan.action, step.function
+            );
+            use std::io::Write;
+            let _ = std::io::stderr().write_all((msg.clone() + "\n").as_bytes());
+            return Err(OperatorError::ExecutionFailed(msg));
         }
+        // Print per-step confirmation to stdout so screen readers and log scrapers
+        // can track progress without parsing the final summary.
+        println!(
+            "{} {}: {} completed (contract: {})",
+            plan.domain, plan.action, step.function, step.contract_id
+        );
         results.push(json!({
             "step": step.description,
             "function": step.function,
@@ -1480,10 +1493,11 @@ pub fn execute_plan(plan: &OperatorPlan, json_output: bool) -> Result<String, Op
         .unwrap_or_default())
     } else {
         let mut out = format!(
-            "Executed {} {} on {}:\n",
+            "{} {} on {} completed successfully ({} step(s)):\n",
             plan.domain,
             plan.action,
-            plan.network.as_str()
+            plan.network.as_str(),
+            results.len(),
         );
         for item in &results {
             out.push_str(&format!(
@@ -1771,6 +1785,62 @@ mod tests {
                 network: "testnet".to_owned(),
                 contract: "refract_bounty".to_owned(),
             })
+        );
+    }
+
+    // ── Issue #594: execute_plan prints named confirmation/error ──────────────
+
+    /// Builds a minimal dry-run plan and verifies the output names the
+    /// subcommand and target on success (stdout path).
+    #[test]
+    fn dry_run_success_output_names_subcommand_and_target() {
+        let dir = repo_deployments_dir();
+        let (cmd, _, _) = parse_operator_args(&vec_s(&[
+            "backstop",
+            "status",
+            "--network",
+            "local",
+            "--dry-run",
+        ]))
+        .unwrap();
+        let plan = build_plan(&cmd, &dir).unwrap();
+        let out = execute_plan(&plan, false).unwrap();
+        // Dry-run output must name the subcommand domain and action.
+        assert!(
+            out.contains("backstop") && out.contains("status"),
+            "dry-run output did not name the subcommand: {out}"
+        );
+        // Network name must appear so operators can confirm the target.
+        assert!(
+            out.contains("local"),
+            "dry-run output did not name the target network: {out}"
+        );
+    }
+
+    /// Verifies that execute_plan returns an Err whose message names the
+    /// subcommand when the stellar binary is unavailable (simulates a failure).
+    #[test]
+    fn execute_plan_failure_names_subcommand_in_error() {
+        let dir = repo_deployments_dir();
+        let (cmd, _, _) = parse_operator_args(&vec_s(&[
+            "backstop",
+            "status",
+            "--network",
+            "local",
+        ]))
+        .unwrap();
+        let plan = build_plan(&cmd, &dir).unwrap();
+
+        // Point STELLAR_BIN at a nonexistent binary so execute_plan returns an error.
+        std::env::set_var("STELLAR_BIN", "/nonexistent-stellar-bin-for-test");
+        let err = execute_plan(&plan, false).unwrap_err();
+        std::env::remove_var("STELLAR_BIN");
+
+        let msg = err.to_string();
+        // The error message must identify both the domain and action.
+        assert!(
+            msg.contains("backstop") && msg.contains("status"),
+            "failure message did not name the subcommand: {msg}"
         );
     }
 }
