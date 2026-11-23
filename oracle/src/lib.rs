@@ -776,13 +776,7 @@ impl RefractOracle {
             .persistent()
             .get(&DataKey::Reading(feed_id))
             .ok_or(OracleError::FeedNotFound)?;
-
-        let ledger_time = env.ledger().timestamp();
-        let age = ledger_time.saturating_sub(reading.timestamp);
-        if age > MAX_STALENESS_SECS {
-            return Err(OracleError::StaleReading);
-        }
-
+        Self::check_fresh(&env, &reading)?;
         Ok(reading)
     }
 
@@ -906,6 +900,17 @@ impl RefractOracle {
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────
+
+    /// Check that an already-read `OracleReading` is not stale.
+    /// Returns `Err(OracleError::StaleReading)` if the reading's timestamp is
+    /// older than [`MAX_STALENESS_SECS`] relative to the current ledger time.
+    fn check_fresh(env: &Env, reading: &OracleReading) -> Result<(), OracleError> {
+        let age = env.ledger().timestamp().saturating_sub(reading.timestamp);
+        if age > MAX_STALENESS_SECS {
+            return Err(OracleError::StaleReading);
+        }
+        Ok(())
+    }
 
     fn require_admin(env: &Env) -> Result<(), OracleError> {
         let admin: Address = env

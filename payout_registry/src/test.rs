@@ -591,3 +591,38 @@ fn test_reference_lookup_not_found() {
     let find_res = f.registry.find_payout(&unknown_ref);
     assert_eq!(find_res, None);
 }
+
+// ─── Sequential Id Counter ───────────────────────────────────────────────────
+
+#[test]
+fn test_sequential_ids_after_several_registrations() {
+    let f = setup();
+    let recipient = Address::generate(&f.env);
+
+    assert_eq!(f.registry.get_next_id(), 0);
+
+    for i in 1u8..=5 {
+        let ref_id = make_reference_id(&f.env, i + 100);
+        f.registry.record_payout(
+            &f.bounty_writer,
+            &recipient,
+            &Symbol::new(&f.env, "bounty"),
+            &(i as i128 * 1_000),
+            &f.usdc,
+            &ref_id,
+        );
+        assert_eq!(f.registry.get_next_id(), i as u64);
+    }
+
+    // Idempotent replay must not advance the counter
+    let dup_ref = make_reference_id(&f.env, 101);
+    f.registry.record_payout(
+        &f.bounty_writer,
+        &recipient,
+        &Symbol::new(&f.env, "bounty"),
+        &1_000i128,
+        &f.usdc,
+        &dup_ref,
+    );
+    assert_eq!(f.registry.get_next_id(), 5);
+}

@@ -887,3 +887,27 @@ fn first_submission_from_a_relayer_is_always_accepted() {
     );
     assert!(res.is_ok());
 }
+
+#[test]
+fn stale_reading_is_rejected_on_get_reading() {
+    let f = setup();
+    let feed = Symbol::new(&f.env, "USDC_PRICE");
+    let submit_ts = f.env.ledger().timestamp();
+
+    // Submit a fresh reading at submit_ts
+    f.oracle.submit(
+        &f.relayer,
+        &feed,
+        &9_990_000,
+        &submit_ts,
+        &Symbol::new(&f.env, "test_source"),
+    );
+
+    // Advance ledger beyond MAX_STALENESS_SECS (1800s) so the reading becomes stale
+    f.env
+        .ledger()
+        .with_mut(|li| li.timestamp = submit_ts + MAX_STALENESS_SECS + 1);
+
+    let res = f.oracle.try_get_reading(&feed);
+    assert_eq!(res, Err(Ok(OracleError::StaleReading)));
+}

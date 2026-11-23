@@ -124,6 +124,8 @@ pub enum DataKey {
     RecipientAssetTotal(Address, Address),
     /// Global cumulative count of all indexed payouts (instance storage).
     TotalPayouts,
+    /// Global monotonic counter for the next payout index (instance storage).
+    NextId,
 }
 
 /// Refract Payout Registry smart contract.
@@ -143,6 +145,7 @@ impl RefractPayoutRegistry {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::TotalPayouts, &0u64);
+        env.storage().instance().set(&DataKey::NextId, &0u64);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -458,6 +461,14 @@ impl RefractPayoutRegistry {
             .unwrap_or(0)
     }
 
+    /// Returns the next global payout id that will be assigned.
+    pub fn get_next_id(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(0)
+    }
+
     // ─── Internal Helpers ─────────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
@@ -565,6 +576,16 @@ impl RefractPayoutRegistry {
         env.storage()
             .instance()
             .set(&DataKey::TotalPayouts, &(total_payouts + 1));
+
+        // Increment global next-id counter
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextId, &(next_id + 1));
 
         // Extend TTLs
         Self::extend_record_ttl(env, &recipient, count, &reference_id, &asset);
