@@ -371,7 +371,7 @@ fn test_zero_and_negative_amount_payouts_rejected() {
         &f.usdc,
         &ref1,
     );
-    assert_eq!(zero_res, Err(Ok(PayoutRegistryError::InvalidAmount)));
+    assert_eq!(zero_res, Err(Ok(PayoutRegistryError::ZeroAmount)));
 
     let neg_res = f.registry.try_record_payout(
         &f.bounty_writer,
@@ -381,7 +381,90 @@ fn test_zero_and_negative_amount_payouts_rejected() {
         &f.usdc,
         &ref2,
     );
-    assert_eq!(neg_res, Err(Ok(PayoutRegistryError::InvalidAmount)));
+    assert_eq!(neg_res, Err(Ok(PayoutRegistryError::NegativeAmount)));
+}
+
+// ─── Readable Rejection Variants (issue #593) ────────────────────────────────
+
+#[test]
+fn test_zero_amount_returns_zero_amount_variant() {
+    let f = setup();
+    let recipient = Address::generate(&f.env);
+    let ref_id = make_reference_id(&f.env, 120);
+
+    let res = f.registry.try_record_payout(
+        &f.bounty_writer,
+        &recipient,
+        &Symbol::new(&f.env, "bounty"),
+        &0i128,
+        &f.usdc,
+        &ref_id,
+    );
+    assert_eq!(res, Err(Ok(PayoutRegistryError::ZeroAmount)));
+}
+
+#[test]
+fn test_negative_amount_returns_negative_amount_variant() {
+    let f = setup();
+    let recipient = Address::generate(&f.env);
+    let ref_id = make_reference_id(&f.env, 121);
+
+    let res = f.registry.try_record_payout(
+        &f.bounty_writer,
+        &recipient,
+        &Symbol::new(&f.env, "bounty"),
+        &-500i128,
+        &f.usdc,
+        &ref_id,
+    );
+    assert_eq!(res, Err(Ok(PayoutRegistryError::NegativeAmount)));
+}
+
+#[test]
+fn test_duplicate_reference_id_returns_duplicate_variant() {
+    let f = setup();
+    let recipient = Address::generate(&f.env);
+    let other_recipient = Address::generate(&f.env);
+    let ref_id = make_reference_id(&f.env, 122);
+
+    // First registration succeeds.
+    f.registry.record_payout(
+        &f.bounty_writer,
+        &recipient,
+        &Symbol::new(&f.env, "bounty"),
+        &1_000i128,
+        &f.usdc,
+        &ref_id,
+    );
+
+    // Same reference_id for a different recipient is a duplicate.
+    let res = f.registry.try_record_payout(
+        &f.bounty_writer,
+        &other_recipient,
+        &Symbol::new(&f.env, "bounty"),
+        &2_000i128,
+        &f.usdc,
+        &ref_id,
+    );
+    assert_eq!(res, Err(Ok(PayoutRegistryError::DuplicateReferenceId)));
+}
+
+#[test]
+fn test_empty_claimant_returns_empty_claimant_variant() {
+    let f = setup();
+    let ref_id = make_reference_id(&f.env, 123);
+
+    // Passing the registry contract address as the recipient triggers EmptyClaimant.
+    let registry_addr = f.registry.address.clone();
+    let res = f.registry.try_record_payout(
+        &f.bounty_writer,
+        &registry_addr,
+        &Symbol::new(&f.env, "bounty"),
+        &1_000i128,
+        &f.usdc,
+        &ref_id,
+    );
+    assert_eq!(res, Err(Ok(PayoutRegistryError::EmptyClaimant)));
 }
 
 // ─── Deregistered Writer Retaining Read Access ────────────────────────────────

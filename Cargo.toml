@@ -19,6 +19,7 @@ members = [
     "oracle",
     "incident_response",
     "params",
+    "shared",
     "snapshot_harness",
     "xtask",
 ]

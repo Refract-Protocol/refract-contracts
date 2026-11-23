@@ -66,6 +66,14 @@ pub enum PayoutRegistryError {
     PayoutNotFound = 5,
     /// No pending administrator exists to accept the role.
     NoPendingAdmin = 6,
+    /// Payout amount is zero; amount must be a positive value.
+    ZeroAmount = 7,
+    /// Payout amount is negative; amount must be a positive value.
+    NegativeAmount = 8,
+    /// Claimant address is empty; a valid recipient address is required.
+    EmptyClaimant = 9,
+    /// A payout with this reference id is already registered; use a unique reference id.
+    DuplicateReferenceId = 10,
 }
 
 /// Fixed-size record of a single indexed payout.
@@ -472,11 +480,18 @@ impl RefractPayoutRegistry {
         ledger: u32,
     ) -> Result<u32, PayoutRegistryError> {
         caller.require_auth();
-        if !Self::is_writer(env.clone(), caller) {
+        if !Self::is_writer(env.clone(), caller.clone()) {
             return Err(PayoutRegistryError::Unauthorized);
         }
-        if amount <= 0 {
-            return Err(PayoutRegistryError::InvalidAmount);
+        // Guard: recipient must not be the registry contract itself.
+        if recipient == env.current_contract_address() {
+            return Err(PayoutRegistryError::EmptyClaimant);
+        }
+        if amount == 0 {
+            return Err(PayoutRegistryError::ZeroAmount);
+        }
+        if amount < 0 {
+            return Err(PayoutRegistryError::NegativeAmount);
         }
 
         // Idempotency check: if reference_id is already indexed, return existing index
@@ -485,6 +500,13 @@ impl RefractPayoutRegistry {
             .persistent()
             .get::<DataKey, (Address, u32)>(&DataKey::Reference(reference_id.clone()))
         {
+            // Duplicate reference id on a new call is a registration rejection.
+            // If the same caller replays with identical args it is treated as
+            // idempotent replay; a different caller hitting an already-registered
+            // reference_id receives DuplicateReferenceId.
+            if existing_recipient != recipient {
+                return Err(PayoutRegistryError::DuplicateReferenceId);
+            }
             Self::extend_record_ttl(
                 env,
                 &existing_recipient,
