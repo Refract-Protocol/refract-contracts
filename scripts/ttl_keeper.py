@@ -8,11 +8,16 @@ import struct
 import subprocess
 import sys
 import tomllib
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 
 DEFAULT_CONFIG = Path(__file__).with_name("ttl_keeper.toml")
+
+
+class RPCUnreachableError(Exception):
+    """Raised when the RPC endpoint cannot be contacted."""
 
 
 def rpc_call(rpc_url, method, params):
@@ -24,8 +29,13 @@ def rpc_call(rpc_url, method, params):
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        result = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.load(response)
+    except (urllib.error.URLError, OSError) as exc:
+        raise RPCUnreachableError(
+            f"RPC endpoint unreachable: {rpc_url} ({exc})"
+        ) from exc
     if "error" in result:
         raise RuntimeError(f"{method}: {result['error']}")
     return result["result"]
@@ -98,11 +108,14 @@ def main(argv):
         keeper = config["keeper"]
         threshold = int(keeper["threshold"])
         extend_to = int(keeper["extend_to"])
+        rpc_url = keeper["rpc_url"]
         report = []
         failed = False
+        first_tick = True
         for contract in config.get("contracts", []):
             try:
-                result = query_contract_ttl(keeper["rpc_url"], contract)
+                result = query_contract_ttl(rpc_url, contract)
+                first_tick = False
                 needs_bump = (
                     result["configured"]
                     and result["remaining_ttl"] < threshold
@@ -116,7 +129,19 @@ def main(argv):
                         invoke_bump(keeper, contract, extend_to)
                         result["action"] = "bumped"
                 report.append(result)
+            except RPCUnreachableError as error:
+                if first_tick:
+                    print(str(error), file=sys.stderr)
+                    return 1
+                tick = len(report) + 1
+                print(
+                    f"tick {tick}: RPC unreachable ({rpc_url}): {error}",
+                    file=sys.stderr,
+                )
+                failed = True
+                report.append({"contract": contract.get("name", "unknown"), "error": str(error)})
             except Exception as error:
+                first_tick = False
                 failed = True
                 report.append({"contract": contract.get("name", "unknown"), "error": str(error)})
         print(
