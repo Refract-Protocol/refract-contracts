@@ -225,4 +225,23 @@ mod tests {
         allow(&env, &addr);
         assert!(is_allowed(&env, &addr));
     }
+
+    #[test]
+    fn present_address_resolves_correctly() {
+        let (env, addr) = setup();
+        allow(&env, &addr);
+        assert!(is_allowed(&env, &addr));
+        assert_eq!(require_allowed(&env, &addr), Ok(()));
+    }
+
+    #[test]
+    fn absent_address_resolves_correctly() {
+        let (env, addr) = setup();
+        // addr was never listed — must behave as NotAllowed
+        assert!(!is_allowed(&env, &addr));
+        assert_eq!(
+            require_allowed(&env, &addr),
+            Err(AllowlistError::NotAllowed)
+        );
+    }
 }

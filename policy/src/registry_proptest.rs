@@ -123,3 +123,24 @@ fn non_existent_policy_lookup_invariants() {
         })
         .unwrap();
 }
+
+#[test]
+fn direct_key_read_matches_scan_for_missing_id() {
+    TestRunner::default()
+        .run(&(1u32..10u32, 200_000u64..200_050u64), |(count, missing_id)| {
+            let env = Env::default();
+            let (registry, pool) = fresh(&env);
+            let holder = Address::generate(&env);
+            env.budget().reset_unlimited();
+            // Register some policies with ids in range [1000, 1000+count)
+            for i in 1..=count {
+                let pid = 1000 + (i as u64);
+                registry.register_policy(&pool, &reg(pid, &holder, CoverageType::StablecoinDepeg));
+            }
+            // missing_id is in range 200_000..200_050 — never registered
+            let result = registry.try_get_policy(&missing_id);
+            prop_assert_eq!(result, Err(Ok(RegistryError::PolicyNotFound)));
+            Ok(())
+        })
+        .unwrap();
+}
