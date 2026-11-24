@@ -145,6 +145,7 @@
 #![allow(clippy::disallowed_methods)]
 
 pub mod operator;
+pub mod legacy_migration;
 
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;

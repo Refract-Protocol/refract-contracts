@@ -850,7 +850,11 @@ def snapshot(rpc, contracts, assets=(), stakers=(), reports=(), network=""):
 
     # Phase 1: every instance entry (config lives there).
     names = sorted(contracts)
-    inst = reader.fetch([(contracts[n], INSTANCE_KEY, "persistent") for n in names])
+    try:
+        inst = reader.fetch([(contracts[n], INSTANCE_KEY, "persistent") for n in names])
+    except RpcError as exc:
+        contract_ids = ", ".join(f"{n}={contracts[n]}" for n in names)
+        raise RpcError(f"state read failed for contracts [{contract_ids}]: {exc}") from exc
     instances = {}
     for n in names:
         rec = inst[encode_ledger_key(contracts[n], INSTANCE_KEY, "persistent")]
@@ -872,13 +876,21 @@ def snapshot(rpc, contracts, assets=(), stakers=(), reports=(), network=""):
     # Phase 2: per-contract persistent keys and token balances, one batch.
     requests, owners = [], []
     for n in names:
-        for req in COLLECTORS[n].keys(contracts[n], storage_of(n), opts):
-            requests.append(req)
-            owners.append(("entry", n, None))
+        try:
+            for req in COLLECTORS[n].keys(contracts[n], storage_of(n), opts):
+                requests.append(req)
+                owners.append(("entry", n, None))
+        except (RpcError, SnapshotError) as exc:
+            raise RpcError(f"contract {contracts[n]!r} ({n}): {exc}") from exc
         for token in asset_list:
             requests.append(_sac_balance_key(token, contracts[n]))
             owners.append(("balance", n, token))
-    fetched = reader.fetch(requests) if requests else {}
+    try:
+        fetched = reader.fetch(requests) if requests else {}
+    except RpcError as exc:
+        # Surface which contracts were being read so the operator knows where to look.
+        contract_ids = ", ".join(f"{n}={contracts[n]}" for n in names)
+        raise RpcError(f"state read failed for contracts [{contract_ids}]: {exc}") from exc
 
     out = {
         "schema_version": SCHEMA_VERSION,

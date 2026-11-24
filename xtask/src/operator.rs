@@ -1496,6 +1496,24 @@ pub fn execute_plan(plan: &OperatorPlan, json_output: bool) -> Result<String, Op
     }
 }
 
+/// Submits a [`GovernanceProposal`] via `submitter` and propagates any failure
+/// as an [`OperatorError::ExecutionFailed`] so the caller exits non-zero with
+/// the message.
+///
+/// Issue #579: previously the submission result was discarded, leaving the
+/// operator believing the proposal was queued when it was not.
+pub fn submit_timelock_proposal<F>(
+    proposal: &crate::legacy_migration::timelock_proposal::GovernanceProposal,
+    submitter: F,
+) -> Result<(), OperatorError>
+where
+    F: FnOnce(&str) -> Result<(), String>,
+{
+    proposal
+        .submit(submitter)
+        .map_err(OperatorError::ExecutionFailed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1772,5 +1790,47 @@ mod tests {
                 contract: "refract_bounty".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn timelock_proposal_submission_error_propagates_to_caller() {
+        // Issue #579: a failing proposal submission must not be silently discarded;
+        // the error must reach the caller as OperatorError::ExecutionFailed so the
+        // process can exit non-zero with a useful message.
+        use crate::legacy_migration::timelock_proposal::{
+            GovernanceProposal, TimelockBatchProposal,
+        };
+        let proposal = GovernanceProposal {
+            title: "migration-test".into(),
+            description: "test".into(),
+            target_timelock: "CAAA".into(),
+            batch_proposal: TimelockBatchProposal {
+                proposal_type: "legacy_migration_batch".into(),
+                version: "1.0.0".into(),
+                generated_at: 0,
+                eta: 100,
+                operations: vec![],
+            },
+        };
+
+        // Successful submission returns Ok.
+        assert!(submit_timelock_proposal(&proposal, |_| Ok(())).is_ok());
+
+        // Failed submission must propagate as ExecutionFailed, not be swallowed.
+        let result = submit_timelock_proposal(&proposal, |_| Err("node unreachable".into()));
+        assert!(
+            matches!(result, Err(OperatorError::ExecutionFailed(_))),
+            "expected ExecutionFailed, got {result:?}"
+        );
+        if let Err(OperatorError::ExecutionFailed(msg)) = result {
+            assert!(
+                msg.contains("node unreachable"),
+                "underlying error missing from ExecutionFailed: {msg:?}"
+            );
+            assert!(
+                msg.contains("migration-test"),
+                "proposal title missing from ExecutionFailed: {msg:?}"
+            );
+        }
     }
 }
