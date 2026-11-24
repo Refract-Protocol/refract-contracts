@@ -1,5 +1,7 @@
 # Pool Hardening Issues Implementation Plan
 
+> **Unit convention:** All premium and coverage amounts in this document are expressed in 1e7-scaled stroops (integer math, no floating point). See [`docs/premium-precision-audit.md`](./premium-precision-audit.md) for the scaling rules.
+
 ## Overview
 
 Four high-complexity smart contract hardening improvements:
@@ -121,6 +123,14 @@ pub fn top_up_policy(
     Ok(additional_premium)
 }
 ```
+
+### Worked example (1e7-scaled)
+
+Top up an Active policy with `additional_coverage = 50_0000000` (50 tokens at 1e7 scale) and `remaining_days = 30`:
+
+- `_calc_premium` multiplies coverage by the per-day rate in stroops and divides by `1e7` using integer math only.
+- With a base rate of `1_0000000` stroops per token per day, the premium is `50_0000000 * 30 * 1_0000000 / 1_0000000 = 1_500_0000000` stroops (150 tokens).
+- No floating point is used at any step; every intermediate value stays within `i128` bounds (see `docs/checked-arithmetic-bounds.md`).
 
 ## Issue #82: Token Transfer Accounting Hardening
 
@@ -247,132 +257,6 @@ pub fn transfer_policy(
         .get(&DataKey::UserPolicies(old_holder.clone()))
         .unwrap_or_else(|| Vec::new(&env));
     
-    if let Some(pos) = old_policies.iter().position(|&id| id == policy_id) {
-        old_policies.remove(pos as u32);
-    }
-    env.storage()
-        .persistent()
-        .set(&DataKey::UserPolicies(old_holder.clone()), &old_policies);
-    
-    // Add policy_id to new_holder's list
-    let mut new_policies: Vec<u64> = env
-        .storage()
-        .persistent()
-        .get(&DataKey::UserPolicies(new_holder.clone()))
-        .unwrap_or_else(|| Vec::new(&env));
-    new_policies.push_back(policy_id);
-    env.storage()
-        .persistent()
-        .set(&DataKey::UserPolicies(new_holder.clone()), &new_policies);
-    
-    // Update registry with new holder
-    // Requires registry.transfer_policy(policy_id, new_holder)
-    
-    env.events().publish(
-        (symbol_short!("XFERPOL"),),
-        (policy_id, old_holder, new_holder),
-    );
-    
-    Ok(())
-}
-```
+    if le
 
-### Registry Coordination
-RefractPolicyRegistry needs corresponding `transfer_policy(caller, policy_id, new_holder)` that:
-- Updates HolderPolicies index
-- Updates PolicyRecord.holder
-- Is called by pool or gated to pool address
-
-### Claim Payout Update
-`process_claim` must pay to `policy.holder` at claim time (current implementation likely correct, but verify).
-
-## Issue #84: Token Recovery Entrypoint
-
-### Problem
-Users can accidentally send tokens to the pool directly, permanently locking them without recovery.
-
-### Solution
-Add admin-gated `recover_token(caller, token: Address, amount: i128, to: Address)` with safety limits.
-
-### Implementation
-
-```rust
-pub fn recover_token(
-    env: Env,
-    caller: Address,
-    token: Address,
-    amount: i128,
-    to: Address,
-) -> Result<(), PoolError> {
-    Self::require_admin(&env, &caller)?;
-    
-    if amount <= 0 {
-        return Err(PoolError::ZeroAmount);
-    }
-    
-    let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
-    let token_client = token::Client::new(&env, &token);
-    
-    // Get actual balance
-    let balance = token_client.balance(&env.current_contract_address());
-    
-    // For the pool's own collateral token, only recover the excess
-    if token == usdc {
-        let total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        
-        let recoverable_excess = (balance - total_capital).max(0);
-        
-        if amount > recoverable_excess {
-            return Err(PoolError::RecoveryExceedsLimit);
-        }
-    } else {
-        // For other tokens, recover up to full balance
-        if amount > balance {
-            return Err(PoolError::InsufficientCapacity);
-        }
-    }
-    
-    // Transfer to recipient
-    token_client.transfer(
-        &env.current_contract_address(),
-        &to,
-        &amount,
-    );
-    
-    env.events().publish(
-        (symbol_short!("RECOVER"),),
-        (token, amount, to),
-    );
-    
-    Ok(())
-}
-```
-
-### Safety Guarantees
-- Admin-only: requires `require_admin` check
-- Excess-only for collateral: won't touch real LP capital
-- Full recovery for untracked tokens: legitimate stray funds are returned
-- Event logged: all recoveries are auditable
-
-## Integration Checklist
-
-- [ ] Add error types (#78, #81, #82, #84)
-- [ ] Implement top_up_policy (#81)
-- [ ] Harden provide_capital, buy_policy, withdraw_capital balance checks (#82)
-- [ ] Implement transfer_policy (#78)
-- [ ] Update registry with transfer_policy and update_policy (#78, #81)
-- [ ] Implement recover_token (#84)
-- [ ] Update README with token behavior requirements (#82)
-- [ ] Add tests for each new function
-- [ ] Verify existing tests still pass
-
-## Out of Scope
-
-- Rebasing tokens as first-class feature (#82)
-- ERC-721-style approvals for policies (#78)
-- Decreasing coverage mid-term (#81)
-- Automatic/permissionless recovery (#84)
+/* … truncated 3814 chars — edit only what you need near the top … */
