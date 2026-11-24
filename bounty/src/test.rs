@@ -74,6 +74,7 @@ fn award_push_happy_path() {
     let researcher = Address::generate(&f.env);
 
     let hash = soroban_sdk::BytesN::from_array(&f.env, &[1u8; 32]);
+    client.allow_recipient(&f.governance, &researcher);
     client.award(&f.governance, &researcher, &500, &hash);
 
     assert_eq!(client.balance(), 10_000 - 500);
@@ -100,6 +101,7 @@ fn create_payout_reserves_funds() {
     let client = f.client();
     let recipient = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 3600;
     let payout_id = client.create_payout(&f.governance, &recipient, &1000, &deadline);
 
@@ -120,6 +122,7 @@ fn payout_claim_happy_path() {
     let client = f.client();
     let recipient = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 3600;
     let payout_id = client.create_payout(&f.governance, &recipient, &750, &deadline);
 
@@ -142,6 +145,7 @@ fn payout_non_recipient_rejected() {
     let recipient = Address::generate(&f.env);
     let attacker = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 3600;
     let payout_id = client.create_payout(&f.governance, &recipient, &100, &deadline);
 
@@ -155,6 +159,7 @@ fn payout_double_claim_rejected() {
     let client = f.client();
     let recipient = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 3600;
     let payout_id = client.create_payout(&f.governance, &recipient, &100, &deadline);
 
@@ -169,6 +174,7 @@ fn payout_sweep_before_deadline_rejected() {
     let client = f.client();
     let recipient = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 3600;
     let payout_id = client.create_payout(&f.governance, &recipient, &100, &deadline);
 
@@ -182,6 +188,7 @@ fn payout_sweep_after_deadline() {
     let client = f.client();
     let recipient = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 100;
     let payout_id = client.create_payout(&f.governance, &recipient, &200, &deadline);
 
@@ -206,6 +213,7 @@ fn payout_claim_after_sweep_rejected() {
     let client = f.client();
     let recipient = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 100;
     let payout_id = client.create_payout(&f.governance, &recipient, &100, &deadline);
 
@@ -223,6 +231,7 @@ fn payout_claim_allowed_after_deadline_before_sweep() {
     let client = f.client();
     let recipient = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 50;
     let payout_id = client.create_payout(&f.governance, &recipient, &300, &deadline);
 
@@ -238,6 +247,7 @@ fn payout_sweep_idempotent_guard() {
     let client = f.client();
     let recipient = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &recipient);
     let deadline = f.now() + 50;
     let payout_id = client.create_payout(&f.governance, &recipient, &100, &deadline);
 
@@ -268,6 +278,7 @@ fn available_balance_blocks_double_commit() {
     let r1 = Address::generate(&f.env);
     let r2 = Address::generate(&f.env);
 
+    client.allow_recipient(&f.governance, &r1);
     // Reserve all 10_000.
     let deadline = f.now() + 3600;
     client.create_payout(&f.governance, &r1, &10_000, &deadline);
@@ -348,6 +359,18 @@ fn test_award_authorized_governance_succeeds() {
     let (governance, client, contract_id, _, token_client, _) = setup_bounty(&env);
     let researcher = Address::generate(&env);
     let report_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+    // Allow the researcher before awarding (issue #244 — recipient allowlist).
+    env.mock_auths(&[MockAuth {
+        address: &governance,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "allow_recipient",
+            args: (&governance, &researcher).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.allow_recipient(&governance, &researcher);
 
     env.mock_auths(&[MockAuth {
         address: &governance,

@@ -357,10 +357,76 @@ fn measure(root: &PathBuf) -> Measurements {
 }
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // Start one level above CARGO_MANIFEST_DIR (which is xtask/) because the
+    // workspace root is the parent of the xtask crate, not xtask itself.
+    let xtask_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let start = xtask_dir
         .parent()
-        .expect("xtask lives inside the workspace")
-        .to_path_buf()
+        .map(|p| p.to_path_buf())
+        .unwrap_or(xtask_dir.clone());
+    find_workspace_root(start).unwrap_or_else(|e| fatal(&e))
+}
+
+/// Walk up from `start` until a directory containing `Cargo.toml` is found.
+/// Returns an error message naming the path that was searched if no root is
+/// found, so a contributor running `cargo xtask` from an unexpected location
+/// sees a clear message rather than a panic backtrace.
+pub fn find_workspace_root(start: PathBuf) -> Result<PathBuf, String> {
+    let mut dir = start.as_path();
+    loop {
+        if dir.join("Cargo.toml").exists() {
+            return Ok(dir.to_path_buf());
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => {
+                return Err(format!(
+                    "workspace root not found: no Cargo.toml found above '{}'",
+                    start.display()
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_workspace_root;
+    use std::path::PathBuf;
+
+    #[test]
+    fn find_workspace_root_errors_on_path_without_cargo_toml() {
+        // Use a temp directory guaranteed to have no Cargo.toml.
+        let tmp = std::env::temp_dir().join("xtask_test_no_manifest");
+        let _ = std::fs::create_dir_all(&tmp);
+        let result = find_workspace_root(tmp.clone());
+        assert!(
+            result.is_err(),
+            "expected Err for path without Cargo.toml, got Ok"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("workspace root not found"),
+            "error message should name the problem; got: {msg}"
+        );
+        assert!(
+            msg.contains(&tmp.display().to_string()),
+            "error message should include the searched path; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn find_workspace_root_succeeds_from_xtask_dir() {
+        // CARGO_MANIFEST_DIR points into the workspace, so the root is a parent.
+        let start = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let result = find_workspace_root(start);
+        assert!(result.is_ok(), "expected Ok from workspace dir, got: {:?}", result);
+        let root = result.unwrap();
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "returned root {root:?} has no Cargo.toml"
+        );
+    }
 }
 
 fn fatal(msg: &str) -> ! {
