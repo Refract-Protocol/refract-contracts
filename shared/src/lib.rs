@@ -10,3 +10,15 @@ pub mod guardians;
 pub mod loss_event;
 pub mod version;
 pub mod withdrawal_queue;
+
+pub use version::version;
+
+#[cfg(test)]
+mod tests {
+    use super::version;
+
+    #[test]
+    fn version_accessor_matches_constant() {
+        assert_eq!(version::version(), version::VERSION);
+    }
+}
