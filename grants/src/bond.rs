@@ -105,6 +105,24 @@ impl BondBook {
         self.bonds.get(&application).copied()
     }
 
+    /// Splits `amount` across `reviewers` shares, assigning the integer
+    /// remainder to the first reviewer so the shares sum to `amount` exactly.
+    ///
+    /// Conservation: `shares.iter().sum::<i128>() == amount` for any
+    /// `reviewers > 0`. Uses integer arithmetic only.
+    pub fn split_refund(amount: i128, reviewers: u32) -> Vec<i128> {
+        if reviewers == 0 {
+            return Vec::new();
+        }
+        let count = reviewers as i128;
+        let share = amount / count;
+        let remainder = amount % count;
+        let mut shares = vec![share; reviewers as usize];
+        // The remainder is always in `0..count`, so it fits in the first slot.
+        shares[0] += remainder;
+        shares
+    }
+
     fn settle(
         &mut self,
         caller: Applicant,
@@ -175,5 +193,26 @@ mod tests {
     #[test]
     fn the_bond_amount_must_be_positive() {
         assert_eq!(BondBook::new(GOVERNANCE, 0).err(), Some(BondError::InvalidAmount));
+    }
+
+    #[test]
+    fn a_split_refund_conserves_the_full_bond() {
+        // 100 stroops across 3 reviewers does not divide evenly.
+        let amount = 100;
+        let shares = BondBook::split_refund(amount, 3);
+        assert_eq!(shares.len(), 3);
+        assert_eq!(shares.iter().sum::<i128>(), amount);
+        // The remainder lands on the first reviewer.
+        assert_eq!(shares[0], 34);
+        assert_eq!(shares[1], 33);
+        assert_eq!(shares[2], 33);
+    }
+
+    #[test]
+    fn a_split_refund_conserves_a_stroop_remainder() {
+        // 1e7 stroops across 7 reviewers strands a remainder without the fix.
+        let amount = 10_000_000;
+        let shares = BondBook::split_refund(amount, 7);
+        assert_eq!(shares.iter().sum::<i128>(), amount);
     }
 }
