@@ -31,3 +31,61 @@ Existing deployments can migrate seamlessly via the one-shot idempotent admin en
 ```rust
 pub fn migrate_accounting(env: Env, caller: Address) -> Result<(), PoolError>;
 ```
+
+## Current Storage Key Layout
+
+The tables below reflect the keys actually written by `shared/src/lib.rs`, `payout_registry/src/lib.rs`, and `treasury/src/lib.rs`. Keys that were removed during consolidation are listed separately so readers do not budget for them.
+
+### Shared (`shared/src/lib.rs`)
+
+| Key | Storage Tier | Value Type | Notes |
+| :--- | :--- | :--- | :--- |
+| `DataKey::Accounting` | Instance | `PoolAccounting` | Consolidated counters (see above) |
+| `DataKey::Admin` | Instance | `Address` | Contract admin |
+| `DataKey::Token` | Instance | `Address` | Underlying token |
+| `DataKey::Paused` | Instance | `bool` | Emergency pause flag |
+| `DataKey::Policy(u64)` | Persistent | `Policy` | Per-policy record |
+| `DataKey::Claim(u64)` | Persistent | `Claim` | Per-claim record |
+
+### Payout Registry (`payout_registry/src/lib.rs`)
+
+| Key | Storage Tier | Value Type | Notes |
+| :--- | :--- | :--- | :--- |
+| `DataKey::Admin` | Instance | `Address` | Registry admin |
+| `DataKey::Payout(u64)` | Persistent | `Payout` | Per-payout record |
+| `DataKey::PayoutCount` | Instance | `u64` | Monotonic payout counter |
+
+### Treasury (`treasury/src/lib.rs`)
+
+| Key | Storage Tier | Value Type | Notes |
+| :--- | :--- | :--- | :--- |
+| `DataKey::Admin` | Instance | `Address` | Treasury admin |
+| `DataKey::Balance` | Instance | `i128` | Tracked treasury balance |
+| `DataKey::Grant(u64)` | Persistent | `Grant` | Per-grant record |
+
+### Removed Keys
+
+The following keys were removed when the counters were consolidated into `DataKey::Accounting` and must no longer be budgeted:
+
+- `DataKey::TotalCapital`
+- `DataKey::TotalCoverage`
+- `DataKey::TotalPremiums`
+- `DataKey::TotalShares`
+- `DataKey::NextPolicyId`
+
+## TTL Constants
+
+TTL values are defined in `shared/ttl.rs` and mirrored by the keeper configuration in `scripts/ttl_keeper.toml`. Instance entries are bumped on every state-altering call; persistent entries are extended by the keeper.
+
+| Entry Class | Threshold (ledgers) | Extend To (ledgers) | Source |
+| :--- | :--- | :--- | :--- |
+| Instance | `INSTANCE_THRESHOLD` | `INSTANCE_EXTEND_TO` | `shared/ttl.rs` |
+| Persistent | `PERSISTENT_THRESHOLD` | `PERSISTENT_EXTEND_TO` | `shared/ttl.rs` |
+
+When updating TTLs, change `shared/ttl.rs` first and then sync `scripts/ttl_keeper.toml` so the keeper and the contracts agree.
+
+## Last verified against
+
+- `shared/src/lib.rs`, `payout_registry/src/lib.rs`, `treasury/src/lib.rs` storage key definitions
+- `shared/ttl.rs` and `scripts/ttl_keeper.toml` TTL constants
+- Verified on branch `docs/storage-accounting-refresh` (issue #634)
