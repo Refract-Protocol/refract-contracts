@@ -5,7 +5,8 @@ This covers two controls in `RefractGrants` (`grants/`):
 * changing a funded grant: amendment, deadline extension, termination
   (issue #280, [`grants/src/lifecycle.rs`](../grants/src/lifecycle.rs));
 * reviewer conflict-of-interest (COI) declarations and recusal
-  (issue #281, [`grants/src/review.rs`](../grants/src/review.rs)).
+  (issue #281, [`grants/src/review.rs`](../grants/src/review.rs),
+  [`grants/src/reviewer_stake.rs`](../grants/src/reviewer_stake.rs)).
 
 The grants crate is the reference state model. "Governance" below means the
 address set at construction, which in production is the timelock, so every
@@ -111,26 +112,86 @@ GrantClosed      { grant_id: 0 }                // after the grantee claims
   overrides. A waived reviewer can be reassigned and review again; the
   invalidated review stays invalid.
 
+### Current COI and stake flow
+
+The flow below matches `grants/src/review.rs` and
+`grants/src/reviewer_stake.rs`. Reviewer eligibility is a single check
+(`is_eligible_reviewer`) shared by `submit_review`, reviewer approval of
+lifecycle requests, and the quorum count: registered, active, assigned, not
+the grantee, no unwaived conflict, and a stake that meets the current
+minimum.
+
+1. **Register** — governance calls `register_reviewer(reviewer, role)`.
+   The reviewer is recorded as active with no stake.
+2. **Stake** — the reviewer calls `stake_reviewer(amount)` to post the
+   minimum stake (`min_reviewer_stake`). Governance can raise or lower the
+   minimum with `set_min_reviewer_stake`; a reviewer below the minimum is
+   ineligible until they top up.
+3. **Assign** — governance calls `assign_reviewer(grant_id, reviewer)`.
+   Refused for inactive reviewers, the grantee, reviewers below the stake
+   minimum, and reviewers with an unwaived conflict on the grant.
+4. **Declare conflict (optional)** — the reviewer calls
+   `declare_conflict(grant_id, kind, evidence_hash)`. This unassigns them
+   from the grant. If they had already submitted a review, that review is
+   invalidated and the conflict is marked `late`.
+5. **Review** — an assigned, eligible reviewer calls
+   `submit_review(grant_id, score, approve)`. The eligibility check runs
+   first; a conflicted or under-staked reviewer is rejected.
+6. **Governance override** — governance can `flag_conflict` (record an
+   undisclosed conflict, same effect as a late declaration) or
+   `waive_conflict` (allow reassignment; the invalidated review stays
+   invalid). Both emit `ConflictOverride`.
+7. **Quorum** — when governance sets a review quorum
+   (`set_review_quorum`), `confirm_milestone` fails with
+   `ReviewQuorumNotMet` until enough eligible reviewers have approved, so a
+   conflicted or under-staked reviewer's approval can never release funds.
+8. **Slashing** — governance can `slash_reviewer(reviewer, amount, reason)`
+   when a reviewer is shown to have acted against the rules. The slashed
+   amount is moved out of the reviewer's stake through the treasury
+   interface; the reviewer stays registered but is ineligible until they
+   top the stake back up to the minimum.
+
+```text
+Governance        Reviewer                 Grants
+    |                 |                       |
+    |--register------>|                       |
+    |                 |--stake_reviewer------>|
+    |--assign_reviewer----------------------->|
+    |                 |                       |
+    |                 |--declare_conflict---->|  (unassign + invalidate)
+    |                 |                       |
+    |                 |--submit_review------->|  (eligibility check)
+    |                 |                       |
+    |--set_review_quorum--------------------->|
+    |                 |                       |--confirm_milestone
+    |                 |                       |  (ReviewQuorumNotMet
+    |                 |                       |   until quorum met)
+    |--slash_reviewer----------------------->|
+```
+
 ### Enforcement
 
 `submit_review`, reviewer approval of lifecycle requests, and the quorum count
 all go through one eligibility check: registered, active, assigned, not the
-grantee, no unwaived conflict. When governance sets a review quorum
-(`set_review_quorum`), `confirm_milestone` fails with `ReviewQuorumNotMet`
-until enough eligible reviewers have approved, so a conflicted reviewer's
-approval can never release funds.
+grantee, no unwaived conflict, and stake at or above the current minimum.
+When governance sets a review quorum (`set_review_quorum`),
+`confirm_milestone` fails with `ReviewQuorumNotMet` until enough eligible
+reviewers have approved, so a conflicted or under-staked reviewer's approval
+can never release funds.
 
 ### Views
 
-`reviewer`, `assigned_reviewers`, `review`, `conflicts_for_grant` (including
-waived conflicts, for audit), `has_conflict`, `approval_count`,
-`has_review_quorum`.
+`reviewer`, `reviewer_stake`, `min_reviewer_stake`, `assigned_reviewers`,
+`review`, `conflicts_for_grant` (including waived conflicts, for audit),
+`has_conflict`, `approval_count`, `has_review_quorum`.
 
 ### Events
 
 ```text
 ReviewerRegistered    { reviewer, role }
 ReviewerStatusChanged { reviewer, active }
+ReviewerStaked        { reviewer, amount, total_stake }
+ReviewerSlashed       { reviewer, amount, reason_hash }
 ReviewerAssigned      { grant_id, reviewer }
 ReviewSubmitted       { grant_id, reviewer, score, approve }
 ConflictDeclared      { grant_id, reviewer, kind, evidence_hash }
