@@ -14,7 +14,39 @@ pub const MAX_EVIDENCE_ENTRIES: u32 = 16;
 /// Maximum length, in bytes, of an evidence URI.
 pub const MAX_URI_LEN: u32 = 256;
 
-/// Reviewer decision on a single evidence entry.
+/// Optional 32-byte hash value, used where `Option<BytesN<32>>` is needed
+/// inside a `#[contracttype]` struct (the SDK 21 macro does not support
+/// `Option<BytesN<N>>`).
+#[contracttype]
+#[derive(Clone)]
+pub enum OptionalHash {
+    None,
+    Some(BytesN<32>),
+}
+
+impl OptionalHash {
+    pub fn is_none(&self) -> bool {
+        matches!(self, OptionalHash::None)
+    }
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+    pub fn into_option(self) -> Option<BytesN<32>> {
+        match self {
+            OptionalHash::None => None,
+            OptionalHash::Some(h) => Some(h),
+        }
+    }
+}
+
+impl From<Option<BytesN<32>>> for OptionalHash {
+    fn from(opt: Option<BytesN<32>>) -> Self {
+        match opt {
+            None => OptionalHash::None,
+            Some(h) => OptionalHash::Some(h),
+        }
+    }
+}
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerificationStatus {
@@ -42,7 +74,7 @@ pub struct EvidenceEntry {
     /// Reviewer decision. Reporters must submit `Unverified`.
     pub status: VerificationStatus,
     /// Hash of the reviewer's written reason for the decision.
-    pub reason_hash: Option<BytesN<32>>,
+    pub reason_hash: OptionalHash,
 }
 
 /// Evidence attached to one bounty report.

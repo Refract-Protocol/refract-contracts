@@ -8,7 +8,7 @@
 //! Not yet implemented: the timelock execution queue, spend caps and
 //! per-asset budgets, request expiry, and multi-approver quorum.
 
-use soroban_sdk::{contracterror, contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, BytesN};
 
 /// Lifecycle of a payment request.
 #[contracttype]
@@ -38,15 +38,3 @@ pub struct PaymentRequest {
     pub created_at: u64,
 }
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum TreasuryError {
-    InvalidAmount = 1,
-    RequestNotFound = 2,
-    InvalidState = 3,
-    SelfApproval = 4,
-    NotRequester = 5,
-    NotAdmin = 6,
-    ReentrancyDetected = 7,
-}

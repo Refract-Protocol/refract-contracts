@@ -66,6 +66,8 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
 
+pub mod evidence;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Default lifetime of a payout-address binding (30 days in ledger seconds).
@@ -129,6 +131,8 @@ pub enum DataKey {
     UsedCommitment(BytesN<32>),
     /// Tracks whether a payout address is frozen as compromised.
     FrozenAddress(Address),
+    /// Evidence manifest for a bounty report, keyed by report_hash.
+    Manifest(BytesN<32>),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -254,6 +258,9 @@ pub enum BountyError {
     AddressFrozen = 18,
     /// Commitment does not match the commitment recorded at disclosure time.
     CommitmentMismatch = 19,
+    /// An evidence entry is malformed, has a zero content hash, or violates
+    /// the submission rules (e.g. pre-set verification status).
+    InvalidEvidence = 20,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -896,3 +903,283 @@ impl RefractBountyEscrow {
 
     /// Immutable record of a rewarded disclosure, if any.
     pub fn get_award(
+        env: Env,
+        report_hash: BytesN<32>,
+    ) -> Option<AwardRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Award(report_hash))
+    }
+
+    /// Look up a pull-based payout record by id.
+    pub fn get_payout(env: Env, payout_id: u64) -> Option<PayoutRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Payout(payout_id))
+    }
+
+    /// Look up a commitment-award record by commitment hash.
+    pub fn get_commitment_award(
+        env: Env,
+        commitment: BytesN<32>,
+    ) -> Option<CommitmentAwardRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CommitmentAward(commitment))
+    }
+
+    /// Look up a payout-address binding by commitment hash.
+    pub fn get_payout_binding(
+        env: Env,
+        commitment: BytesN<32>,
+    ) -> Option<PayoutBindingRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayoutBinding(commitment))
+    }
+
+    /// Return the disclosure commitment recorded for `report_hash`, if any.
+    pub fn get_disclosure_commitment(env: Env, report_hash: BytesN<32>) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisclosureCommitment(report_hash))
+    }
+
+    /// Return whether `address` is frozen by governance.
+    pub fn is_payout_address_frozen(env: Env, address: Address) -> bool {
+        Self::is_address_frozen(&env, &address)
+    }
+
+    // ─── Recipient allowlist (issue #244) ─────────────────────────────────
+
+    /// Allow `recipient` to receive bounty payouts. Governance-only.
+    pub fn allow_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage().persistent().set(
+            &DataKey::RecipientStatus(recipient.clone()),
+            &ScreeningStatus::Allowed,
+        );
+        env.events()
+            .publish((symbol_short!("al_allow"),), recipient);
+        Ok(())
+    }
+
+    /// Block `recipient` from receiving bounty payouts. Governance-only.
+    pub fn block_recipient(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+        env.storage().persistent().set(
+            &DataKey::RecipientStatus(recipient.clone()),
+            &ScreeningStatus::Blocked,
+        );
+        env.events()
+            .publish((symbol_short!("al_block"),), recipient);
+        Ok(())
+    }
+
+    /// Return the screening status of `recipient`, if any.
+    pub fn recipient_status(env: Env, recipient: Address) -> Option<ScreeningStatus> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecipientStatus(recipient))
+    }
+
+    // ─── Evidence manifest (issue #582) ───────────────────────────────────
+
+    /// Append an evidence entry to the manifest for `report_hash`.
+    ///
+    /// Only the original reporter may append. The entry is validated and the
+    /// `content_hash` must be non-zero — a zero hash means no actual content
+    /// was hashed and is rejected as unverified. Appending is blocked once a
+    /// bounty award has been recorded for the same report.
+    pub fn append_evidence(
+        env: Env,
+        reporter: Address,
+        report_hash: BytesN<32>,
+        entry: evidence::EvidenceEntry,
+    ) -> Result<(), BountyError> {
+        reporter.require_auth();
+
+        // Reject entries that fail format or status preconditions.
+        evidence::validate_entry(&entry)?;
+
+        // Reject a zero content_hash — it means the hash was never computed.
+        // A mismatched or unverified hash must not be stored.
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if entry.content_hash == zero {
+            return Err(BountyError::InvalidEvidence);
+        }
+
+        // Block appending once the report has been awarded.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Award(report_hash.clone()))
+        {
+            return Err(BountyError::PayoutAlreadySettled);
+        }
+
+        let manifest_key = DataKey::Manifest(report_hash.clone());
+        let mut manifest: evidence::ReportManifest =
+            env.storage().persistent().get(&manifest_key).unwrap_or_else(|| {
+                evidence::ReportManifest {
+                    reporter: reporter.clone(),
+                    entries: soroban_sdk::Vec::new(&env),
+                }
+            });
+
+        // Only the original reporter may extend the manifest.
+        if manifest.reporter != reporter {
+            return Err(BountyError::Unauthorized);
+        }
+
+        if manifest.entries.len() >= evidence::MAX_EVIDENCE_ENTRIES {
+            return Err(BountyError::InvalidEvidence);
+        }
+
+        manifest.entries.push_back(entry);
+        env.storage().persistent().set(&manifest_key, &manifest);
+        Self::bump_persistent(&env, &manifest_key);
+
+        env.events()
+            .publish((symbol_short!("ev_add"), report_hash), reporter);
+        Ok(())
+    }
+
+    /// Update the verification status of a single evidence entry. Governance-only.
+    pub fn verify_evidence(
+        env: Env,
+        caller: Address,
+        report_hash: BytesN<32>,
+        index: u32,
+        status: evidence::VerificationStatus,
+        reason_hash: Option<BytesN<32>>,
+    ) -> Result<(), BountyError> {
+        caller.require_auth();
+        let governance = Self::governance_addr(&env)?;
+        if caller != governance {
+            return Err(BountyError::Unauthorized);
+        }
+
+        let manifest_key = DataKey::Manifest(report_hash.clone());
+        let mut manifest: evidence::ReportManifest = env
+            .storage()
+            .persistent()
+            .get(&manifest_key)
+            .ok_or(BountyError::InvalidEvidence)?;
+
+        let mut entry = manifest
+            .entries
+            .get(index)
+            .ok_or(BountyError::InvalidEvidence)?;
+
+        entry.status = status;
+        entry.reason_hash = reason_hash.into();
+        manifest.entries.set(index, entry);
+
+        env.storage().persistent().set(&manifest_key, &manifest);
+        Self::bump_persistent(&env, &manifest_key);
+
+        env.events()
+            .publish((symbol_short!("ev_ver"), report_hash), (index, status));
+        Ok(())
+    }
+
+    /// Return the evidence manifest for `report_hash`, if one exists.
+    pub fn get_manifest(
+        env: Env,
+        report_hash: BytesN<32>,
+    ) -> Option<evidence::ReportManifest> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Manifest(report_hash))
+    }
+
+    // ─── Private helpers ──────────────────────────────────────────────────
+
+    fn governance_addr(env: &Env) -> Result<Address, BountyError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(BountyError::NotInitialized)
+    }
+
+    fn token_addr(env: &Env) -> Result<Address, BountyError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(BountyError::NotInitialized)
+    }
+
+    fn raw_balance(env: &Env) -> Result<i128, BountyError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Balance)
+            .ok_or(BountyError::NotInitialized)
+    }
+
+    fn raw_reserved(env: &Env) -> Result<i128, BountyError> {
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::Reserved)
+            .unwrap_or(0i128))
+    }
+
+    fn available_balance_inner(env: &Env) -> Result<i128, BountyError> {
+        let balance = Self::raw_balance(env)?;
+        let reserved = Self::raw_reserved(env)?;
+        Ok(balance.saturating_sub(reserved))
+    }
+
+    fn is_recipient_allowed_inner(env: &Env, recipient: &Address) -> bool {
+        matches!(
+            env.storage()
+                .persistent()
+                .get::<DataKey, ScreeningStatus>(&DataKey::RecipientStatus(recipient.clone())),
+            Some(ScreeningStatus::Allowed)
+        )
+    }
+
+    fn is_address_frozen(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::FrozenAddress(address.clone()))
+            .unwrap_or(false)
+    }
+
+    fn hash_preimage(env: &Env, preimage: &BytesN<32>) -> BytesN<32> {
+        env.crypto().sha256(&preimage.clone().into()).into()
+    }
+
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND,
+        );
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod evidence_test;
+
+#[cfg(test)]
+mod test;

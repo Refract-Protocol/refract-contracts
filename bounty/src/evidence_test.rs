@@ -1,6 +1,6 @@
 use soroban_sdk::{testutils::Address as _, token, Address, BytesN, Env, String};
 
-use crate::evidence::{EvidenceEntry, VerificationStatus, MAX_EVIDENCE_ENTRIES};
+use crate::evidence::{EvidenceEntry, OptionalHash, VerificationStatus, MAX_EVIDENCE_ENTRIES};
 use crate::{RefractBountyEscrow, RefractBountyEscrowClient};
 
 struct Setup {
@@ -36,7 +36,7 @@ fn entry(env: &Env) -> EvidenceEntry {
         uri: None,
         encrypted: false,
         status: VerificationStatus::Unverified,
-        reason_hash: None,
+        reason_hash: OptionalHash::None,
     }
 }
 
@@ -103,7 +103,7 @@ fn governance_verifies_entry() {
 
     let stored = s.client.get_manifest(&hash).unwrap().entries.get(0).unwrap();
     assert_eq!(stored.status, VerificationStatus::Verified);
-    assert_eq!(stored.reason_hash, Some(reason));
+    assert_eq!(stored.reason_hash.into_option(), Some(reason));
 }
 
 #[test]
@@ -131,6 +131,33 @@ fn mismatched_entry_stays_unverified_without_reviewer() {
 }
 
 #[test]
+fn zero_content_hash_is_rejected_and_evidence_is_not_stored() {
+    // Simulates submitting an entry whose content_hash is all zeros,
+    // meaning the hash was never actually computed (a "mismatched" / empty
+    // hash). append_evidence must reject it and must not store the entry.
+    let s = setup();
+    let reporter = Address::generate(&s.env);
+    let hash = report(&s.env);
+
+    let mut bad_entry = entry(&s.env);
+    bad_entry.content_hash = BytesN::from_array(&s.env, &[0u8; 32]);
+
+    // Should return an error — not store the bad entry.
+    assert!(
+        s.client
+            .try_append_evidence(&reporter, &hash, &bad_entry)
+            .is_err(),
+        "entry with zero content_hash must be rejected"
+    );
+
+    // No manifest should have been created.
+    assert!(
+        s.client.get_manifest(&hash).is_none(),
+        "evidence with zero content_hash must not be stored"
+    );
+}
+
+#[test]
 fn append_after_award_is_rejected() {
     let s = setup();
     let reporter = Address::generate(&s.env);
@@ -142,6 +169,7 @@ fn append_after_award_is_rejected() {
     let funder = Address::generate(&s.env);
     token::StellarAssetClient::new(&s.env, &s.token).mint(&funder, &1_000);
     s.client.fund(&funder, &500);
+    s.client.allow_recipient(&s.governance, &researcher);
     s.client.award(&s.governance, &researcher, &100, &hash);
 
     assert!(s

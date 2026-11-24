@@ -58,7 +58,7 @@ use soroban_sdk::{
 
 pub mod payments;
 
-use payments::{PaymentRequest, PaymentStatus, TreasuryError};
+use payments::{PaymentRequest, PaymentStatus};
 
 pub mod challenge;
 
@@ -99,6 +99,13 @@ pub enum TreasuryError {
     RecallExceedsSeed = 12,
     /// The asset-feed mapping already exists.
     FeedAlreadyRegistered = 13,
+    // Payment-request variants (from payments module).
+    RequestNotFound = 14,
+    InvalidState = 15,
+    SelfApproval = 16,
+    NotRequester = 17,
+    NotAdmin = 18,
+    ReentrancyDetected = 19,
 }
 
 // ── Screening status ──────────────────────────────────────────────────────────
@@ -400,7 +407,7 @@ impl RefractTreasury {
         env.storage()
             .persistent()
             .remove(&DataKey::AssetFeed(token.clone()));
-        let mut assets: Vec<Address> = env
+        let assets: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::TrackedAssets)
@@ -830,19 +837,18 @@ impl RefractTreasury {
     // ─── Private helpers ──────────────────────────────────────────────────
 
     fn acquire_reentrancy_guard(env: &Env) -> Result<(), TreasuryError> {
-        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+        if env.storage().instance().has(&DataKey::ReentrancyLock) {
             return Err(TreasuryError::ReentrancyDetected);
         }
-        env.storage().temporary().set(&DataKey::ReentrancyLock, &true);
+        env.storage().instance().set(&DataKey::ReentrancyLock, &true);
         Ok(())
     }
 
     fn release_reentrancy_guard(env: &Env) {
-        env.storage().temporary().remove(&DataKey::ReentrancyLock);
+        env.storage().instance().remove(&DataKey::ReentrancyLock);
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), TreasuryError> {
-        caller.require_auth();
         let admin: Address = env
             .storage()
             .instance()
@@ -900,7 +906,7 @@ mod test {
     use super::*;
     use soroban_sdk::{
         testutils::Address as _,
-        Address, Env, Symbol,
+        Address, Env,
     };
 
     fn make_env() -> (Env, Address, Address) {
@@ -915,4 +921,11 @@ mod test {
     fn double_initialize_rejected() {
         let (env, admin, trs_id) = make_env();
         let trs = RefractTreasuryClient::new(&env, &trs_id);
-        trs
+        trs.initialize(&admin);
+        let result = trs.try_initialize(&admin);
+        assert!(
+            result.is_err(),
+            "second initialize must be rejected with AlreadyInitialized"
+        );
+    }
+}

@@ -15,6 +15,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ALLOWLIST="$ROOT/scripts/panic_free_allowlist.txt"
+
+# The allowlist is required: without it every scanned violation would be
+# treated as new and the gate would vacuously pass on an empty result.
+# A missing file is always a configuration error, not a clean tree.
+if [ ! -f "$ALLOWLIST" ]; then
+  echo "error: allowlist file not found: $ALLOWLIST" >&2
+  exit 1
+fi
 CRATES=(backstop bounty grants treasury)
 PATTERN='panic!|\.unwrap\(\)|\.expect\('
 
