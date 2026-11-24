@@ -88,7 +88,9 @@ for contract in "${CONTRACTS[@]}"; do
   if [[ "$first_hash" != "$second_hash" ]]; then
     reproducible=false
     failed=1
-    echo "NOT REPRODUCIBLE: $contract builds differ ($first_hash vs $second_hash)" >&2
+    echo "NOT REPRODUCIBLE: $contract builds differ" >&2
+    echo "  expected (build 1): $first_hash" >&2
+    echo "  actual   (build 2): $second_hash" >&2
   fi
 
   onchain="not-checked"
@@ -99,6 +101,9 @@ for contract in "${CONTRACTS[@]}"; do
       else
         onchain="mismatch"
         failed=1
+        echo "ON-CHAIN MISMATCH: $contract" >&2
+        echo "  expected (local build): $first_hash" >&2
+        echo "  actual   (on-chain):    $deployed_hash" >&2
       fi
     else
       onchain="error"

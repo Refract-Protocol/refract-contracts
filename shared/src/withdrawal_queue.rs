@@ -95,6 +95,37 @@ impl WithdrawalQueue {
         Ok(())
     }
 
+    /// Processes the head of the queue by calling `payout` with the entry.
+    ///
+    /// If `payout` returns `Ok(())`, the entry is removed from the queue.
+    /// If `payout` returns `Err(e)`, the entry remains queued so it can be
+    /// retried, and the error is returned to the caller — it is never silently
+    /// discarded.
+    ///
+    /// Issue #580: previously the entry was removed before the payout result
+    /// was checked, so a failing payout caused the claimant's funds to be lost
+    /// from the queue with no record of the failure.
+    pub fn process_head<E, F>(&mut self, payout: F) -> Option<Result<Fill, E>>
+    where
+        F: FnOnce(&Request) -> Result<(), E>,
+    {
+        let head = self.requests.first()?;
+        let fill = Fill {
+            id: head.id,
+            shares: head.shares,
+        };
+        match payout(head) {
+            Ok(()) => {
+                self.requests.remove(0);
+                Some(Ok(fill))
+            }
+            Err(e) => {
+                // Entry stays queued — do not remove it.
+                Some(Err(e))
+            }
+        }
+    }
+
     /// Fills the queue from `available` shares' worth of capital.
     ///
     /// If `available` covers the whole queue, every request is filled in full
@@ -222,5 +253,49 @@ mod tests {
         queue.request(ALICE, 100, 0).unwrap();
         assert!(queue.fill_pro_rata(0).unwrap().is_empty());
         assert_eq!(queue.total_requested(), 100);
+    }
+
+    #[test]
+    fn process_head_keeps_entry_when_payout_fails() {
+        // Issue #580: when the payout call fails, the queue entry must remain
+        // so the claimant's funds are not lost.
+        let mut queue = WithdrawalQueue::new();
+        queue.request(ALICE, 100, 0).unwrap();
+        queue.request(BOB, 200, 1).unwrap();
+
+        // Simulate a failing payout for the head entry.
+        let result = queue.process_head(|_req| Err("transfer rejected"));
+        assert!(result.is_some(), "expected Some result for non-empty queue");
+        assert!(result.unwrap().is_err(), "expected Err from failing payout");
+
+        // Entry must still be present — funds must not be lost.
+        assert_eq!(queue.pending().len(), 2, "entry was removed despite payout failure");
+        assert_eq!(queue.pending()[0].staker, ALICE);
+        assert_eq!(queue.pending()[0].shares, 100);
+    }
+
+    #[test]
+    fn process_head_removes_entry_only_on_success() {
+        let mut queue = WithdrawalQueue::new();
+        queue.request(ALICE, 100, 0).unwrap();
+        queue.request(BOB, 200, 1).unwrap();
+
+        // Successful payout for the head entry.
+        let result = queue.process_head(|_req| Ok::<(), &str>(()));
+        assert!(result.is_some());
+        let fill = result.unwrap().unwrap();
+        assert_eq!(fill.id, 0);
+        assert_eq!(fill.shares, 100);
+
+        // Only Alice's entry should have been removed.
+        assert_eq!(queue.pending().len(), 1);
+        assert_eq!(queue.pending()[0].staker, BOB);
+    }
+
+    #[test]
+    fn process_head_on_empty_queue_returns_none() {
+        let mut queue = WithdrawalQueue::new();
+        let result = queue.process_head(|_req| Ok::<(), &str>(()));
+        assert!(result.is_none());
     }
 }

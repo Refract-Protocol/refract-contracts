@@ -166,6 +166,20 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(cs.RpcError):
             cs.check_rpc_response({"result": {}})
 
+    def test_rpc_error_includes_contract_id_and_underlying_message(self):
+        # Issue #577: when a state read fails, the error must carry both the
+        # contract id being read and the original RPC error message.
+        try:
+            cs.snapshot(FailingRpc(), bf.CONTRACTS)
+            self.fail("expected RpcError")
+        except cs.RpcError as exc:
+            msg = str(exc)
+            # At least one contract id from the fixture must appear.
+            contract_ids_present = any(cid in msg for cid in bf.CONTRACTS.values())
+            self.assertTrue(contract_ids_present, f"contract id missing from error: {msg!r}")
+            # The underlying RPC error text must also appear.
+            self.assertIn("boom", msg, f"underlying error missing from: {msg!r}")
+
     def test_bad_arguments_are_rejected(self):
         for spec in ["", "nope=" + bf.BACKSTOP, "backstop=" + bf.ADMIN, "backstop"]:
             with self.assertRaises(ValueError):
