@@ -47,6 +47,14 @@ pub fn resolve(env: &Env, registry: &Address, role: Role) -> Option<Address> {
     RegistryClient::new(env, registry).get(&role)
 }
 
+/// `true` if a contract is currently registered for `role`.
+///
+/// Returns `false` for a missing key instead of panicking, matching the
+/// non-panicking behaviour of [`resolve`].
+pub fn contains(env: &Env, registry: &Address, role: Role) -> bool {
+    resolve(env, registry, role).is_some()
+}
+
 /// `true` if `addr` is currently registered for `role`.
 pub fn is_trusted(env: &Env, registry: &Address, role: Role, addr: &Address) -> bool {
     RegistryClient::new(env, registry).is_trusted(&role, addr)
