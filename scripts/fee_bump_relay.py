@@ -132,10 +132,18 @@ def main(argv: list[str] | None = None) -> int:
             json.dump(updated, handle)
             handle.write("\n")
         return 0
-    submit_with_retry(envelope, args.rpc_url)
+    result = submit_with_retry(envelope, args.rpc_url)
+    status = result.get("status", "")
+    if status not in ("PENDING", "SUCCESS", ""):
+        print(
+            f"fee-bump submission failed: status={status!r} body={json.dumps(result)}",
+            file=sys.stderr,
+        )
+        return 1
     with open(args.policy, "w", encoding="utf-8") as handle:
         json.dump(updated, handle)
         handle.write("\n")
+    print(json.dumps({"status": status, "result": result}))
     return 0
 
 
