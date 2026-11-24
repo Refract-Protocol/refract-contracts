@@ -1,6 +1,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::payout::{self, PayoutError, PayoutStatus, TransferOutcome, RECLAIM_TIMEOUT_SECS};
+use crate::registry;
 use crate::testutils::{MockMode, MockToken, MockTokenClient};
 use soroban_sdk::{
     contract, contractimpl,
@@ -35,6 +36,14 @@ fn setup() -> Setup {
         token,
         mock,
     }
+}
+
+#[test]
+fn registry_contains_missing_key_is_false() {
+    let env = Env::default();
+    // Unset key: `contains` must return false without panicking.
+    assert!(!registry::contains(&env, 42));
+    assert!(registry::get(&env, 42).is_none());
 }
 
 #[test]
@@ -243,8 +252,9 @@ fn failure_emits_event() {
     let s = setup();
     let to = Address::generate(&s.env);
     s.mock.set_mode(&to, &MockMode::Frozen);
-    s.env
-        .as_contract(&s.host, || payout::pay(&s.env, &s.token, &to, 5, 0));
-    let events = s.env.events().all();
-    assert!(!events.is_empty());
+
+    s.env.as_contract(&s.host, || {
+        payout::pay(&s.env, &s.token, &to, 10, 0);
+    });
+    assert!(!s.env.events().all().is_empty());
 }
