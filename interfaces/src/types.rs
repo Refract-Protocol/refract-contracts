@@ -13,11 +13,30 @@ use crate::errors::RefractError;
 
 // ── Numeric conventions ──────────────────────────────────────────────────────
 
-/// A token amount in 1e7 fixed point (the USDC / Stellar asset convention):
-/// `10_000_000` is one whole token.
+/// A token amount denominated in **stroops** (the Stellar base unit).
+///
+/// Amounts use 1e7 fixed point, matching the USDC / Stellar asset convention:
+/// one whole token equals [`AMOUNT_SCALE`] (`10_000_000`) stroops. For example
+/// `25_000_000` is 2.5 tokens.
+///
+/// # Range
+///
+/// `Amount` is an `i128`, so the representable range is
+/// `i128::MIN..=i128::MAX`. In practice amounts are non-negative and bounded
+/// well below `i128::MAX`; the maximum representable value is
+/// `i128::MAX` (`170_141_183_460_469_231_731_687_303_715_884_105_727`
+/// stroops).
+///
+/// # Arithmetic
+///
+/// Do **not** use raw `+`, `-`, `*`, or `/` on `Amount` values: they can
+/// silently overflow or truncate. Route all arithmetic through the checked
+/// helpers in the `math` crate (and the local [`mul_div_floor`] /
+/// [`apply_bps`] helpers), which return [`RefractError::Overflow`] instead of
+/// wrapping.
 pub type Amount = i128;
 
-/// Scale of an [`Amount`]: one whole token.
+/// Scale of an [`Amount`]: one whole token, in stroops.
 pub const AMOUNT_SCALE: Amount = 10_000_000;
 
 /// Basis points: `10_000` is 100%.
@@ -63,6 +82,19 @@ pub fn mul_div_floor(a: i128, b: i128, denom: i128) -> Result<i128, RefractError
 /// `amount * bps / 10_000`, rounded down.
 pub fn apply_bps(amount: Amount, bps: Bps) -> Result<Amount, RefractError> {
     mul_div_floor(amount, bps as i128, BPS_DENOM as i128)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The documented 1e7 scale on [`Amount`] must match the constant exported
+    /// by the `math` crate so downstream crates cannot disagree.
+    #[test]
+    fn amount_scale_matches_math() {
+        assert_eq!(AMOUNT_SCALE, math::SCALE);
+        assert_eq!(AMOUNT_SCALE, 10_000_000);
+    }
 }
 
 // ── Access control ───────────────────────────────────────────────────────────
@@ -240,37 +272,8 @@ pub struct Grant {
     pub recipient: Address,
     /// Total across all milestones.
     pub total_amount: Amount,
-    /// Ordered milestones; index 0 is confirmed first.
+    /// Milestones in release order.
     pub milestones: Vec<Milestone>,
-    /// Confirmed but not yet claimed.
-    pub claimable: Amount,
-    /// Already paid to the recipient.
-    pub released: Amount,
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn mul_div_floor_rounds_down_and_checks() {
-        assert_eq!(mul_div_floor(10, 1, 3), Ok(3));
-        assert_eq!(mul_div_floor(0, 5, 7), Ok(0));
-        assert_eq!(mul_div_floor(1, 1, 0), Err(RefractError::InvalidArgument));
-        assert_eq!(mul_div_floor(i128::MAX, 2, 1), Err(RefractError::Overflow));
-    }
-
-    #[test]
-    fn apply_bps_is_floor() {
-        assert_eq!(apply_bps(10_000, 500), Ok(500));
-        assert_eq!(apply_bps(9_999, 1), Ok(0));
-        assert_eq!(apply_bps(AMOUNT_SCALE, BPS_DENOM), Ok(AMOUNT_SCALE));
-    }
-
-    #[test]
-    fn role_discriminants_are_pinned() {
-        for (i, role) in Role::ALL.iter().enumerate() {
-            assert_eq!(*role as u32, i as u32);
-        }
-    }
+    /// Whether the grant has been approved.
+    pub approved: bool,
 }

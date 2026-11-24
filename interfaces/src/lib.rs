@@ -26,6 +26,8 @@ pub mod types;
 
 pub use clients::*;
 pub use errors::RefractError;
+/// Token amounts are denominated in **stroops** (1 token = 10_000_000).
+/// See [`types::Amount`] for the full unit and range contract.
 pub use types::*;
 
 /// Expose the shared access-control entrypoints
