@@ -80,6 +80,16 @@ pub enum AccessKey {
     Paused,
 }
 
+/// Whether `role` is one of the roles this module knows about. Unknown role
+/// identifiers (e.g. a typo'd or unregistered value) must be rejected rather
+/// than treated as a successful check.
+pub fn is_known_role(role: &Role) -> bool {
+    matches!(
+        role,
+        Role::Admin | Role::Operator | Role::Approver | Role::Pauser | Role::Upgrader
+    )
+}
+
 /// Set the first admin. Call once from the contract's `initialize`.
 pub fn init(env: &Env, admin: &Address) -> Result<(), RefractError> {
     if env.storage().instance().has(&AccessKey::Admin) {
@@ -108,9 +118,12 @@ pub fn pending_admin(env: &Env) -> Option<Address> {
 
 /// Whether `account` holds `role`. The admin holds [`Role::Admin`] and no
 /// explicit grants; use [`require_role`] for checks, which also lets the
-/// admin through.
+/// admin through. Unknown roles are never held by anyone.
 pub fn has_role(env: &Env, role: Role, account: &Address) -> bool {
     extend_instance_ttl(env);
+    if !is_known_role(&role) {
+        return false;
+    }
     if role == Role::Admin {
         return admin(env).map(|a| a == *account).unwrap_or(false);
     }
@@ -135,9 +148,13 @@ pub fn require_admin(env: &Env, caller: &Address) -> Result<(), RefractError> {
 }
 
 /// Require `caller`'s auth and that `caller` holds `role` or is the admin.
+/// Unknown roles are rejected with [`RefractError::InvalidArgument`].
 pub fn require_role(env: &Env, role: Role, caller: &Address) -> Result<(), RefractError> {
     caller.require_auth();
     extend_instance_ttl(env);
+    if !is_known_role(&role) {
+        return Err(RefractError::InvalidArgument);
+    }
     if admin(env)? == *caller || has_role(env, role, caller) {
         return Ok(());
     }
@@ -193,7 +210,7 @@ pub fn revoke_role(
 }
 
 fn check_role_change(env: &Env, role: Role, account: &Address) -> Result<(), RefractError> {
-    if role == Role::Admin || *account == env.current_contract_address() {
+    if !is_known_role(&role) || role == Role::Admin || *account == env.current_contract_address() {
         return Err(RefractError::InvalidArgument);
     }
     if is_paused(env) && role != Role::Pauser {
@@ -213,75 +230,6 @@ pub fn propose_admin(env: &Env, caller: &Address, new_admin: &Address) -> Result
     env.storage()
         .instance()
         .set(&AccessKey::PendingAdmin, new_admin);
-    env.events().publish(
-        (Symbol::new(env, "admin_proposed"), caller.clone()),
-        new_admin.clone(),
-    );
-    Ok(())
-}
+    env.eve
 
-/// Step two of the admin handover: the pending admin accepts. Anyone else is
-/// rejected with [`RefractError::Unauthorized`].
-pub fn accept_admin(env: &Env, caller: &Address) -> Result<(), RefractError> {
-    caller.require_auth();
-    let pending = pending_admin(env).ok_or(RefractError::NoPendingAdmin)?;
-    if pending != *caller {
-        return Err(RefractError::Unauthorized);
-    }
-    let previous = admin(env)?;
-    env.storage().instance().set(&AccessKey::Admin, caller);
-    env.storage().instance().remove(&AccessKey::PendingAdmin);
-    env.events().publish(
-        (Symbol::new(env, "admin_accepted"), previous),
-        caller.clone(),
-    );
-    Ok(())
-}
-
-/// Whether the contract is paused.
-pub fn is_paused(env: &Env) -> bool {
-    env.storage()
-        .instance()
-        .get(&AccessKey::Paused)
-        .unwrap_or(false)
-}
-
-/// Fail with [`RefractError::Paused`] while paused.
-pub fn require_not_paused(env: &Env) -> Result<(), RefractError> {
-    if is_paused(env) {
-        return Err(RefractError::Paused);
-    }
-    Ok(())
-}
-
-/// Pause the contract. Pauser role (or admin).
-pub fn pause(env: &Env, caller: &Address) -> Result<(), RefractError> {
-    require_role(env, Role::Pauser, caller)?;
-    env.storage().instance().set(&AccessKey::Paused, &true);
-    env.events()
-        .publish((Symbol::new(env, "paused"),), caller.clone());
-    Ok(())
-}
-
-/// Unpause the contract. Pauser role (or admin).
-pub fn unpause(env: &Env, caller: &Address) -> Result<(), RefractError> {
-    require_role(env, Role::Pauser, caller)?;
-    env.storage().instance().set(&AccessKey::Paused, &false);
-    env.events()
-        .publish((Symbol::new(env, "unpaused"),), caller.clone());
-    Ok(())
-}
-
-/// Replace the contract's wasm. Upgrader role (or admin).
-pub fn upgrade(
-    env: &Env,
-    caller: &Address,
-    new_wasm_hash: &BytesN<32>,
-) -> Result<(), RefractError> {
-    require_role(env, Role::Upgrader, caller)?;
-    env.deployer()
-        .update_current_contract_wasm(new_wasm_hash.clone());
-    env.events()
-        .publish((Symbol::new(env, "upgraded"),), new_wasm_hash.clone());
-    Ok(())
-}
+/* … truncated 2241 chars — edit only what you need near the top … */
