@@ -174,123 +174,136 @@ pub trait GrantsInterface {
     ) -> Result<(), RefractError>;
     /// Pay the recipient everything confirmed so far.
     fn claim(env: Env, recipient: Address, grant_id: GrantId) -> Result<Amount, RefractError>;
-    /// A grant by id.
+    /// A grant's record.
     fn get_grant(env: Env, grant_id: GrantId) -> Option<Grant>;
-    /// Confirmed but unclaimed amount of a grant.
-    fn claimable(env: Env, grant_id: GrantId) -> Result<Amount, RefractError>;
 }
 
-/// `RefractTreasury`: token custody with approver-gated withdrawals.
+/// `RefractTreasury`: protocol fee custody and spend authorisation.
 #[contractclient(name = "TreasuryClient")]
 pub trait TreasuryInterface {
     /// One-time setup. `admin` should be the timelock.
-    fn initialize(env: Env, admin: Address) -> Result<(), RefractError>;
-    /// Send `amount` of `token` to `to`. Approver role.
-    fn withdraw(
+    fn initialize(env: Env, admin: Address, token: Address) -> Result<(), RefractError>;
+    /// Book `amount` of fee income received from `from`.
+    fn receive_fees(env: Env, from: Address, amount: Amount) -> Result<(), RefractError>;
+    /// Pay `amount` to `to` against an approved `operation_id`. Operator role.
+    fn spend(
         env: Env,
         caller: Address,
-        token: Address,
-        amount: Amount,
         to: Address,
+        amount: Amount,
+        operation_id: OperationId,
     ) -> Result<(), RefractError>;
-    /// The treasury's balance of `token`.
-    fn balance(env: Env, token: Address) -> Amount;
+    /// Funds held by the treasury.
+    fn balance(env: Env) -> Result<Amount, RefractError>;
 }
 
-/// Governance weight as exposed by `RefractVeToken`.
-#[contractclient(name = "VotingPowerClient")]
-pub trait VotingPowerInterface {
-    /// Combined weight: lock power plus backstop power.
-    fn get_voting_power(env: Env, account: Address) -> i128;
-    /// Weight from the account's token lock only.
-    fn locked_power(env: Env, account: Address) -> i128;
-    /// Weight from the account's active backstop stake only.
-    fn backstop_power(env: Env, account: Address) -> i128;
-}
+// ── Client-only mirrors ──────────────────────────────────────────────────────
 
-// ── Client-only mirrors of legacy contracts ──────────────────────────────────
-
-/// Subset of `RefractPool` used by other contracts.
+/// `RefractPool`: the underwriting pool. Client-only mirror; see the module
+/// docs for how its errors decode.
 #[contractclient(name = "PoolClient")]
 pub trait PoolInterface {
-    /// Settle the claim on `policy_id`.
-    fn process_claim(env: Env, policy_id: PolicyId) -> Result<Amount, RefractError>;
-    /// The backstop the pool draws from.
-    fn backstop(env: Env) -> Option<Address>;
-    /// Pool admin.
-    fn admin(env: Env) -> Option<Address>;
-    /// Wire the backstop. Pool admin only.
-    fn set_backstop(env: Env, caller: Address, backstop: Address) -> Result<(), RefractError>;
-}
-
-/// Subset of `RefractOracle` used by the pool.
-#[contractclient(name = "OracleClient")]
-pub trait OracleInterface {
-    /// Whether the feed meets the oracle's trigger for `coverage_type`.
-    fn is_triggered(env: Env, coverage_type: u32, feed_id: Symbol) -> Result<bool, RefractError>;
-    /// Oracle admin.
-    fn admin(env: Env) -> Option<Address>;
-}
-
-/// Subset of `RefractPolicyRegistry` used by the pool.
-#[contractclient(name = "PolicyRegistryClient")]
-pub trait PolicyRegistryInterface {
-    /// Index a policy the pool created. Pool or admin.
+    /// One-time setup. `admin` should be the timelock.
+    fn initialize(
+        env: Env,
+        admin: Address,
+        token: Address,
+        oracle: Address,
+        backstop: Address,
+    ) -> Result<(), RefractError>;
+    /// Register a policy. Policy manager role.
     fn register_policy(
         env: Env,
         caller: Address,
-        reg: PolicyRegistration,
+        registration: PolicyRegistration,
     ) -> Result<PolicyId, RefractError>;
-    /// Mark a policy inactive. Pool or admin.
-    fn deactivate_policy(
+    /// Pay a claim against `policy_id`. Claim approver role.
+    fn pay_claim(
         env: Env,
         caller: Address,
         policy_id: PolicyId,
+        amount: Amount,
     ) -> Result<(), RefractError>;
-    /// Registry admin.
-    fn admin(env: Env) -> Option<Address>;
+    /// Funds held by the pool.
+    fn balance(env: Env) -> Result<Amount, RefractError>;
 }
 
-/// Subset of `RefractTimelock` used by governance.
+/// `RefractOracle`: price feeds. Client-only mirror.
+#[contractclient(name = "OracleClient")]
+pub trait OracleInterface {
+    /// Latest price for `asset`, in the oracle's base units.
+    fn price(env: Env, asset: Address) -> Result<Amount, RefractError>;
+}
+
+/// `RefractPolicyRegistry`: policy metadata. Client-only mirror.
+#[contractclient(name = "PolicyRegistryClient")]
+pub trait PolicyRegistryInterface {
+    /// Metadata for `policy_id`, if registered.
+    fn get_policy(env: Env, policy_id: PolicyId) -> Option<PolicyRegistration>;
+}
+
+/// `RefractTimelock`: delayed admin execution. Client-only mirror.
 #[contractclient(name = "TimelockClient")]
 pub trait TimelockInterface {
-    /// Queue `function(args)` on `target` for execution at or after `eta`.
-    fn queue(
+    /// Queue a call. Admin only.
+    fn schedule(
         env: Env,
+        caller: Address,
         target: Address,
         function: Symbol,
         args: Vec<Val>,
         eta: u64,
-    ) -> Result<OperationId, RefractError>;
-    /// Execute a queued operation whose eta has passed.
-    fn execute(env: Env, id: OperationId) -> Result<(), RefractError>;
-    /// Cancel a queued operation. Timelock admin only.
-    fn cancel(env: Env, id: OperationId) -> Result<(), RefractError>;
-    /// Minimum delay in seconds.
-    fn min_delay(env: Env) -> u64;
-    /// Timelock admin (the governor, once wired).
-    fn admin(env: Env) -> Option<Address>;
+    ) -> Result<BytesN<32>, RefractError>;
+    /// Execute a queued call once its ETA has passed.
+    fn execute(env: Env, caller: Address, operation_id: BytesN<32>) -> Result<(), RefractError>;
 }
 
-/// Subset of `RefractGovernor`.
+/// `RefractGovernor`: proposal voting. Client-only mirror.
 #[contractclient(name = "GovernorClient")]
 pub trait GovernorInterface {
-    /// Create a proposal to call `function(args)` on `target`.
-    fn propose(
-        env: Env,
-        proposer: Address,
-        target: Address,
-        function: Symbol,
-        args: Vec<Val>,
-        description: Symbol,
-    ) -> Result<ProposalId, RefractError>;
-    /// Vote on a proposal. Returns the weight counted.
+    /// Cast a vote on `proposal_id`.
     fn cast_vote(
         env: Env,
         voter: Address,
         proposal_id: ProposalId,
         support: bool,
-    ) -> Result<i128, RefractError>;
-    /// Forward a succeeded proposal to the timelock.
-    fn queue(env: Env, proposal_id: ProposalId, eta: u64) -> Result<(), RefractError>;
+    ) -> Result<(), RefractError>;
+}
+
+/// `RefractVeToken`: locked-balance voting power. Implemented by the ve-token
+/// contract via `#[contractimpl] impl VotingPowerInterface for Contract`.
+#[contractclient(name = "VeTokenClient")]
+pub trait VotingPowerInterface {
+    /// Voting power of `account` at the current ledger.
+    fn voting_power(env: Env, account: Address) -> Result<Amount, RefractError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _, Env};
+
+    /// Minimal mock of the balance-reading entrypoint. It follows the
+    /// documented contract: an unknown account reads as `Ok(0)` rather than
+    /// erroring or panicking.
+    #[contract]
+    pub struct MockBalance;
+
+    #[contractimpl]
+    impl MockBalance {
+        pub fn balance(env: Env, account: Address) -> Result<Amount, RefractError> {
+            let key = (Symbol::new(&env, "bal"), account);
+            Ok(env.storage().persistent().get(&key).unwrap_or(0))
+        }
+    }
+
+    #[test]
+    fn unknown_account_balance_is_zero() {
+        let env = Env::default();
+        let contract_id = env.register(MockBalance, ());
+        let client = MockBalanceClient::new(&env, &contract_id);
+
+        let unknown = Address::generate(&env);
+        assert_eq!(client.balance(&unknown), 0);
+    }
 }

@@ -5,6 +5,17 @@
 //! has the same major version and a minor version at least as new. A major
 //! change breaks callers. A minor change only adds to the interface.
 
+/// The published interface version of this crate.
+pub const VERSION: &str = "1.2";
+
+/// Returns the published interface version of this crate.
+///
+/// This is the accessor form of [`VERSION`], kept alongside the constant for
+/// backward compatibility.
+pub fn version() -> &'static str {
+    VERSION
+}
+
 /// An interface version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
@@ -78,5 +89,10 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_accessor_returns_the_constant() {
+        assert_eq!(version(), VERSION);
     }
 }

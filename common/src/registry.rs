@@ -57,3 +57,11 @@ pub fn is_trusted_any(env: &Env, registry: &Address, roles: &[Role], addr: &Addr
     let client = RegistryClient::new(env, registry);
     roles.iter().any(|role| client.is_trusted(role, addr))
 }
+
+/// `true` if a contract is currently registered for `role`.
+///
+/// Returns `false` when no address is registered for `role`, matching the
+/// `Option`-returning [`resolve`] rather than panicking on a missing key.
+pub fn contains(env: &Env, registry: &Address, role: Role) -> bool {
+    resolve(env, registry, role).is_some()
+}
