@@ -16,3 +16,14 @@ Recurring treasury schedules reserve their complete budget when created. A
 keeper can execute at most one due period per call. Cancellation and exhaustion
 release the unspent reserve; a schedule never authorizes spending beyond its
 reserved asset balance.
+
+## Operator CLI
+
+The operator subcommands are exposed through `cargo xtask operator`. Run
+`cargo xtask operator --help` to list them, or `cargo xtask operator <subcommand>
+--help` for the arguments a specific subcommand takes. Each subcommand carries a
+one-line description matching the operations documented above:
+
+- `rescue` — rescue live excess tokens to the governance recipient.
+- `batch` — submit a bounded batch of administrative operations.
+- `schedule` — create, execute, or cancel a recurring treasury schedule.
