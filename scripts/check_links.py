@@ -4,6 +4,10 @@
 Scope:
 - Verifies that all local relative links (e.g. ./CODE_OF_CONDUCT.md, ./SECURITY.md) exist.
 - Verifies external URLs syntax and reachability when network is available.
+
+A single malformed URL is reported as a broken link (with its source file) and
+does not abort the run.  The checker exits non-zero when any link — malformed
+or unreachable — is reported.
 """
 
 import argparse
@@ -27,10 +31,13 @@ def check_local_link(source_file, target):
 
 
 def check_external_link(url, timeout=5):
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; RefractLinkChecker/1.0)"}
-    )
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; RefractLinkChecker/1.0)"}
+        )
+    except ValueError as exc:
+        return False, f"Malformed URL: {exc}"
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return 200 <= response.status < 400, None
@@ -78,7 +85,12 @@ def main():
                     if args.skip_external:
                         continue
                     if target not in checked_external:
-                        ok, info = check_external_link(target)
+                        try:
+                            ok, info = check_external_link(target)
+                        except Exception as exc:  # noqa: BLE001 - malformed URL or parse error
+                            checked_external[target] = (False, f"Malformed URL: {exc}")
+                            broken_links.append((rel_path, target, f"Malformed URL: {exc}"))
+                            continue
                         checked_external[target] = (ok, info)
                         if info:
                             print(f"  [URL] {target}: {info}")

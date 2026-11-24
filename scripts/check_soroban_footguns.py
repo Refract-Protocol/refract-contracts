@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""
-Static Analysis Gate for Soroban Footguns.
+"""Static analysis gate for Soroban footguns.
 
 Scans contract logic (excluding test modules) for:
-1. `unwrap()` / `expect()` calls in `#[contractimpl]` methods that trigger wasm traps.
-2. Missing `require_auth()` checks on privileged state mutations.
+1. ``unwrap()`` / ``expect()`` calls in ``#[contractimpl]`` methods that
+   trigger wasm traps.
+2. Missing ``require_auth()`` checks on privileged state mutations.
 3. Unbounded collection or storage pattern risks.
+
+Exit-code contract:
+  0 — no findings; all scanned contract logic satisfies Soroban safety
+      invariants.
+  1 — at least one finding was reported, or the fixture verification step
+      failed.  CI must treat exit code 1 as a gate failure.
 """
 
 import os
@@ -84,12 +90,12 @@ def test_on_fixtures():
             return False
     return True
 
-def main():
+def main() -> int:
     print("=== Refract Contracts: Soroban Static Analysis Gate ===")
-    
+
     # 1. Run fixture verification
     if not test_on_fixtures():
-        sys.exit(1)
+        return 1
 
     # 2. Scan core contracts
     crates = ["pool", "policy", "oracle", "backstop", "bounty", "treasury"]
@@ -113,8 +119,10 @@ def main():
     print(f"\nStatic analysis complete. Total unresolved violations: {total_violations}")
     if total_violations > 0:
         print("CI Gate Failed: Please replace panics with typed errors or update allowlist.")
-        sys.exit(1)
+        return 1
     print("CI Gate Passed: All contract logic satisfies Soroban safety invariants.")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -18,6 +18,16 @@ ALLOWLIST="$ROOT/scripts/panic_free_allowlist.txt"
 CRATES=(backstop bounty grants treasury)
 PATTERN='panic!|\.unwrap\(\)|\.expect\('
 
+# Fail closed: if the allowlist is missing or unreadable the gate cannot run.
+if [[ ! -f "$ALLOWLIST" ]]; then
+  echo "panic-free gate: allowlist not found: $ALLOWLIST" >&2
+  exit 1
+fi
+if [[ ! -r "$ALLOWLIST" ]]; then
+  echo "panic-free gate: allowlist not readable: $ALLOWLIST" >&2
+  exit 1
+fi
+
 found="$(mktemp)"
 trap 'rm -f "$found"' EXIT
 
