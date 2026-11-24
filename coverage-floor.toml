@@ -1,0 +1,7 @@
+# Minimum acceptable line-coverage percentage for the workspace.
+# scripts/coverage.py reads this value and exits non-zero when the
+# measured coverage falls below it.
+#
+# Raise this floor when you add well-tested code; never lower it.
+[coverage]
+min_percent = 80.0

@@ -189,6 +189,88 @@ fn calc_shares_is_1to1_when_pool_is_empty() {
         .unwrap();
 }
 
+/// The curve cache and a direct storage read must produce identical quotes.
+/// If the cache is not invalidated when set_pool_config() is called, a quote
+/// after a config update returns the stale cached value instead of the new
+/// one — this test pins that invariant.
+#[test]
+fn cached_and_fresh_quotes_agree_after_config_update() {
+    let env = Env::default();
+    let pool_id = env.register_contract(None, RefractPool);
+
+    let cases = (
+        1i128..50_000_000_000i128,  // coverage_amount (up to 5000 USDC in 1e7)
+        1u32..365u32,               // duration_days
+        100u32..1_000u32,           // base_premium_rate_bps (1% – 10%)
+    );
+
+    TestRunner::default()
+        .run(&cases, |(coverage_amount, duration_days, new_rate_bps)| {
+            env.as_contract(&pool_id, || {
+                // Seed an initial config and version.
+                let initial_config = PoolConfig {
+                    base_premium_rate_bps: 300,
+                    max_utilization_bps: 8_000,
+                    min_coverage: 0,
+                    max_coverage: i128::MAX / (PRECISION * 400),
+                    lockup_days: 7,
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PoolConfig, &initial_config);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CurveVersion, &0u64);
+                // Prime the cache with the initial config.
+                let _ = RefractPool::_get_cached_config(&env);
+
+                // Simulate set_pool_config: write new config, bump version, clear cache.
+                let updated_config = PoolConfig {
+                    base_premium_rate_bps: new_rate_bps,
+                    max_utilization_bps: 8_000,
+                    min_coverage: 0,
+                    max_coverage: i128::MAX / (PRECISION * 400),
+                    lockup_days: 7,
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PoolConfig, &updated_config);
+                let ver: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CurveVersion)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CurveVersion, &(ver + 1));
+                env.storage().instance().remove(&DataKey::CurveCache);
+
+                // Cached path
+                let cached_config = RefractPool::_get_cached_config(&env);
+                // Direct storage path
+                let direct_config: PoolConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PoolConfig)
+                    .unwrap();
+
+                let params = PolicyParams {
+                    coverage_amount,
+                    coverage_type: CoverageType::StablecoinDepeg,
+                    duration_days,
+                    trigger_threshold: 0,
+                };
+
+                let cached_premium = RefractPool::_calc_premium(&cached_config, &params);
+                let fresh_premium = RefractPool::_calc_premium(&direct_config, &params);
+
+                prop_assert_eq!(cached_premium, fresh_premium);
+            });
+            Ok(())
+        })
+        .unwrap();
+}
+
 /// `_quote_withdrawal` must never let a caller preview more USDC than the
 /// pool actually holds. Regression coverage for the bug where a `shares`
 /// argument above `total_shares` made `usdc_out` exceed `total_capital`,

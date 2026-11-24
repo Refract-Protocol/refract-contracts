@@ -1,0 +1,6 @@
+{
+  "_comment": "Testnet ledger snapshot. Regenerate with: python scripts/capture_ledger_snapshot.py",
+  "ledger_sequence": 1234567,
+  "captured_at": "2024-01-15T00:00:00Z",
+  "entries": []
+}

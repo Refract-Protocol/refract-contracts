@@ -75,6 +75,8 @@ pub enum DataKey {
     Initialized,
     OracleData(CoverageType), // latest oracle reading per type
     LastDeposit(Address),     // provider → timestamp of their most recent provide_capital()
+    CurveVersion,             // monotonic counter, incremented on every set_pool_config
+    CurveCache,               // cached PoolConfig at the current CurveVersion
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -143,7 +145,7 @@ pub struct PoolConfig {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PoolStats {
     pub total_capital: i128,
     pub total_coverage: i128,
@@ -163,6 +165,19 @@ pub struct PoolStats {
 pub struct OracleData {
     pub value: i128, // current metric (price, percentage change, etc)
     pub updated_at: u64,
+}
+
+/// Cached premium-curve parameters, valid for the current CurveVersion.
+/// Invalidated whenever set_pool_config() increments CurveVersion.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurveCache {
+    pub version: u64,
+    pub base_premium_rate_bps: u32,
+    pub max_utilization_bps: u32,
+    pub min_coverage: i128,
+    pub max_coverage: i128,
+    pub lockup_days: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -208,6 +223,7 @@ impl RefractPool {
         };
         env.storage().instance().set(&DataKey::PoolConfig, &config);
         env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::CurveVersion, &0u64);
 
         env.events().publish((symbol_short!("INIT"),), (admin,));
         Ok(())
@@ -378,7 +394,7 @@ impl RefractPool {
     /// tell a quote was for a purchase that could never succeed.
     pub fn quote_premium(env: Env, params: PolicyParams) -> Result<i128, PoolError> {
         Self::assert_initialized(&env)?;
-        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+        let config: PoolConfig = Self::_get_cached_config(&env);
         Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
         Ok(Self::_calc_premium(&config, &params))
     }
@@ -388,7 +404,7 @@ impl RefractPool {
         holder.require_auth();
         Self::assert_initialized(&env)?;
 
-        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+        let config: PoolConfig = Self::_get_cached_config(&env);
         let new_coverage = Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
 
         let premium = Self::_calc_premium(&config, &params);
@@ -696,6 +712,18 @@ impl RefractPool {
         Self::require_admin(&env, &caller)?;
         env.storage().instance().set(&DataKey::PoolConfig, &config);
 
+        // Invalidate the curve cache so the next quote recomputes from the new config.
+        let version: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurveVersion)
+            .unwrap_or(0);
+        let new_version = version + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::CurveVersion, &new_version);
+        env.storage().instance().remove(&DataKey::CurveCache);
+
         env.events().publish((symbol_short!("CFG_SET"),), ());
         Ok(())
     }
@@ -928,6 +956,47 @@ impl RefractPool {
         } else {
             amount * total_shares / total_capital
         }
+    }
+
+    /// Return the PoolConfig, using a version-keyed cache to avoid re-reading
+    /// storage on every quote in a batch.  Invalidated by set_pool_config().
+    fn _get_cached_config(env: &Env) -> PoolConfig {
+        let version: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurveVersion)
+            .unwrap_or(0);
+
+        if let Some(cache) = env
+            .storage()
+            .instance()
+            .get::<DataKey, CurveCache>(&DataKey::CurveCache)
+        {
+            if cache.version == version {
+                return PoolConfig {
+                    base_premium_rate_bps: cache.base_premium_rate_bps,
+                    max_utilization_bps: cache.max_utilization_bps,
+                    min_coverage: cache.min_coverage,
+                    max_coverage: cache.max_coverage,
+                    lockup_days: cache.lockup_days,
+                };
+            }
+        }
+
+        // Cache miss or stale — read from storage and repopulate.
+        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+        env.storage().instance().set(
+            &DataKey::CurveCache,
+            &CurveCache {
+                version,
+                base_premium_rate_bps: config.base_premium_rate_bps,
+                max_utilization_bps: config.max_utilization_bps,
+                min_coverage: config.min_coverage,
+                max_coverage: config.max_coverage,
+                lockup_days: config.lockup_days,
+            },
+        );
+        config
     }
 
     /// Shared by quote_premium() and buy_policy() so the preview and the
