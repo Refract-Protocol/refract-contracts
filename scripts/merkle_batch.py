@@ -155,11 +155,18 @@ def verify_proof(root: bytes, leaf: bytes, proof: list) -> bool:
 # Batch files
 # ---------------------------------------------------------------------------
 
-def build_batch(asset: str, entries: list) -> dict:
+def build_batch(asset: str, entries: list, progress_every: int = 0) -> dict:
+    """Builds a batch. With `progress_every` > 0, reports every that many leaves.
+
+    Progress goes to stderr so stdout stays a clean machine-readable summary.
+    """
     decode_strkey(asset)
     leaves = []
     seen = set()
+    total = len(entries)
     for i, entry in enumerate(entries):
+        if progress_every and i and i % progress_every == 0:
+            print(f"  hashed {i}/{total} leaves", file=sys.stderr)
         recipient = entry["recipient"]
         amount = int(entry["amount"])
         if amount <= 0:
@@ -171,8 +178,12 @@ def build_batch(asset: str, entries: list) -> dict:
         seen.add(h)
         leaves.append({"recipient": recipient, "amount": amount, "salt": salt.hex(), "leaf": h})
 
+    if progress_every:
+        print(f"  hashed {total}/{total} leaves, building the tree", file=sys.stderr)
     levels = build_tree([l["leaf"] for l in leaves])
     root = levels[-1][0]
+    if progress_every:
+        print(f"  tree built, depth {len(levels) - 1}, writing proofs", file=sys.stderr)
     for l in leaves:
         l["proof"] = [p.hex() for p in proof_for(levels, l["leaf"])]
         l["leaf"] = l["leaf"].hex()
@@ -243,7 +254,7 @@ def load(path):
 
 
 def cmd_build(args):
-    batch = build_batch(args.asset, load(args.input))
+    batch = build_batch(args.asset, load(args.input), progress_every=args.progress_every)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(batch, f, indent=2)
     print(f"root={batch['root']} total_amount={batch['total_amount']} leaves={len(batch['leaves'])}")
@@ -331,6 +342,12 @@ def main(argv=None):
     b.add_argument("--asset", required=True)
     b.add_argument("--input", required=True)
     b.add_argument("--out", required=True)
+    b.add_argument(
+        "--progress-every",
+        type=int,
+        default=1000,
+        help="report progress to stderr every N leaves (0 to stay silent)",
+    )
     b.set_defaults(func=cmd_build)
 
     v = sub.add_parser("verify")
