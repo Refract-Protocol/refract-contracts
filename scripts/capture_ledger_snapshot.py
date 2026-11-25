@@ -19,6 +19,7 @@ import argparse
 import base64
 import hashlib
 import json
+import urllib.parse
 import urllib.request
 
 # Pool, oracle, policy, and the four claimant/backstop contracts.
@@ -59,6 +60,20 @@ def entry_from_rpc(contract: str, key: str, xdr: str) -> dict:
     return {"contract": contract, "key": key, "value": int(text), "xdr": xdr}
 
 
+def redact_endpoint(url: str) -> str:
+    """The endpoint with any credential stripped.
+
+    A snapshot is committed as a fixture, so the URL it records must not carry
+    a private RPC's API key. Userinfo, the query string and any fragment are
+    dropped; scheme, host, port and path are what identify the endpoint.
+    """
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
 def capture(rpc_url: str, network: str, contracts: dict[str, str]) -> dict:
     unknown = sorted(set(contracts) - set(ALLOWED))
     if unknown:
@@ -81,6 +96,10 @@ def capture(rpc_url: str, network: str, contracts: dict[str, str]) -> dict:
         "schema": SCHEMA,
         "version": VERSION,
         "network": network,
+        # Which endpoint this fixture was read from. Two snapshots of the same
+        # network can disagree when they came from different nodes, and without
+        # this there is no way to tell that from the file.
+        "rpc_endpoint": redact_endpoint(rpc_url),
         "ledger_sequence": int(latest["sequence"]),
         "close_time": int(latest["closeTime"]),
         "hash": content_hash(entries),
