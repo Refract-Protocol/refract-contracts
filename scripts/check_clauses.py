@@ -46,7 +46,12 @@ def main() -> int:
         for error in errors:
             print(f"  - {error}")
         return 1
-    print(f"Checked {len(clauses)} clauses: all mapped to existing tests.")
+    # A bare "all mapped" cannot be told apart from a run that matched nothing,
+    # so say how many clauses were read and which document they came from.
+    print(
+        f"Checked {len(clauses)} clauses from {SPEC.relative_to(ROOT)} "
+        f"(mapping {MAPPING.relative_to(ROOT)}): all mapped to existing tests."
+    )
     return 0
 
 
