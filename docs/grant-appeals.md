@@ -73,3 +73,23 @@ finalized).
 
 Out of scope: bounty dispute resolution, legal appeals, and re-opening
 applications the applicant withdrew.
+
+## Application bond
+
+Every grant application must post a fixed anti-spam bond before it enters
+review. The bond amount is set when the `BondBook` is initialised by
+governance and is the same for all applications.
+
+| State | Meaning |
+|---|---|
+| `Held` | Bond posted; application under review |
+| `Refunded` | Governance returned the bond after a good-faith review (approved or legitimately rejected) |
+| `Forfeited` | Governance kept the bond because the application was spam or abuse |
+
+**Where it is held.** The bond is held in the `BondBook` keyed by
+application id and is locked until governance calls `refund` or `forfeit`.
+
+**When it is returned.** Governance refunds the bond once the application
+has been reviewed in good faith, regardless of the outcome (approved or
+rejected). A bond is forfeited only for spam or abuse. Each application's
+bond is settled exactly once — it cannot be both refunded and forfeited.
