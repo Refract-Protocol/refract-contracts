@@ -390,6 +390,14 @@ def cmd_deploy(args, cfg: dict) -> None:
 
     log(f"registry: {registry_path(args.network).relative_to(REPO_ROOT)}", "ok")
     cmd_verify(args, cfg)
+    # Only report success once the registry is saved *and* verification has
+    # passed; cmd_verify exits non-zero on any mismatch.
+    for name in sorted(selected(cfg), key=lambda c: c["name"]):
+        print(
+            f"deployed {name['name']} contract_id={ids[name['name']]} "
+            f"network={args.network}",
+            flush=True,
+        )
 
 
 def _norm(v) -> str:

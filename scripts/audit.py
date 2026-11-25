@@ -242,7 +242,18 @@ def main():
         gh("warning", f"audit.toml {acc_id} no longer matches any finding; remove it")
 
     write_summary(report, rows, policy_errors, sorted(set(active) - matched), today)
-    return 1 if fail else 0
+    if fail:
+        return 1
+    db = report.get("database") or {}
+    lock = report.get("lockfile") or {}
+    count = lock.get("dependency-count", "?")
+    source = db.get("source") or db.get("url") or "RustSec advisory database"
+    updated = db.get("last-updated", "unknown")
+    print(
+        f"AUDIT OK: checked {count} packages using advisory database "
+        f"{source} (updated {updated})"
+    )
+    return 0
 
 
 def write_summary(report, rows, policy_errors, stale, today):
