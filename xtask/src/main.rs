@@ -146,6 +146,7 @@
 
 pub mod operator;
 
+use operator::OperatorError;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -160,12 +161,39 @@ const BUDGET_CRATES: &[&str] = &[
     "refract-treasury",
 ];
 
+/// Plain-text, one-task-per-line list for `cargo xtask` with no arguments.
+fn top_level_help() -> &'static str {
+    "Available tasks (cargo xtask <task> [options]):\n\
+     authz-matrix - Check that every state-mutating entrypoint has an authorization test.\n\
+     budget-check - Compare measured resource usage with resource_budgets.json.\n\
+     operator - Run a backstop, bounty, grants or treasury operator subcommand.\n\
+     backstop - Run a backstop operator subcommand (operator backstop ...).\n\
+     bounty - Run a bounty operator subcommand (operator bounty ...).\n\
+     grants - Run a grants operator subcommand (operator grants ...).\n\
+     treasury - Run a treasury operator subcommand (operator treasury ...).\n"
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        None => {
+            print!("{}", top_level_help());
+            process::exit(2);
+        }
+        Some("--help" | "-h" | "help") => print!("{}", top_level_help()),
         Some("authz-matrix") => authz_matrix(),
         Some("budget-check") => budget_check(args.iter().any(|a| a == "--update")),
-        Some("operator" | "backstop" | "bounty" | "grants" | "treasury") => run_operator(&args),
+        Some(domain @ ("operator" | "backstop" | "bounty" | "grants" | "treasury")) => {
+            if args
+                .iter()
+                .any(|a| a == "--help" || a == "-h" || a == "help")
+            {
+                let (given_domain, action) = operator_help_filter(&args, domain);
+                print!("{}", operator::help_text(given_domain, action));
+            } else {
+                run_operator(&args);
+            }
+        }
         _ => {
             eprintln!(
                 "usage: cargo xtask <authz-matrix | budget-check [--update] | \
@@ -176,15 +204,53 @@ fn main() {
     }
 }
 
+/// Resolve which subcommand a `--help` invocation is asking about.
+fn operator_help_filter<'a>(
+    args: &'a [String],
+    domain: &'a str,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let slices = if domain == "operator" {
+        &args[1..]
+    } else {
+        args
+    };
+    let given_domain = slices
+        .first()
+        .map(String::as_str)
+        .filter(|s| *s != "help" && *s != "--help" && *s != "-h");
+    let action = slices
+        .get(1)
+        .map(String::as_str)
+        .filter(|s| *s != "help" && *s != "--help" && *s != "-h");
+    (given_domain, action)
+}
+
 fn run_operator(args: &[String]) {
+    let label = operator::command_label(args);
     let (cmd, custom_dir, json_output) =
-        operator::parse_operator_args(args).unwrap_or_else(|e| fatal(&e.to_string()));
+        operator::parse_operator_args(args).unwrap_or_else(|e| fatal_operator(&label, &e));
     let deployments_dir = custom_dir.unwrap_or_else(|| repo_root().join("deployments"));
-    let plan = operator::build_plan(&cmd, &deployments_dir)
-        .unwrap_or_else(|e| fatal(&e.to_string()));
+    let plan =
+        operator::build_plan(&cmd, &deployments_dir).unwrap_or_else(|e| fatal_operator(&label, &e));
     let output =
-        operator::execute_plan(&plan, json_output).unwrap_or_else(|e| fatal(&e.to_string()));
+        operator::execute_plan(&plan, json_output).unwrap_or_else(|e| fatal_operator(&label, &e));
     print!("{output}");
+    // Machine-readable output stays parseable; human output always ends with
+    // one confirmation line so a screen reader can tell the run finished.
+    if !json_output {
+        let outcome = if plan.dry_run {
+            "dry run completed"
+        } else {
+            "completed successfully"
+        };
+        println!("{label}: {outcome}");
+    }
+}
+
+/// Report the error's own Display text, prefixed with the subcommand name.
+fn fatal_operator(label: &str, error: &OperatorError) -> ! {
+    eprintln!("{}", operator::described_error(label, error));
+    process::exit(1);
 }
 
 fn authz_matrix() {

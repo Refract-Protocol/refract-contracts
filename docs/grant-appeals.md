@@ -36,6 +36,25 @@ Pending ──(all reviewers voted)──▶ Approved ──fund_application─�
 | Binding decision | `final_decision(overturn, reason_hash)`, registry `Timelock` only. Resolves `Escalated` or overrides a panel outcome |
 | Timelock delay | `final_decision` and `reopen_appeal` accept only the timelock, so escalation can never bypass the delay |
 
+## Appeal bond
+
+The refundable anti-spam bond is implemented in
+[`grants/src/bond.rs`](../grants/src/bond.rs). It is a fixed, positive `amount`
+chosen when a `BondBook` is created (`BondBook::new` rejects zero and negative
+amounts); there is no separate per-appeal price. `post` records one bond per
+application in state `Held`, keyed by application id in the book's `bonds` map.
+The bond stays there until governance settles it: `refund` returns it after a
+good-faith review (`Refunded`), while `forfeit` keeps it when the application
+is spam or abuse (`Forfeited`). Only governance may settle a bond, and each
+bond is settled exactly once, so it cannot be refunded and forfeited or paid
+out twice. `bond(application_id)` shows the current state of a posted bond.
+
+The on-chain `submit_appeal` entrypoint in `grants/src/appeals.rs` currently
+checks the applicant, appeal count and appeal window, but does not call into
+`BondBook`. Under the deployed contract no bond is charged when an appeal is
+filed; the bond policy above applies to application posting. If appeals are
+later wired to the bond, the same amount, custody and refund conditions apply.
+
 ## Audit trail
 
 The original decision (`Application` plus per-reviewer `ReviewRecord`) and

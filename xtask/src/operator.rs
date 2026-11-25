@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -119,6 +120,101 @@ impl fmt::Display for OperatorError {
             Self::ExecutionFailed(msg) => write!(f, "command execution failed: {msg}"),
         }
     }
+}
+
+/// Operator subcommands and the flags each one accepts, in parse order.
+pub const OPERATOR_SUBCOMMANDS: &[(&str, &str, &str)] = &[
+    (
+        "backstop",
+        "stake",
+        "Stake into the backstop; requires --source and --amount, optional --staker, --tranche, --network, --dry-run, --confirm-mainnet",
+    ),
+    (
+        "backstop",
+        "unstake",
+        "Unstake shares from the backstop; requires --source and --shares, optional --staker, --tranche, --network, --dry-run, --confirm-mainnet",
+    ),
+    (
+        "backstop",
+        "status",
+        "Show backstop stake status; optional --staker, --network, --dry-run",
+    ),
+    (
+        "bounty",
+        "fund",
+        "Fund a bounty; requires --source and --amount, optional --from, --network, --dry-run, --confirm-mainnet",
+    ),
+    (
+        "bounty",
+        "check-claim",
+        "Check a bounty claim; requires --payout-id or --report-hash, optional --network, --dry-run",
+    ),
+    (
+        "bounty",
+        "status",
+        "Show bounty status; optional --network, --dry-run",
+    ),
+    (
+        "grants",
+        "approve-milestone",
+        "Confirm a grant milestone; requires --source, --grant-id and --milestone-index, optional --caller, --network, --dry-run, --confirm-mainnet",
+    ),
+    (
+        "grants",
+        "status",
+        "Show grant status; optional --grant-id, --network, --dry-run",
+    ),
+    (
+        "treasury",
+        "deposit",
+        "Deposit into the treasury; requires --source and --amount, optional --from, --token, --network, --dry-run, --confirm-mainnet",
+    ),
+    (
+        "treasury",
+        "propose-withdrawal",
+        "Propose a treasury withdrawal; requires --source, --payee, --amount and --purpose-hash, optional --requester, --token, --network, --dry-run, --confirm-mainnet",
+    ),
+    (
+        "treasury",
+        "status",
+        "Show payment-request status; optional --request-id, --network, --dry-run",
+    ),
+];
+
+/// One line per subcommand, in parse order, for screen readers to read linearly.
+/// `domain` and `action` narrow the output to a single subcommand when given.
+pub fn help_text(domain: Option<&str>, action: Option<&str>) -> String {
+    let mut out = String::from(
+        "operator subcommands: cargo xtask operator <domain> <subcommand> [options]\n",
+    );
+    for (d, a, description) in OPERATOR_SUBCOMMANDS {
+        if domain.is_some_and(|given| given != *d) || action.is_some_and(|given| given != *a) {
+            continue;
+        }
+        let _ = writeln!(out, "operator {d} {a} - {description}");
+    }
+    if out.lines().count() == 1 {
+        let _ = writeln!(out, "no matching operator subcommand");
+    }
+    out
+}
+
+/// A single-line label naming the subcommand for success and error output.
+pub fn command_label(args: &[String]) -> String {
+    let slice = if args.first().map(String::as_str) == Some("operator") {
+        &args[1..]
+    } else {
+        args
+    };
+    let domain = slice.first().map(String::as_str).unwrap_or("<domain>");
+    let action = slice.get(1).map(String::as_str).unwrap_or("<subcommand>");
+    format!("operator {domain} {action}")
+}
+
+/// Full `Display` text of an error with the subcommand prefix, so callers
+/// report what actually failed rather than a generic message.
+pub fn described_error(label: &str, error: &OperatorError) -> String {
+    format!("{label}: {error}")
 }
 
 /// Resolved network and contract deployment metadata.
@@ -1716,6 +1812,28 @@ mod tests {
         assert!(prop_plan.steps[0]
             .to_shell_command()
             .contains("--amount 752500000"));
+    }
+
+    #[test]
+    fn help_and_command_label_cover_every_operator_command() {
+        for (domain, action, description) in OPERATOR_SUBCOMMANDS {
+            let label = command_label(&vec_s(&[domain, action]));
+            assert_eq!(label, format!("operator {domain} {action}"));
+            let text = help_text(Some(domain), Some(action));
+            assert!(text.contains(&label));
+            assert!(text.contains(description));
+        }
+        let all = help_text(None, None);
+        for (domain, action, _) in OPERATOR_SUBCOMMANDS {
+            assert!(all.contains(&format!("operator {domain} {action} -")));
+        }
+    }
+
+    #[test]
+    fn described_error_uses_underlying_operator_error_message() {
+        let label = "operator treasury propose-withdrawal";
+        let error = OperatorError::InvalidArgument("unknown flag --payee".to_owned());
+        assert_eq!(described_error(label, &error), format!("{label}: {error}"));
     }
 
     #[test]
